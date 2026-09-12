@@ -1,0 +1,6 @@
+__pycache__
+*.pyc
+.env
+yolov8n.pt
+tests/
+*.md

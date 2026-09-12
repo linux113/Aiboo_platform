@@ -1,0 +1,117 @@
+version: "3.9"
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: aiboo-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - aiboo-net
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh --quiet
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: aiboo-backend
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    env_file:
+      - ./backend/.env
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/aiboo
+      - NODE_ENV=production
+    networks:
+      - aiboo-net
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) })"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aiboo-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:4000/api
+      - VITE_SOCKET_URL=http://localhost:4000
+      - VITE_CV_URL=http://localhost:5050
+      - VITE_AGENT_URL=http://localhost:8001
+    networks:
+      - aiboo-net
+
+  agent:
+    build:
+      context: ./agent
+      dockerfile: Dockerfile
+    container_name: aiboo-agent
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    depends_on:
+      - backend
+    env_file:
+      - ./agent/.env
+    environment:
+      - NODE_BACKEND=http://backend:4000
+      - API_PORT=8001
+    networks:
+      - aiboo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  cv-service:
+    build:
+      context: ./cv-service
+      dockerfile: Dockerfile
+    container_name: aiboo-cv
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    depends_on:
+      - backend
+    environment:
+      - CV_HOST=0.0.0.0
+      - NODE_BACKEND=http://backend:4000
+      # CHANGE THIS: set a strong random secret for production
+      - CV_AUTH_TOKEN=changeme-cv-token
+      - FRONTEND_ORIGIN=http://localhost:5173
+    volumes:
+      - cv_models:/app/models
+    networks:
+      - aiboo-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5050/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  mongo_data:
+  cv_models:
+
+networks:
+  aiboo-net:
+    driver: bridge
