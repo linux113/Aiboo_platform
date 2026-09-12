@@ -28,6 +28,26 @@ interface IsoSuggestion {
   timestamp: number;
 }
 
+interface LlmReport {
+  id: string;
+  narrative: string;
+  source: string;
+  timestamp: string;
+}
+
+interface LlmHyp {
+  id: string;
+  entity: string;
+  hypothesis: string;
+  source: string;
+  timestamp: string;
+}
+
+interface LlmInsights {
+  reports: LlmReport[];
+  hypotheses: LlmHyp[];
+}
+
 const ISO_STATUS_CLS: Record<string, string> = {
   pending: "bg-amber-500/10 text-amber-300 ring-amber-400/40",
   executing: "bg-cyan-500/10 text-cyan-300 ring-cyan-400/40",
@@ -52,7 +72,7 @@ export default function AgentConsole({
   onSendTestEvent: (evt: unknown) => void;
 }) {
   const [tab, setTab] = useState<
-    "findings" | "correlated" | "gates" | "locks" | "isolation" | "send"
+    "findings" | "correlated" | "gates" | "locks" | "isolation" | "ai" | "send"
   >("findings");
   const [form, setForm] = useState({
     source: "test-sensor",
@@ -69,15 +89,23 @@ export default function AgentConsole({
   const [isoSuggestions, setIsoSuggestions] = useState<IsoSuggestion[]>([]);
   const [autoMode, setAutoMode] = useState(false);
   const [isoBusy, setIsoBusy] = useState<string | null>(null);
+  const [llm, setLlm] = useState<LlmInsights>({ reports: [], hypotheses: [] });
 
   const refreshIsolation = useCallback(async () => {
     try {
-      const [sug, st] = await Promise.all([
+      const [sug, st, ins] = await Promise.all([
         api.get(`${AGENT_URL}/isolation/suggestions`, agentH()),
         api.get(`${AGENT_URL}/isolation/stats`, agentH()),
+        api.get(`${AGENT_URL}/llm/insights`, agentH()).catch(() => ({ data: null })),
       ]);
       setIsoSuggestions(Array.isArray(sug.data) ? sug.data : []);
       setAutoMode(!!st.data?.auto_mode);
+      if (ins.data && typeof ins.data === "object") {
+        setLlm({
+          reports: Array.isArray(ins.data.reports) ? ins.data.reports : [],
+          hypotheses: Array.isArray(ins.data.hypotheses) ? ins.data.hypotheses : [],
+        });
+      }
     } catch {
       /* agent service offline — keep last known state */
     }
@@ -160,6 +188,10 @@ export default function AgentConsole({
     {
       k: "isolation" as const,
       label: `Isolation (${isoSuggestions.filter((x) => x.status === "pending").length})`,
+    },
+    {
+      k: "ai" as const,
+      label: `AI Insights (${llm.reports.length + llm.hypotheses.length})`,
     },
     { k: "send" as const, label: "Send Event" },
   ];
@@ -579,6 +611,72 @@ export default function AgentConsole({
                   )}
                 </div>
               ))}
+            </div>
+          )}
+
+          {tab === "ai" && (
+            <div className="space-y-4">
+              {/* ---- Threat hypotheses (next-move predictions) ---- */}
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-amber-300">
+                    🎯 Threat Hypotheses — attacker's predicted next move
+                  </span>
+                  <span className="text-[9px] text-slate-600">(generated on every Gate 3 BLOCK)</span>
+                </div>
+                {llm.hypotheses.length === 0 && (
+                  <p className="text-xs text-slate-600 py-2">
+                    No hypotheses yet — they appear automatically after a Gate 3 BLOCK decision.
+                  </p>
+                )}
+                <div className="space-y-2">
+                  {llm.hypotheses.map((h) => (
+                    <div key={h.id + h.timestamp} className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-3">
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <span className="text-xs font-semibold text-amber-200 font-mono">{h.entity}</span>
+                        <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[8px] text-slate-400 ring-1 ring-slate-600">
+                          {h.source === "llm" ? "🤖 LLM" : "⚙️ offline rules"}
+                        </span>
+                        <span className="text-[10px] text-slate-600 ml-auto">
+                          {new Date(h.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 leading-relaxed">{h.hypothesis}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* ---- Narrative incident reports ---- */}
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-cyan-300">
+                    📄 Incident Narratives — plain-English reports
+                  </span>
+                  <span className="text-[9px] text-slate-600">(generated on every correlated alert)</span>
+                </div>
+                {llm.reports.length === 0 && (
+                  <p className="text-xs text-slate-600 py-2">
+                    No narratives yet — they appear automatically when a correlated alert fires.
+                  </p>
+                )}
+                <div className="space-y-2">
+                  {llm.reports.map((r) => (
+                    <div key={r.id + r.timestamp} className="rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3">
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <span className="text-xs font-semibold text-cyan-200">INCIDENT {r.id}</span>
+                        <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[8px] text-slate-400 ring-1 ring-slate-600">
+                          {r.source === "llm" ? "🤖 LLM" : r.source === "offline-template" ? "⚙️ template" : "⚙️ offline"}
+                        </span>
+                        <span className="text-[10px] text-slate-600 ml-auto">
+                          {new Date(r.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <pre className="text-[11px] text-slate-300 leading-relaxed whitespace-pre-wrap font-sans">{r.narrative}</pre>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 

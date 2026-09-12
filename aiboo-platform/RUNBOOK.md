@@ -339,6 +339,7 @@ curl -s -X POST $URL -H "Content-Type: application/json" -H "$KEY" -d "{
 | Agent Console → **Gates** | Gate 1/2/3 decisions with verdicts (hold/pass/block/escalate) |
 | Agent Console → **Locks** | Pseudo-locks with decoy endpoints (attack #4 triggers one) |
 | Agent Console → **Isolation** | AI suggestion cards → **⚡ Take Action** or **Dismiss** |
+| Agent Console → **AI Insights** | Threat hypotheses (attacker's next move) + incident narratives |
 | `GET :8001/llm/insights` | Narrative report + attacker next-move hypothesis |
 
 ### Inspect results via API
