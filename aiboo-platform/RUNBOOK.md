@@ -355,6 +355,115 @@ curl -s http://localhost:4000/api/agent/sources             # live endpoints
 
 ---
 
+## 7b. Testing from a REMOTE PC — step-by-step (detailed)
+
+### Scenario A — Remote Windows PC ships its logs to your agent (LAN) — RECOMMENDED FIRST TEST
+
+**On the MAIN PC** (running the stack):
+
+1. Find your LAN IP:
+   ```bat
+   ipconfig   :: look for "IPv4 Address" e.g. 192.168.1.100
+   ```
+2. Open the firewall for the agent API (run as Administrator):
+   ```bat
+   open-firewall.bat
+   ```
+3. Confirm the agent is listening on all interfaces:
+   ```bat
+   netstat -an | findstr :8001    :: must show 0.0.0.0:8001 LISTENING
+   ```
+4. Note your key: `dev-key-change-in-production` (or your custom `AGENT_API_KEY`).
+
+**On the REMOTE PC:**
+
+5. Copy the `plugin/` folder (or just `remote-log-sender.ps1`) over — USB/network share.
+6. Quick connectivity check first:
+   ```powershell
+   Test-NetConnection 192.168.1.100 -Port 8001    :: TcpTestSucceeded : True
+   ```
+   - If False: firewall on main PC (step 2), or you're on different subnets/VLANs.
+7. **Send one manual test event** (fastest way to prove the path — no install needed):
+   ```powershell
+   $body = @{
+     timestamp  = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+     source     = $env:COMPUTERNAME
+     event_type = "failed_logon"
+     message    = "manual connectivity test from remote PC"
+     severity   = "high"
+     payload    = @{ user_id = "test"; src_ip = "10.0.0.99" }
+   } | ConvertTo-Json
+   Invoke-RestMethod -Uri "http://192.168.1.100:8001/events" -Method Post `
+     -ContentType "application/json" `
+     -Headers @{ "X-API-Key" = "dev-key-change-in-production" } `
+     -Body $body
+   ```
+   Expected: `status=accepted, event_id=<8 chars>`.
+8. **Install the continuous forwarder** — Option 1 (scheduled task, survives reboot):
+   - Edit `plugin\config.txt` → line 1: `192.168.1.100`, line 2: `dev-key-change-in-production`
+   - Right-click `install.bat` → **Run as Administrator**
+   - It creates scheduled task "AiBoO Security Plugin" (forwards Security events every few min, offline retry queue included).
+   - Uninstall anytime: `uninstall.bat` (admin).
+9. **Option 2** (lightweight console script):
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File remote-log-sender.ps1 -ServerUrl "http://192.168.1.100:8001" -Interval 15
+   ```
+   Note: this script sends `Authorization: Bearer` — pass the key via `-AuthToken dev-key-change-in-production` if you changed it from the default.
+10. **Verify on the MAIN PC:**
+    ```bash
+    curl http://localhost:4000/api/agent/sources        → ["REMOTE-PC-NAME", ...]
+    curl "http://localhost:4000/api/agent/findings?limit=5"
+    ```
+    Dashboard → Agent Console: your remote PC appears as a live endpoint; real 4625/4624 Security events arrive as findings within minutes.
+    Agent log (`logs\agent.log`): `Received event from REMOTE-PC-NAME: ...`
+
+### Scenario B — Remote PC runs its OWN full agent → pushes to your backend over ngrok
+
+Use this when the remote PC is off-LAN (home/branch office) and you want full local detection there.
+
+1. **Main PC:** start the tunnel → `ngrok http 4000` → copy the `https://xxxx.ngrok-free.app` URL.
+2. **Remote PC:** install Python 3.10+, copy the whole `agent/` folder, then:
+   ```bat
+   pip install -r requirements.txt
+   ```
+3. Create `agent\config.ini` on the remote PC:
+   ```ini
+   [AIBOO]
+   remote_url = https://xxxx.ngrok-free.app
+   api_key = dev-key-change-in-production
+   endpoint_name = Branch-Office-PC
+   server_ip = 127.0.0.1
+   log_level = INFO
+   ```
+4. Start it: `python main.py` → expect `Platform ready — tri-gate pipeline + 7 specialist agents...`
+5. **Verify delivery:** on the remote PC generate a critical event:
+   ```powershell
+   # same Invoke-RestMethod as step 7 above, but URL = http://localhost:8001
+   ```
+   Then on the main PC: `curl http://localhost:4000/api/agent/sources` → includes `Branch-Office-PC`.
+6. **Test the offline queue:** stop ngrok (Ctrl+C), send 2–3 events on the remote PC (they'll queue in SQLite `alerts_queue.db`), restart ngrok with the SAME URL (or update config.ini if URL changed), wait ≤30s → the queued alerts flush automatically.
+7. Real detections also flow: log in/out on the remote PC (Windows Security events → 4624/4625) and watch findings appear on your dashboard.
+
+### Scenario C — Remote Linux server (SSH box, no install of plugin)
+
+```bash
+curl -X POST http://192.168.1.100:8001/events \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: dev-key-change-in-production" \
+  -d '{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","source":"prod-server-01","event_type":"anomalous_behavior","message":"cron job ran outside schedule","severity":"medium","payload":{"user_id":"root","process":"cron"}}'
+```
+Wrap this in a cron/systemd timer or shell into your app's audit log to forward anything.
+
+### Remote testing checklist (what to look for on the dashboard)
+
+| Step | Action on remote PC | Expected on dashboard (within ~10s) |
+|------|--------------------|--------------------------------------|
+| 1 | Manual test event (high) | 🔔 notification + finding in Agent Console |
+| 2 | Critical event (`physical_intrusion` server_room payload) | Gates tab: ESCALATE→BLOCK, Locks tab: new pseudo-lock, Isolation tab: AI suggestion |
+| 3 | Click **⚡ Take Action** on the suggestion | status → EXECUTED; `GET /api/agent/response-log` shows the mirrored action |
+| 4 | Kill the network path, send events, restore it | alerts flushed from the SQLite queue automatically |
+| 5 | Stop the plugin task (`uninstall.bat`) | endpoint goes grey/offline in EndpointsList after ~2 min |
+
 ## 8. Troubleshooting
 
 | Symptom | Cause → Fix |

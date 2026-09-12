@@ -3,6 +3,7 @@ import axios from 'axios';
 import { getIO } from '../config/socket.js';
 import { protect, authorize } from '../middleware/auth.js';
 import logger from '../utils/logger.js';
+import AgentEvent from '../models/AgentEvent.js';
 
 const router = express.Router();
 
@@ -21,6 +22,44 @@ const store = {
 
 const MAX = 200;
 const push = (arr, item) => { arr.unshift(item); if (arr.length > MAX) arr.pop(); };
+
+// ---- MongoDB persistence (fire-and-forget; memory stays the primary read path) ----
+const persist = (kind, key, data) => {
+  if (!key) return;
+  AgentEvent.findOneAndUpdate({ kind, key }, { kind, key, data }, { upsert: true })
+    .catch((err) => logger.debug(`persist ${kind} skipped: ${err.message}`));
+};
+
+// ---- Hydration: once after boot, load the latest items back from MongoDB ----
+const hydratePromises = {};
+const hydrate = (kind) => {
+  if (!hydratePromises[kind]) {
+    hydratePromises[kind] = AgentEvent.find({ kind }).sort({ createdAt: -1 }).limit(MAX).lean()
+      .then((docs) => {
+        if (!docs || docs.length === 0) return;
+        if (kind === 'findings' && store.findings.length === 0) {
+          store.findings = docs.map((d) => d.data);
+        } else if (kind === 'correlated' && store.correlated.length === 0) {
+          store.correlated = docs.map((d) => d.data);
+        } else if (kind === 'gateDecisions' && store.gateDecisions.length === 0) {
+          store.gateDecisions = docs.map((d) => d.data);
+        } else if (kind === 'responseLog' && store.responseLog.length === 0) {
+          store.responseLog = docs.map((d) => d.data);
+        } else if (kind === 'pseudoLocks' && Object.keys(store.pseudoLocks).length === 0) {
+          docs.reverse().forEach((d) => { store.pseudoLocks[d.key] = d.data; });
+        } else if (kind === 'endpoints') {
+          docs.forEach((d) => {
+            const ep = d.data;
+            const cur = store.endpoints[ep.source];
+            if (!cur || new Date(ep.lastSeen) > new Date(cur.lastSeen)) store.endpoints[ep.source] = ep;
+          });
+        }
+        logger.info(`Hydrated ${kind} from MongoDB (${docs.length} items)`);
+      })
+      .catch((err) => logger.debug(`hydrate ${kind} skipped: ${err.message}`));
+  }
+  return hydratePromises[kind];
+};
 
 const emit = (ev, data) => {
   try {
@@ -71,6 +110,7 @@ const updateEndpointHeartbeat = (source) => {
       lastSeen: new Date().toISOString(),
       source,
     };
+    persist('endpoint', source, store.endpoints[source]);
   }
 };
 
@@ -109,6 +149,7 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
     };
 
     push(store.findings, finding);
+    persist('finding', finding.id, finding);
     emit('agent:finding', finding);
     logger.info(`Agent finding from ${source}: ${threat_type} (${severity})`);
 
@@ -128,7 +169,8 @@ router.post('/heartbeat', validateAgentApiKey, (req, res) => {
 });
 
 // GET /api/agent/sources – List only LIVE endpoints (recent heartbeat)
-router.get('/sources', (req, res) => {
+router.get('/sources', async (req, res) => {
+  await hydrate('endpoints');
   const liveSources = Object.values(store.endpoints)
     .filter((ep) => isActive(ep.lastSeen))
     .map((ep) => ep.source)
@@ -139,7 +181,8 @@ router.get('/sources', (req, res) => {
 });
 
 // GET /api/agent/findings – Query findings (filter by source? optional)
-router.get('/findings', (req, res) => {
+router.get('/findings', async (req, res) => {
+  await hydrate('findings');
   const { source, limit = 50 } = req.query;
   let result = store.findings;
   if (source) {
@@ -149,7 +192,8 @@ router.get('/findings', (req, res) => {
 });
 
 // GET /api/agent/endpoints – Detailed endpoint status (with active flag)
-router.get('/endpoints', (req, res) => {
+router.get('/endpoints', async (req, res) => {
+  await hydrate('endpoints');
   const now = Date.now();
   const list = Object.values(store.endpoints).map((ep) => ({
     ...ep,
@@ -164,28 +208,34 @@ router.get('/endpoints', (req, res) => {
 // ============================================================
 
 router.post('/finding', protect, (req, res) => {
-  const finding = { ...req.body, source: getSource(req) };
+  const finding = { ...req.body, id: req.body.id || `local_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, source: getSource(req) };
   push(store.findings, finding);
+  persist('finding', finding.id, finding);
   emit('agent:finding', finding);
   res.json({ ok: true });
 });
 
 router.post('/correlated', protectOrAgentKey, (req, res) => {
-  push(store.correlated, req.body);
-  emit('agent:correlated', req.body);
-  if (['critical', 'high'].includes(req.body.severity))
-    emit('alert:critical', { ...req.body, message: req.body.description });
+  const corr = { ...req.body, alert_id: req.body.alert_id || `corr_${Date.now()}` };
+  push(store.correlated, corr);
+  persist('correlated', corr.alert_id, corr);
+  emit('agent:correlated', corr);
+  if (['critical', 'high'].includes(corr.severity))
+    emit('alert:critical', { ...corr, message: corr.description });
   res.json({ ok: true });
 });
 
 router.post('/gate-decision', protectOrAgentKey, (req, res) => {
-  push(store.gateDecisions, req.body);
-  emit('agent:gate', req.body);
+  const gate = { ...req.body, gate_id: `${req.body.event_id || 'evt'}:${req.body.gate || 0}:${Date.now()}` };
+  push(store.gateDecisions, gate);
+  persist('gate', gate.gate_id, gate);
+  emit('agent:gate', gate);
   res.json({ ok: true });
 });
 
 router.post('/pseudo-lock', protectOrAgentKey, (req, res) => {
   store.pseudoLocks[req.body.lock_id] = req.body;
+  persist('lock', req.body.lock_id, req.body);
   emit('agent:pseudo-lock', req.body);
   res.json({ ok: true });
 });
@@ -194,25 +244,28 @@ router.post('/pseudo-lock-restore', protectOrAgentKey, (req, res) => {
   const { lock_id } = req.body;
   if (store.pseudoLocks[lock_id]) {
     store.pseudoLocks[lock_id].active = false;
+    persist('lock', lock_id, store.pseudoLocks[lock_id]);
     emit('agent:pseudo-lock-restore', { lock_id });
   }
   res.json({ ok: true });
 });
 
 // ---- Internal GET endpoints ----
-router.get('/correlated', protect, (req, res) => res.json(store.correlated.slice(0, 20)));
+router.get('/correlated', protect, async (req, res) => { await hydrate('correlated'); res.json(store.correlated.slice(0, 20)); });
 router.get('/gate-decisions', protect, (req, res) => res.json(store.gateDecisions.slice(0, 50)));
-router.get('/pseudo-locks', protect, (req, res) => res.json(Object.values(store.pseudoLocks)));
-router.get('/response-log', protect, (req, res) => res.json(store.responseLog.slice(0, 50)));
+router.get('/pseudo-locks', protect, async (req, res) => { await hydrate('pseudoLocks'); res.json(Object.values(store.pseudoLocks)); });
+router.get('/response-log', protect, async (req, res) => { await hydrate('responseLog'); res.json(store.responseLog.slice(0, 50)); });
 
 // POST /response-log — agents mirror executed containment actions here
 router.post('/response-log', validateAgentApiKey, (req, res) => {
   const entry = {
     ...req.body,
+    id: req.body.id || `resp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     source: getSource(req),
     loggedAt: new Date().toISOString(),
   };
   push(store.responseLog, entry);
+  persist('response', entry.id, entry);
   emit('response:log', entry);
   res.status(201).json({ ok: true, id: entry.id });
 });

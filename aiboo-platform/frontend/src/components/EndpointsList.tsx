@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react';
 import api, { authH } from '../utils/api';
-import { cn } from '../utils/cn';
 
 // Define the shape of an endpoint from the backend
 interface Endpoint {

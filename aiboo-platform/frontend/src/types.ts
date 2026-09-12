@@ -11,12 +11,21 @@ export type NavId =
 export interface Camera {
   _id: string;
   name: string;
-  location: string;
-  zone: string;
+  streamUrl: string;
+  location?: string;
+  zone?: string;
+  enabled?: boolean;
+  type?: "ip" | "rtsp" | "mobile" | "usb";
+  resolution?: string;
+  fps?: number;
+  detectionEnabled?: boolean;
+  detectionTypes?: string[];
   status: "online" | "offline" | "error";
-  stream_url?: string;
-  rtsp_url?: string;
-  metadata?: Record<string, unknown>;
+  lastSeen?: string;
+  thumbnail?: string;
+  addedBy?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 export interface Detection {
@@ -30,6 +39,16 @@ export interface Detection {
   timestamp: string;
   image_url?: string;
   metadata?: Record<string, unknown>;
+}
+
+export interface ChatMsg {
+  id?: number | string;
+  role: "user" | "assistant";
+  content: string;
+  timestamp?: string;
+  fallback?: boolean;
+  isTyping?: boolean;
+  meta?: { confidence?: number; sources?: string; [k: string]: unknown };
 }
 
 export interface Threat {

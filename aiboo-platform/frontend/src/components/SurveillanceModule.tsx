@@ -328,7 +328,7 @@ export default function SurveillanceModule({
               <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3 space-y-1.5 text-xs text-slate-400">
                 {[
                   ["Status", cfgCam.status],
-                  ["Type", cfgCam.type.toUpperCase()],
+                  ["Type", (cfgCam.type ?? "ip").toUpperCase()],
                   ["Zone", cfgCam.zone],
                   ["Enabled", cfgCam.enabled ? "Yes" : "No"],
                   ["URL", cfgCam.streamUrl],

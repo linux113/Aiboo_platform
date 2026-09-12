@@ -183,7 +183,7 @@ export default function AIPanel({
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3);
     const activeLocks = f.filter((x) => x.actions.includes("pseudo_lock")).length;
-    const openThreats = t.filter((x) => x.status === "open").length;
+    const openThreats = t.filter((x) => x.status === "active" || x.status === "investigating").length;
 
     if (
       isQ("hello") ||
