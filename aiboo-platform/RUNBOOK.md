@@ -176,7 +176,7 @@ python app.py          # first run downloads yolov8n.pt
 
 ## 5b. One-click alternatives
 
-- **Windows (bare metal):** run `setup.bat` once (installs deps), then `start-all.bat` (starts all 4 + checks health). `close-all.bat` stops them.
+- **Windows (bare metal):** just run **`start-all.bat`** — it now auto-installs missing npm/pip dependencies, creates `agent\config.ini` for you (endpoint = your PC name, backend = localhost:4000), waits for first-run model downloads, prints the last log lines of any service that fails to start, and skips services already running. `close-all.bat` stops everything (it also kills by port, so nothing is left behind). `setup.bat` is optional nowadays.
 - **Docker:** `cp backend/.env.example backend/.env && cp agent/.env.example agent/.env`, edit both, then `docker compose up --build` (Mongo + backend + frontend + agent + cv-service). The agent container runs the **full pipeline** since the latest fix.
 
 ---
