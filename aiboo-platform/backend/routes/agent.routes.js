@@ -56,6 +56,14 @@ const validateAgentApiKey = (req, res, next) => {
   next();
 };
 
+// ---- JWT **or** agent API key (the remote agent pushes with X-API-Key only) ----
+const protectOrAgentKey = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'] || '';
+  const expectedKey = process.env.AGENT_API_KEY || 'dev-key-change-in-production';
+  if (apiKey && apiKey === expectedKey) return next();
+  return protect(req, res, next);
+};
+
 // ---- Record endpoint heartbeat ----
 const updateEndpointHeartbeat = (source) => {
   if (source && source !== 'unknown') {
@@ -162,7 +170,7 @@ router.post('/finding', protect, (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/correlated', protect, (req, res) => {
+router.post('/correlated', protectOrAgentKey, (req, res) => {
   push(store.correlated, req.body);
   emit('agent:correlated', req.body);
   if (['critical', 'high'].includes(req.body.severity))
@@ -170,19 +178,19 @@ router.post('/correlated', protect, (req, res) => {
   res.json({ ok: true });
 });
 
-router.post('/gate-decision', protect, (req, res) => {
+router.post('/gate-decision', protectOrAgentKey, (req, res) => {
   push(store.gateDecisions, req.body);
   emit('agent:gate', req.body);
   res.json({ ok: true });
 });
 
-router.post('/pseudo-lock', protect, (req, res) => {
+router.post('/pseudo-lock', protectOrAgentKey, (req, res) => {
   store.pseudoLocks[req.body.lock_id] = req.body;
   emit('agent:pseudo-lock', req.body);
   res.json({ ok: true });
 });
 
-router.post('/pseudo-lock-restore', protect, (req, res) => {
+router.post('/pseudo-lock-restore', protectOrAgentKey, (req, res) => {
   const { lock_id } = req.body;
   if (store.pseudoLocks[lock_id]) {
     store.pseudoLocks[lock_id].active = false;
@@ -196,6 +204,37 @@ router.get('/correlated', protect, (req, res) => res.json(store.correlated.slice
 router.get('/gate-decisions', protect, (req, res) => res.json(store.gateDecisions.slice(0, 50)));
 router.get('/pseudo-locks', protect, (req, res) => res.json(Object.values(store.pseudoLocks)));
 router.get('/response-log', protect, (req, res) => res.json(store.responseLog.slice(0, 50)));
+
+// ---- GET /identities — per-user rollup derived from live agent findings ----
+// Frontend IntelligenceModule expects: { id, user, role, lastSeen, access, anomaly }
+router.get('/identities', protect, (req, res) => {
+  const byUser = {};
+  store.findings.forEach((f) => {
+    const uid = f.metadata?.user_id || f.metadata?.entity_id;
+    if (!uid || uid === 'unknown') return;
+    if (!byUser[uid]) byUser[uid] = { user: uid, findings: 0, anomaly: 0, lastSeen: f.timestamp, access: 'allowed' };
+    const row = byUser[uid];
+    row.findings += 1;
+    if (new Date(f.timestamp) > new Date(row.lastSeen)) row.lastSeen = f.timestamp;
+    // confidence of the highest-severity finding doubles as the anomaly signal
+    const sevWeight = { low: 0.2, medium: 0.5, high: 0.8, critical: 1.0 }[f.severity] || 0.5;
+    row.anomaly = Math.min(1, Math.max(row.anomaly, (f.confidence || 0.5) * sevWeight));
+    if (Array.isArray(f.actions)) {
+      if (f.actions.includes('revoke_identity') || f.actions.includes('block_access')) row.access = 'revoked';
+      else if (f.actions.includes('challenge_mfa') || f.actions.includes('step_up_auth')) row.access = 'challenged';
+      else if (row.access !== 'revoked' && f.actions.includes('force_logout')) row.access = 'challenged';
+    }
+  });
+  const rows = Object.entries(byUser).map(([uid, r], i) => ({
+    id: i + 1,
+    user: r.user,
+    role: r.findings > 5 ? 'high-activity' : 'user',
+    lastSeen: r.lastSeen,
+    access: r.access,
+    anomaly: Math.round(r.anomaly * 100) / 100,
+  }));
+  res.json(rows);
+});
 
 router.get('/stats', protect, (req, res) => {
   const sc = {}; const tc = {};
@@ -214,7 +253,7 @@ router.get('/stats', protect, (req, res) => {
 });
 
 // ---- Restore lock (existing) ----
-router.post('/pseudo-locks/:lockId/restore', async (req, res) => {
+router.post('/pseudo-locks/:lockId/restore', protectOrAgentKey, async (req, res) => {
   const { lockId } = req.params;
   if (store.pseudoLocks[lockId]) {
     store.pseudoLocks[lockId].active = false;

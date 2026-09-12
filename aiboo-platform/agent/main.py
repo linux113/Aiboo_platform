@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 import uvicorn
 from core.orchestrator import Orchestrator
 from core.event_bus import EventBus
+from core.config import config
 from api.ingestion_api import create_app
 
 logging.basicConfig(
@@ -91,9 +92,11 @@ def ensure_endpoint_config():
 
 def run_api_server(event_bus):
     """Run the FastAPI server in a background thread."""
-    log.info("[INFO] Starting API server on http://0.0.0.0:8000")
+    # Use the configured port (default 8001) so the frontend, plugin and
+    # remote log senders — which all target port 8001 — can reach the agent.
+    log.info("[INFO] Starting API server on http://%s:%s", config.api_host, config.api_port)
     app = create_app(event_bus)
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host=config.api_host, port=config.api_port, log_level="info")
 
 
 async def main():
@@ -110,7 +113,7 @@ async def main():
     orchestrator = Orchestrator(bus)
     await orchestrator.start()
 
-    log.info("[STARTUP] AiBoO started — API on port 8000, orchestrator active")
+    log.info("[STARTUP] AiBoO started — API on port %s, orchestrator active", config.api_port)
 
     try:
         while True:

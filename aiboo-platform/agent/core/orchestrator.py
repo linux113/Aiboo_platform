@@ -4,6 +4,7 @@ import asyncio
 import logging
 import configparser
 import os
+import socket
 from .event_bus import EventBus
 from gates import Gate1Perimeter, Gate2Behavioural, Gate3Adaptive, GateResponseBridge
 from log_ingestion import WindowsEventIngestor
@@ -61,7 +62,14 @@ class Orchestrator:
         # self.response_eng = AutonomousResponseEngine(bus) # DISABLED
 
         # ---- Real Windows Event Log ingestion ----
-        self.windows_ingestor = WindowsEventIngestor(bus)
+        # Windows-only (pywin32). Degrade gracefully on Linux/containers so the
+        # full pipeline still runs with API-based ingestion.
+        try:
+            self.windows_ingestor = WindowsEventIngestor(bus)
+        except RuntimeError as e:
+            log.warning("Windows Event Log ingestion unavailable: %s", e)
+            self.windows_ingestor = None
+        self._ingestor_task = None
         # self.real_response = RealResponseEngine(bus)    # DISABLED
 
         # ---- Zero Trust engines (existing) ----
@@ -87,7 +95,13 @@ class Orchestrator:
         self.anomaly_detection = AnomalyDetectionEngine(bus)
 
         # ---- MERN dashboard bridge ----
-        self.dashboard_bridge = DashboardBridge(bus, backend_url='https://stuffy-volley-had.ngrok-free.dev')
+        # backend_url comes from config.ini (remote_url) — no hardcoded tunnels.
+        self.dashboard_bridge = DashboardBridge(
+            bus,
+            backend_url=self.config.get('remote_url'),
+            api_key=self.config.get('api_key'),
+            endpoint_id=self.config.get('endpoint_name'),
+        )
 
         # ---- Offline queue ----
         self.queue_manager = OfflineQueueManager(
@@ -106,11 +120,11 @@ class Orchestrator:
             config.read(config_path)
             if 'AIBOO' in config:
                 return dict(config['AIBOO'])
-        # Fallback defaults
+        # Fallback defaults — prefer NODE_BACKEND env (docker) over any dead tunnel URL
         return {
-            'remote_url': 'https://stuffy-volley-had.ngrok-free.dev',
-            'api_key': 'dev-key-change-in-production',
-            'endpoint_name': 'Unknown_PC',
+            'remote_url': os.environ.get('NODE_BACKEND', 'http://localhost:4000'),
+            'api_key': os.environ.get('AGENT_API_KEY', 'dev-key-change-in-production'),
+            'endpoint_name': socket.gethostname(),
             'server_ip': '192.168.1.100'
         }
 
@@ -174,13 +188,14 @@ class Orchestrator:
                 asyncio.create_task(agent.start_memory_scanning())
                 log.info("Memory scanning activated for CyberThreatAgent")
 
-        # ---- Start Windows Event Log ingestion ----
-        try:
-            await self.windows_ingestor.start(tail_only=True)
+        # ---- Start Windows Event Log ingestion (as background task so start() returns) ----
+        if self.windows_ingestor is not None:
+            self._ingestor_task = asyncio.create_task(
+                self.windows_ingestor.start(tail_only=True)
+            )
             log.info("Windows Event Log ingestion active — monitoring Security, System, Application logs")
-        except Exception as e:
-            log.warning(f"Windows Event Log ingestion failed: {e}")
-            log.warning("Running in demo mode with predefined events")
+        else:
+            log.warning("Windows Event Log ingestion unavailable — running with API-based ingestion only")
 
         log.info(
             "Platform ready — tri-gate pipeline + %d specialist agents + "
@@ -205,11 +220,15 @@ class Orchestrator:
                 log.info("Memory scanning stopped for CyberThreatAgent")
 
         # ---- Stop Windows Event Log ingestion ----
-        try:
-            await self.windows_ingestor.stop()
-            log.info("Windows Event Log ingestion stopped")
-        except Exception as e:
-            log.debug(f"Error stopping ingestor: {e}")
+        if self._ingestor_task is not None:
+            self._ingestor_task.cancel()
+            self._ingestor_task = None
+        if self.windows_ingestor is not None:
+            try:
+                await self.windows_ingestor.stop()
+                log.info("Windows Event Log ingestion stopped")
+            except Exception as e:
+                log.debug(f"Error stopping ingestor: {e}")
 
         # ---- Stop Zero Trust components ----
         self.zero_trust_pep.stop()

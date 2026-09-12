@@ -22,6 +22,7 @@ import responseRoutes from './routes/response.routes.js';
 import aiRoutes from './routes/ai.routes.js';
 import dashboardRoutes from './routes/dashboard.routes.js';
 import agentRoutes from './routes/agent.routes.js';
+import settingsRoutes from './routes/settings.routes.js';
 import { seedDemoAgentData } from './routes/agent.routes.js';
 
 // ❌ Outbound WebSocket import removed – agents push via HTTP.
@@ -77,6 +78,7 @@ app.use('/api/identities', apiLimiter, identityRoutes);
 app.use('/api/respond', apiLimiter, responseRoutes);
 app.use('/api/ai', apiLimiter, aiRoutes);
 app.use('/api/dashboard', apiLimiter, dashboardRoutes);
+app.use('/api/settings', apiLimiter, settingsRoutes);
 
 // ✅ Agent routes now use agentLimiter (more permissive)
 app.use('/api/agent', agentLimiter, agentRoutes);
