@@ -100,7 +100,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         api_key = request.headers.get("X-API-Key", "")
         internal_key = request.headers.get("X-Internal-Key", "")
-        if api_key == config.api_key or internal_key == config.internal_key:
+        # PowerShell plugins / remote-log-sender.ps1 authenticate with a Bearer token
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+        if api_key == config.api_key or internal_key == config.internal_key or bearer_token == config.api_key:
             return await call_next(request)
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
