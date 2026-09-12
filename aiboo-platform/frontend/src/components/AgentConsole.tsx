@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { cn } from "../utils/cn";
-import api, { authH, AGENT_URL } from "../utils/api";
+import api, { agentH, AGENT_URL } from "../utils/api";
 import { sevCls, threatIcon, verdictCls } from "../utils/helpers";
 import type {
   AgentFinding,
@@ -8,6 +8,53 @@ import type {
   GateDecision,
   PseudoLock,
 } from "../types";
+
+interface IsoSuggestion {
+  id: string;
+  event_id: string;
+  agent: string;
+  threat_type: string;
+  severity: string;
+  confidence: number;
+  summary: string;
+  target: string;
+  recommended_actions: string[];
+  advice: string;
+  advice_source: string;
+  status: "pending" | "executing" | "executed" | "dismissed" | "failed";
+  executed_actions?: string[];
+  notes?: string;
+  auto?: boolean;
+  timestamp: number;
+}
+
+interface LlmReport {
+  id: string;
+  narrative: string;
+  source: string;
+  timestamp: string;
+}
+
+interface LlmHyp {
+  id: string;
+  entity: string;
+  hypothesis: string;
+  source: string;
+  timestamp: string;
+}
+
+interface LlmInsights {
+  reports: LlmReport[];
+  hypotheses: LlmHyp[];
+}
+
+const ISO_STATUS_CLS: Record<string, string> = {
+  pending: "bg-amber-500/10 text-amber-300 ring-amber-400/40",
+  executing: "bg-cyan-500/10 text-cyan-300 ring-cyan-400/40",
+  executed: "bg-emerald-500/10 text-emerald-300 ring-emerald-400/40",
+  dismissed: "bg-slate-500/10 text-slate-400 ring-slate-500/40",
+  failed: "bg-red-500/10 text-red-400 ring-red-500/40",
+};
 
 export default function AgentConsole({
   findings,
@@ -25,7 +72,7 @@ export default function AgentConsole({
   onSendTestEvent: (evt: unknown) => void;
 }) {
   const [tab, setTab] = useState<
-    "findings" | "correlated" | "gates" | "locks" | "send"
+    "findings" | "correlated" | "gates" | "locks" | "isolation" | "ai" | "send"
   >("findings");
   const [form, setForm] = useState({
     source: "test-sensor",
@@ -37,6 +84,67 @@ export default function AgentConsole({
   });
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState("");
+
+  // ---- Isolation tab state ----
+  const [isoSuggestions, setIsoSuggestions] = useState<IsoSuggestion[]>([]);
+  const [autoMode, setAutoMode] = useState(false);
+  const [isoBusy, setIsoBusy] = useState<string | null>(null);
+  const [llm, setLlm] = useState<LlmInsights>({ reports: [], hypotheses: [] });
+
+  const refreshIsolation = useCallback(async () => {
+    try {
+      const [sug, st, ins] = await Promise.all([
+        api.get(`${AGENT_URL}/isolation/suggestions`, agentH()),
+        api.get(`${AGENT_URL}/isolation/stats`, agentH()),
+        api.get(`${AGENT_URL}/llm/insights`, agentH()).catch(() => ({ data: null })),
+      ]);
+      setIsoSuggestions(Array.isArray(sug.data) ? sug.data : []);
+      setAutoMode(!!st.data?.auto_mode);
+      if (ins.data && typeof ins.data === "object") {
+        setLlm({
+          reports: Array.isArray(ins.data.reports) ? ins.data.reports : [],
+          hypotheses: Array.isArray(ins.data.hypotheses) ? ins.data.hypotheses : [],
+        });
+      }
+    } catch {
+      /* agent service offline — keep last known state */
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshIsolation();
+    const t = setInterval(refreshIsolation, 8000);
+    return () => clearInterval(t);
+  }, [refreshIsolation]);
+
+  const executeIso = async (id: string) => {
+    setIsoBusy(id);
+    try {
+      await api.post(`${AGENT_URL}/isolation/execute`, { id }, agentH());
+      await refreshIsolation();
+    } finally {
+      setIsoBusy(null);
+    }
+  };
+
+  const dismissIso = async (id: string) => {
+    setIsoBusy(id);
+    try {
+      await api.post(`${AGENT_URL}/isolation/dismiss`, { id }, agentH());
+      setIsoSuggestions((p) => p.filter((x) => x.id !== id));
+    } finally {
+      setIsoBusy(null);
+    }
+  };
+
+  const toggleAuto = async () => {
+    try {
+      await api.post(`${AGENT_URL}/isolation/auto`, { enabled: !autoMode }, agentH());
+      setAutoMode(!autoMode);
+    } catch {
+      /* best-effort */
+    }
+  };
 
   const sendEvent = async () => {
     setSending(true);
@@ -55,7 +163,7 @@ export default function AgentConsole({
             dst_port: parseInt(form.dst_port) || 443,
           },
         },
-        authH()
+        agentH()
       );
       setSendResult(`✅ Event accepted — ID: ${res.data.event_id}`);
       onSendTestEvent(res.data);
@@ -76,6 +184,14 @@ export default function AgentConsole({
     {
       k: "locks" as const,
       label: `Locks (${pseudoLocks.filter((l) => l.active).length} active)`,
+    },
+    {
+      k: "isolation" as const,
+      label: `Isolation (${isoSuggestions.filter((x) => x.status === "pending").length})`,
+    },
+    {
+      k: "ai" as const,
+      label: `AI Insights (${llm.reports.length + llm.hypotheses.length})`,
     },
     { k: "send" as const, label: "Send Event" },
   ];
@@ -373,6 +489,194 @@ export default function AgentConsole({
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {tab === "isolation" && (
+            <div className="space-y-3">
+              {/* ---- Control strip ---- */}
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={toggleAuto}
+                  className={cn(
+                    "rounded-lg px-3 py-1.5 text-[11px] font-bold ring-1 transition",
+                    autoMode
+                      ? "bg-red-500/15 text-red-300 ring-red-500/50 hover:bg-red-500/25"
+                      : "bg-slate-800/60 text-slate-300 ring-slate-600/50 hover:bg-slate-800"
+                  )}
+                >
+                  {autoMode ? "AUTO-RESPOND: ON" : "AUTO-RESPOND: OFF"}
+                </button>
+                <button
+                  onClick={refreshIsolation}
+                  className="rounded-lg bg-slate-800/60 px-3 py-1.5 text-[11px] font-medium text-slate-300 ring-1 ring-slate-600/50 hover:bg-slate-800 transition"
+                >
+                  ⟳ Refresh
+                </button>
+                <span className="text-[10px] text-slate-500 ml-auto">
+                  {isoSuggestions.filter((x) => x.status === "pending").length} pending ·{" "}
+                  {isoSuggestions.filter((x) => x.status === "executed").length} executed
+                </span>
+              </div>
+
+              {isoSuggestions.length === 0 && (
+                <div className="py-10 text-center">
+                  <p className="text-slate-500 text-sm">No isolation suggestions</p>
+                  <p className="text-slate-600 text-xs mt-1">
+                    High/critical findings with containment actions appear here for review.
+                  </p>
+                </div>
+              )}
+
+              {isoSuggestions.map((iso) => (
+                <div
+                  key={iso.id}
+                  className={cn(
+                    "rounded-xl border p-3",
+                    iso.status === "executed"
+                      ? "border-emerald-500/30 bg-emerald-500/5"
+                      : iso.status === "failed"
+                        ? "border-red-500/40 bg-red-500/5"
+                        : iso.severity === "critical"
+                          ? "border-red-500/40 bg-red-500/5"
+                          : "border-amber-500/30 bg-amber-500/5"
+                  )}
+                >
+                  {/* header row */}
+                  <div className="flex items-center gap-2 flex-wrap mb-1.5">
+                    <span className="text-sm font-semibold text-slate-100">
+                      {threatIcon(iso.threat_type)} {iso.threat_type.replace(/_/g, " ")}
+                    </span>
+                    <span className={cn("rounded-full px-2 py-0.5 text-[9px] font-medium ring-1", sevCls(iso.severity))}>
+                      {iso.severity.toUpperCase()}
+                    </span>
+                    <span className={cn("rounded-full px-2 py-0.5 text-[9px] font-medium ring-1", ISO_STATUS_CLS[iso.status] || ISO_STATUS_CLS.pending)}>
+                      {iso.status.toUpperCase()}{iso.auto ? " · AUTO" : ""}
+                    </span>
+                    <span className="text-[10px] text-slate-600 ml-auto">
+                      {new Date(iso.timestamp * 1000).toLocaleTimeString()} · {iso.agent}
+                    </span>
+                  </div>
+
+                  <div className="text-xs text-slate-300 mb-1">
+                    <span className="text-slate-500">Target:</span>{" "}
+                    <span className="font-mono text-cyan-300">{iso.target}</span>
+                    <span className="text-slate-600"> · {(iso.confidence * 100) | 0}% confidence</span>
+                  </div>
+                  <div className="text-xs text-slate-400 mb-2">{iso.summary}</div>
+
+                  {/* AI advice */}
+                  <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-2.5 mb-2">
+                    <div className="flex items-center gap-2 mb-1">
+                      <span className="text-[9px] font-bold uppercase tracking-wider text-cyan-300">
+                        🤖 AI Suggestion
+                      </span>
+                      <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[8px] text-slate-400 ring-1 ring-slate-600">
+                        {iso.advice_source === "llm" ? "LLM" : "offline rules"}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-cyan-100/90 leading-relaxed">{iso.advice}</p>
+                  </div>
+
+                  {/* recommended actions */}
+                  <div className="flex items-center gap-1.5 flex-wrap mb-2.5">
+                    {(iso.executed_actions?.length ? iso.executed_actions : iso.recommended_actions).map((a) => (
+                      <span key={a} className="rounded-md bg-slate-800/80 px-2 py-0.5 text-[9px] font-medium text-slate-300 ring-1 ring-slate-600/60">
+                        {a.replace(/_/g, " ")}
+                      </span>
+                    ))}
+                  </div>
+                  {iso.notes && (
+                    <div className="text-[10px] text-slate-500 mb-2">ℹ️ {iso.notes}</div>
+                  )}
+
+                  {/* action buttons */}
+                  {(iso.status === "pending" || iso.status === "failed") && (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => executeIso(iso.id)}
+                        disabled={isoBusy === iso.id}
+                        className="rounded-lg bg-gradient-to-r from-red-500 to-orange-500 px-4 py-1.5 text-[11px] font-bold text-white hover:from-red-400 hover:to-orange-400 transition disabled:opacity-50 shadow"
+                      >
+                        {isoBusy === iso.id ? "Executing..." : "⚡ Take Action"}
+                      </button>
+                      <button
+                        onClick={() => dismissIso(iso.id)}
+                        disabled={isoBusy === iso.id}
+                        className="rounded-lg bg-slate-800/80 px-4 py-1.5 text-[11px] font-medium text-slate-300 ring-1 ring-slate-600/60 hover:bg-slate-800 transition disabled:opacity-50"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {tab === "ai" && (
+            <div className="space-y-4">
+              {/* ---- Threat hypotheses (next-move predictions) ---- */}
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-amber-300">
+                    🎯 Threat Hypotheses — attacker's predicted next move
+                  </span>
+                  <span className="text-[9px] text-slate-600">(generated on every Gate 3 BLOCK)</span>
+                </div>
+                {llm.hypotheses.length === 0 && (
+                  <p className="text-xs text-slate-600 py-2">
+                    No hypotheses yet — they appear automatically after a Gate 3 BLOCK decision.
+                  </p>
+                )}
+                <div className="space-y-2">
+                  {llm.hypotheses.map((h) => (
+                    <div key={h.id + h.timestamp} className="rounded-xl border border-amber-500/25 bg-amber-500/5 p-3">
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <span className="text-xs font-semibold text-amber-200 font-mono">{h.entity}</span>
+                        <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[8px] text-slate-400 ring-1 ring-slate-600">
+                          {h.source === "llm" ? "🤖 LLM" : "⚙️ offline rules"}
+                        </span>
+                        <span className="text-[10px] text-slate-600 ml-auto">
+                          {new Date(h.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-300 leading-relaxed">{h.hypothesis}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* ---- Narrative incident reports ---- */}
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-[10px] font-bold uppercase tracking-[0.15em] text-cyan-300">
+                    📄 Incident Narratives — plain-English reports
+                  </span>
+                  <span className="text-[9px] text-slate-600">(generated on every correlated alert)</span>
+                </div>
+                {llm.reports.length === 0 && (
+                  <p className="text-xs text-slate-600 py-2">
+                    No narratives yet — they appear automatically when a correlated alert fires.
+                  </p>
+                )}
+                <div className="space-y-2">
+                  {llm.reports.map((r) => (
+                    <div key={r.id + r.timestamp} className="rounded-xl border border-cyan-500/25 bg-cyan-500/5 p-3">
+                      <div className="flex items-center gap-2 flex-wrap mb-1">
+                        <span className="text-xs font-semibold text-cyan-200">INCIDENT {r.id}</span>
+                        <span className="rounded-full bg-slate-800 px-1.5 py-0.5 text-[8px] text-slate-400 ring-1 ring-slate-600">
+                          {r.source === "llm" ? "🤖 LLM" : r.source === "offline-template" ? "⚙️ template" : "⚙️ offline"}
+                        </span>
+                        <span className="text-[10px] text-slate-600 ml-auto">
+                          {new Date(r.timestamp).toLocaleTimeString()}
+                        </span>
+                      </div>
+                      <pre className="text-[11px] text-slate-300 leading-relaxed whitespace-pre-wrap font-sans">{r.narrative}</pre>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 

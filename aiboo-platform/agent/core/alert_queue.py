@@ -162,6 +162,11 @@ class OfflineQueueManager:
                             headers = {
                                 "Content-Type": "application/json",
                                 "X-API-Key": self.api_key,
+                                # Required when remote_url is an ngrok tunnel:
+                                # without this, ngrok free returns its browser
+                                # warning page with HTTP 200 and the alert would
+                                # be silently lost.
+                                "ngrok-skip-browser-warning": "true",
                             }
 
                             response = httpx.post(

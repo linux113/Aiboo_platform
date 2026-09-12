@@ -597,7 +597,8 @@ class ConvergedSecurityEngine:
                 if meta.get("signature") == "DNS_TUNNELING" or "dns" in meta.get("signature", "").lower():
                     dns_anomaly = True
                 # Lateral movement: many internal destinations
-                if meta.get("dst_ip") and meta.get("dst_ip").startswith("10.") or meta.get("dst_ip").startswith("192.168."):
+                dst_ip = meta.get("dst_ip")
+                if dst_ip and (dst_ip.startswith("10.") or dst_ip.startswith("192.168.")):
                     lateral_movement = True
             if sig.signal_type == SignalType.ANOMALY:
                 if meta.get("anomaly_type") == "reconnaissance":

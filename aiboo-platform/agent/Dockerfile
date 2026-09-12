@@ -5,4 +5,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 EXPOSE 8001
-CMD ["python", "run_api.py"]
+# Full pipeline (orchestrator + tri-gate + agents + engines + API).
+# Windows log ingestion degrades gracefully on Linux; events arrive via the API.
+CMD ["python", "main.py"]

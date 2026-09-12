@@ -56,6 +56,17 @@ def get_event_bus() -> EventBus:
         log.info("Created new EventBus for API server (standalone mode)")
     return _shared_event_bus
 
+
+# ---- Global shared isolation advisor (optional; set by orchestrator) ----
+_shared_isolation_advisor = None
+
+def set_isolation_advisor(advisor) -> None:
+    global _shared_isolation_advisor
+    _shared_isolation_advisor = advisor
+
+def get_isolation_advisor():
+    return _shared_isolation_advisor
+
 # -------------------------------------------------------------
 
 request_counts: TTLCache[str, list[float]] = TTLCache(maxsize=10000, ttl=60)
@@ -89,7 +100,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         api_key = request.headers.get("X-API-Key", "")
         internal_key = request.headers.get("X-Internal-Key", "")
-        if api_key == config.api_key or internal_key == config.internal_key:
+        # PowerShell plugins / remote-log-sender.ps1 authenticate with a Bearer token
+        auth_header = request.headers.get("Authorization", "")
+        bearer_token = auth_header[7:].strip() if auth_header.lower().startswith("bearer ") else ""
+        if api_key == config.api_key or internal_key == config.internal_key or bearer_token == config.api_key:
             return await call_next(request)
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -459,6 +473,63 @@ def create_app(event_bus: EventBus = None) -> FastAPI:
     async def metrics():
         return {"active_endpoints": len([r for r in app.routes if hasattr(r, 'methods')]), "uptime": "running"}
 
+    # ---- Isolation Advisor (suggestions + execute/dismiss) ----
+    @app.get("/isolation/suggestions")
+    async def isolation_suggestions(status: Optional[str] = None):
+        advisor = get_isolation_advisor()
+        if advisor is None:
+            return []
+        return advisor.snapshot(status=status)
+
+    @app.get("/isolation/stats")
+    async def isolation_stats():
+        advisor = get_isolation_advisor()
+        if advisor is None:
+            return {"total": 0, "by_status": {}, "auto_mode": False, "llm": False}
+        return advisor.stats()
+
+    @app.post("/isolation/execute")
+    async def isolation_execute(body: Dict[str, Any]):
+        advisor = get_isolation_advisor()
+        if advisor is None:
+            raise HTTPException(status_code=503, detail="Isolation advisor not active")
+        sid = body.get("id", "")
+        if not sid:
+            raise HTTPException(status_code=400, detail="'id' is required")
+        result = await advisor.execute(sid)
+        if not result.get("ok") and "error" in result and result["error"] == "suggestion not found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        return result
+
+    @app.post("/isolation/dismiss")
+    async def isolation_dismiss(body: Dict[str, Any]):
+        advisor = get_isolation_advisor()
+        if advisor is None:
+            raise HTTPException(status_code=503, detail="Isolation advisor not active")
+        sid = body.get("id", "")
+        if not sid:
+            raise HTTPException(status_code=400, detail="'id' is required")
+        result = await advisor.dismiss(sid)
+        if not result.get("ok"):
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        return result
+
+    @app.post("/isolation/auto")
+    async def isolation_auto(body: Dict[str, Any]):
+        advisor = get_isolation_advisor()
+        if advisor is None:
+            raise HTTPException(status_code=503, detail="Isolation advisor not active")
+        return advisor.set_auto(bool(body.get("enabled", False)))
+
+    # ---- LLM insights (narratives + threat hypotheses) ----
+    @app.get("/llm/insights")
+    async def llm_insights():
+        try:
+            from llm.advisor import insights as _insights
+            return _insights.snapshot()
+        except ImportError:
+            return {"reports": [], "hypotheses": []}
+
     @app.get("/")
     async def root():
         return {
@@ -473,7 +544,12 @@ def create_app(event_bus: EventBus = None) -> FastAPI:
                 "GET /health": "Health check",
                 "GET /metrics": "Metrics",
                 "GET /docs": "Interactive API documentation",
-                "WS /ws/alerts": "WebSocket for live alert stream"
+                "WS /ws/alerts": "WebSocket for live alert stream",
+                "GET /isolation/suggestions": "Isolation suggestions from findings",
+                "POST /isolation/execute": "Execute an isolation suggestion",
+                "POST /isolation/dismiss": "Dismiss an isolation suggestion",
+                "POST /isolation/auto": "Toggle auto-isolation mode",
+                "GET /llm/insights": "AI narratives & threat hypotheses"
             }
         }
 

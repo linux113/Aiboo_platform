@@ -12,6 +12,16 @@ export function getToken(): string | null {
   return localStorage.getItem("token");
 }
 
+// Headers for direct agent-service calls (FastAPI uses X-API-Key auth, not JWT).
+export function agentH() {
+  return {
+    headers: {
+      "Content-Type": "application/json",
+      "X-API-Key": import.meta.env.VITE_AGENT_API_KEY || "dev-key-change-in-production",
+    },
+  };
+}
+
 export function authH() {
   const token = getToken();
   if (!token || token === "undefined") {

@@ -23,7 +23,7 @@ export default function EndpointsList({ onSelectEndpoint, selectedEndpoint = nul
     const fetchEndpoints = async () => {
       try {
         setLoading(true);
-        const response = await api.get('/api/agent/endpoints', authH());
+        const response = await api.get('/agent/endpoints', authH());
         // Response data is an array of { source, lastSeen, active }
         setEndpoints(response.data || []);
         setError(null);
