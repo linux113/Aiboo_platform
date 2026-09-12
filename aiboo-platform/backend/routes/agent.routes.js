@@ -205,6 +205,18 @@ router.get('/gate-decisions', protect, (req, res) => res.json(store.gateDecision
 router.get('/pseudo-locks', protect, (req, res) => res.json(Object.values(store.pseudoLocks)));
 router.get('/response-log', protect, (req, res) => res.json(store.responseLog.slice(0, 50)));
 
+// POST /response-log — agents mirror executed containment actions here
+router.post('/response-log', validateAgentApiKey, (req, res) => {
+  const entry = {
+    ...req.body,
+    source: getSource(req),
+    loggedAt: new Date().toISOString(),
+  };
+  push(store.responseLog, entry);
+  emit('response:log', entry);
+  res.status(201).json({ ok: true, id: entry.id });
+});
+
 // ---- GET /identities — per-user rollup derived from live agent findings ----
 // Frontend IntelligenceModule expects: { id, user, role, lastSeen, access, anomaly }
 router.get('/identities', protect, (req, res) => {

@@ -38,6 +38,8 @@ class Orchestrator:
             ConvergedSecurityEngine, ComplianceEngine, AnomalyDetectionEngine,
         )
         from response import RealResponseEngine
+        from response.isolation_advisor import IsolationAdvisor
+        from llm import NarrativeAgent, ThreatHypothesisAgent
 
         # ---- Tri-gate pipeline ----
         self.gate1 = Gate1Perimeter(bus)
@@ -112,6 +114,13 @@ class Orchestrator:
         # ---- Process killer (local actions) ----
         self.process_killer = ProcessKiller(interval=3.0)
 
+        # ---- Isolation advisor (suggestions + operator actions) ----
+        self.isolation_advisor = IsolationAdvisor(bus)
+
+        # ---- LLM agents (self-disable/fallback to offline heuristics without a key) ----
+        self.narrative_agent = NarrativeAgent(bus)
+        self.threat_hypothesis = ThreatHypothesisAgent(bus)
+
     def _load_config(self) -> dict:
         """Load configuration from config.ini in the same directory."""
         config = configparser.ConfigParser()
@@ -177,6 +186,13 @@ class Orchestrator:
         )
         log.info("Offline alert queue and retry worker started")
 
+        # ---- Start isolation advisor + LLM agents ----
+        self.isolation_advisor.start()
+        from api.ingestion_api import set_isolation_advisor
+        set_isolation_advisor(self.isolation_advisor)
+        self.narrative_agent.start()
+        self.threat_hypothesis.start()
+
         # ---- Start process killer (local actions) ----
         await self.process_killer.start()   # <-- NEW
         log.info("Process killer started – listening for high/critical alerts")
@@ -209,6 +225,11 @@ class Orchestrator:
 
         # ---- Stop process killer ----
         await self.process_killer.stop()   # <-- NEW
+
+        # ---- Stop LLM agents + isolation advisor ----
+        await self.narrative_agent.stop()
+        await self.threat_hypothesis.stop()
+        await self.isolation_advisor.stop()
 
         # ---- Stop offline queue ----
         self.queue_manager.stop_retry()

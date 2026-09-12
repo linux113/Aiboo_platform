@@ -2,113 +2,85 @@
 llm/narrative_agent.py — LLM Narrative Agent (optional)
 
 Subscribes to CorrelatedAlert and generates a plain-English
-incident report using the Anthropic API.
-
-Enable by setting ANTHROPIC_API_KEY in your .env file.
+incident report. Uses the shared Anthropic helper (llm.advisor);
+falls back to a templated offline report when no API key is set.
+Reports are stored in the shared InsightStore and served via
+GET /llm/insights.
 """
 from __future__ import annotations
+
 import asyncio
 import logging
-import os
-import time
-
-import httpx
 
 from core.event_bus import EventBus
-from core.events import CorrelatedAlert
-from core.config import config
+from core.events import CorrelatedAlert, ResponseAction
+from .advisor import call_llm, insights, llm_available
 
 log = logging.getLogger("LLM.NarrativeAgent")
 
-_RETRY_MAX = 3
-_RETRY_DELAY = 2.0
-_RATE_LIMIT_PER_SEC = 4
-_last_call_time: float = 0.0
+_SYSTEM = (
+    "You are AiBoO's security narrative engine. "
+    "Write a concise, plain-English incident report "
+    "for a SOC analyst. Include: what happened, "
+    "which systems are affected, what actions were taken, "
+    "and the recommended next step."
+)
+
+
+def _offline_report(alert: CorrelatedAlert) -> str:
+    actions = ", ".join(a.value for a in alert.actions) or "none yet"
+    findings = "; ".join(f.summary for f in alert.findings[:5]) or alert.description
+    return (
+        f"INCIDENT {alert.alert_id} — {alert.threat_type.value.replace('_', ' ').title()} "
+        f"({alert.severity.value.upper()}, confidence {alert.confidence:.0%}).\n"
+        f"What happened: {findings}\n"
+        f"Actions taken/applied: {actions}.\n"
+        f"Recommended next step: verify containment on the affected assets, "
+        f"review related findings in the Agent Console, and escalate to the SOC "
+        f"if activity persists after isolation."
+    )
 
 
 class NarrativeAgent:
     def __init__(self, bus: EventBus) -> None:
         self.bus = bus
-        self._key = config.llm_api_key or os.getenv("ANTHROPIC_API_KEY", "")
-        self._model = config.llm_model
-        self._ready = bool(self._key)
-        self._client: httpx.AsyncClient | None = None
+        self._ready = llm_available()
+        self._generating: set[str] = set()
 
     def start(self) -> None:
-        if not self._ready:
-            log.warning("ANTHROPIC_API_KEY not set — NarrativeAgent disabled.")
-            return
         self.bus.subscribe(CorrelatedAlert, self._on_alert)
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(config.request_timeout))
-        log.info("NarrativeAgent active — will generate incident reports.")
+        if not self._ready:
+            log.warning("ANTHROPIC_API_KEY not set — NarrativeAgent running in OFFLINE templated mode.")
+        else:
+            log.info("NarrativeAgent active — will generate incident reports.")
 
     async def stop(self) -> None:
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        pass  # no long-lived resources (httpx client is per-call now)
 
     async def _on_alert(self, alert: CorrelatedAlert) -> None:
+        if alert.alert_id in self._generating:
+            return
+        self._generating.add(alert.alert_id)
         asyncio.create_task(self._generate(alert))
 
     async def _generate(self, alert: CorrelatedAlert) -> None:
-        if not self._ready or not self._client:
-            return
         try:
-            payload = {
-                "model": self._model,
-                "max_tokens": 500,
-                "system": (
-                    "You are AiBoO's security narrative engine. "
-                    "Write a concise, plain-English incident report "
-                    "for a SOC analyst. Include: what happened, "
-                    "which systems are affected, what actions were taken, "
-                    "and the recommended next step."
-                ),
-                "messages": [{
-                    "role": "user",
-                    "content": (
-                        f"Alert: {alert.description}\n"
-                        f"Severity: {alert.severity.value}\n"
-                        f"Confidence: {alert.confidence:.0%}\n"
-                        f"Findings: {[f.summary for f in alert.findings]}\n"
-                        f"Actions taken: {[a.value for a in alert.actions]}"
-                    ),
-                }],
-            }
-            for attempt in range(_RETRY_MAX):
-                try:
-                    global _last_call_time
-                    elapsed = time.monotonic() - _last_call_time
-                    if elapsed < 1.0 / _RATE_LIMIT_PER_SEC:
-                        await asyncio.sleep(1.0 / _RATE_LIMIT_PER_SEC - elapsed)
-                    _last_call_time = time.monotonic()
-
-                    resp = await self._client.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers={
-                            "x-api-key": self._key,
-                            "anthropic-version": "2023-06-01",
-                            "content-type": "application/json",
-                        },
-                        json=payload,
-                    )
-                    if resp.status_code == 429:
-                        wait = _RETRY_DELAY * (2 ** attempt)
-                        log.warning("Rate limited, retrying in %ss", wait)
-                        await asyncio.sleep(wait)
-                        continue
-                    resp.raise_for_status()
-                    data = resp.json()
-                    narrative = data["content"][0]["text"]
-                    log.info("Narrative for alert %s:\n%s", alert.alert_id, narrative)
-                    return
-                except httpx.HTTPStatusError as e:
-                    log.error("HTTP error generating narrative (attempt %d): %s", attempt + 1, e)
-                    if attempt < _RETRY_MAX - 1:
-                        await asyncio.sleep(_RETRY_DELAY * (2 ** attempt))
-                except httpx.TimeoutException:
-                    log.error("Timeout generating narrative (attempt %d)", attempt + 1)
-                    if attempt < _RETRY_MAX - 1:
-                        await asyncio.sleep(_RETRY_DELAY * (2 ** attempt))
+            user = (
+                f"Alert: {alert.description}\n"
+                f"Severity: {alert.severity.value}\n"
+                f"Confidence: {alert.confidence:.0%}\n"
+                f"Findings: {[f.summary for f in alert.findings]}\n"
+                f"Actions taken: {[a.value for a in alert.actions]}"
+            )
+            narrative = None
+            if self._ready:
+                narrative = await call_llm(_SYSTEM, user, max_tokens=500)
+            if not narrative:
+                narrative = _offline_report(alert)
+            insights.add_report(alert.alert_id, narrative,
+                                source="llm" if self._ready else "offline-template")
+            log.info("Narrative for alert %s:\n%s", alert.alert_id, narrative)
         except Exception as e:
             log.error("Narrative generation failed: %s", e)
+        finally:
+            self._generating.discard(alert.alert_id)
