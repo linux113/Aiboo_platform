@@ -245,7 +245,33 @@ If the backend is down, alerts sit in `agent/alerts_queue.db` and auto-retry eve
 ### Backend on a different machine / cloud
 
 If the agent runs on a different PC than the backend, set in the agent's `config.ini`:
-- `remote_url = http://<BACKEND-IP>:4000` (or an ngrok/https URL: `https://xxxx.ngrok-free.app` — run `ngrok http 4000` on the backend machine).
+- `remote_url = http://<BACKEND-IP>:4000` (LAN), or a public tunnel (below).
+
+### ☁️ Public backend over ngrok (for remote endpoints over the internet)
+
+On the **backend machine**:
+
+```bash
+ngrok http 4000
+# example output:
+#   Forwarding  https://d450-....ngrok-free.app -> http://localhost:4000
+```
+
+Then on every **REMOTE** machine that runs a full AiBoO agent, set in `agent/config.ini`:
+
+```ini
+[AIBOO]
+remote_url = https://d450-....ngrok-free.app     ; your ngrok URL, no trailing slash
+api_key = dev-key-change-in-production           ; must match backend AGENT_API_KEY
+endpoint_name = Remote-Office-PC                 ; unique per machine
+```
+
+Notes that matter:
+- The agent already sends the `ngrok-skip-browser-warning` header, so free-tier ngrok cannot swallow alerts.
+- ngrok **free URLs change on every restart** of ngrok → re-edit `config.ini` each time, or reserve a free **static domain** at dashboard.ngrok.com → *Domains*, then run `ngrok http 4000 --domain=your-static.ngrok-free.app`.
+- The PowerShell **plugins** (`plugin/`, `remote-log-sender.ps1`) talk to the AGENT on port **8001**, not the backend — use the agent PC's LAN IP for those. If the agent is also behind NAT, run a second tunnel (`ngrok http 8001`) and point `-ServerUrl` at it.
+- Opening the **dashboard** itself via ngrok needs its own tunnel + CORS: add the dashboard URL to backend `CORS_ORIGINS` and set the frontend's `VITE_API_URL`/`VITE_SOCKET_URL` to the same public URL.
+- The backend already has `trust proxy` enabled, so HTTPS client IPs are logged correctly behind the tunnel.
 
 ---
 

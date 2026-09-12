@@ -18,6 +18,7 @@ from core.event_bus import EventBus
 from core.config import config
 from api.ingestion_api import create_app
 
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -29,104 +30,207 @@ log = logging.getLogger("main")
 
 def ensure_endpoint_config():
     """
-    Check if config.ini exists and has a valid endpoint_name.
-    If not, prompt the user (only if interactive) or auto-set to hostname.
-    No Unicode/emoji characters – plain ASCII only.
+    Ensure AiBoO has a valid endpoint name and backend URL.
+
+    Behaviour:
+      - config.ini lives next to this script (works for script AND frozen exe).
+      - Missing options are filled with sane defaults:
+          remote_url -> NODE_BACKEND env or http://localhost:4000
+          api_key    -> AGENT_API_KEY env or dev-key-change-in-production
+      - Missing endpoint name is auto-set to the hostname.
+        Interactive naming ONLY happens when AIBOO_INTERACTIVE=1 is set
+        (never blocks services / start-all.bat).
     """
-    # Determine the base directory (works for both script and frozen .exe)
-    if getattr(sys, 'frozen', False):
+
+    # Determine the base directory.
+    # For normal Python execution this is the agent directory.
+    if getattr(sys, "frozen", False):
         base_dir = os.path.dirname(sys.executable)
     else:
-        base_dir = os.getcwd()
-    config_path = os.path.join(base_dir, 'config.ini')
+        base_dir = os.path.dirname(os.path.abspath(__file__))
 
-    # Load existing config or create a new one
-    config = configparser.ConfigParser()
+    config_path = os.path.join(base_dir, "config.ini")
+
+    # Load existing configuration.
+    agent_config = configparser.ConfigParser()
+
     if os.path.exists(config_path):
-        config.read(config_path)
-    if not config.has_section('AIBOO'):
-        config['AIBOO'] = {}
+        agent_config.read(config_path)
 
-    # Set default values if missing
+    if not agent_config.has_section("AIBOO"):
+        agent_config["AIBOO"] = {}
+
+    # Default configuration (env-aware so Docker/services need no edits).
     defaults = {
-        'remote_url': 'https://your-ngrok-url.ngrok-free.dev',
-        'api_key': 'dev-key-change-in-production',
-        'server_ip': '192.168.1.100',
-        'log_level': 'INFO',
+        "remote_url": os.environ.get("NODE_BACKEND", "http://localhost:4000"),
+        "api_key": os.environ.get("AGENT_API_KEY", "dev-key-change-in-production"),
+        "server_ip": "127.0.0.1",
+        "log_level": "INFO",
     }
-    for key, val in defaults.items():
-        if not config.has_option('AIBOO', key):
-            config['AIBOO'][key] = val
 
-    # Get current endpoint name
-    current_name = config.get('AIBOO', 'endpoint_name', fallback='').strip()
+    for key, value in defaults.items():
+        if not agent_config.has_option("AIBOO", key):
+            agent_config["AIBOO"][key] = value
 
-    # If empty or default placeholder, we need to set one
-    if not current_name or current_name.lower() in ('unknown', 'unknown_pc', ''):
-        # Check if we are running interactively (has a terminal)
-        if sys.stdin.isatty():
-            # Interactive prompt – safe to use print/input
+    # Get endpoint name.
+    current_name = agent_config.get(
+        "AIBOO",
+        "endpoint_name",
+        fallback=""
+    ).strip()
+
+    # Configure endpoint if missing.
+    if not current_name or current_name.lower() in (
+        "unknown",
+        "unknown_pc",
+        "unknown-pc",
+    ):
+
+        hostname = socket.gethostname()
+
+        # Only ask the user when explicitly requested.
+        interactive_mode = (
+            sys.stdin.isatty()
+            and os.environ.get("AIBOO_INTERACTIVE") == "1"
+        )
+
+        if interactive_mode:
+
             print("\n" + "=" * 50)
             print("  Welcome to AiBoO Agent!")
             print("=" * 50)
-            print("Please enter a unique name for this endpoint (e.g., 'Alice_Laptop'):")
-            new_name = input("> ").strip()
+            print(
+                "Please enter a unique name for this endpoint "
+                "(e.g., 'Alice_Laptop'):"
+            )
+
+            try:
+                new_name = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                new_name = ""
+
             if not new_name:
-                new_name = socket.gethostname()
-                print(f"No input provided. Using hostname: {new_name}")
-            config['AIBOO']['endpoint_name'] = new_name
-            with open(config_path, 'w') as f:
-                config.write(f)
-            print(f"[OK] Endpoint name set to: {new_name}")
-            print(f"Config saved to: {config_path}\n")
+                new_name = hostname
+
+            endpoint_name = new_name
+
         else:
-            # Running as a service (no console) – auto-set to hostname
-            hostname = socket.gethostname()
-            config['AIBOO']['endpoint_name'] = hostname
-            with open(config_path, 'w') as f:
-                config.write(f)
-            log.info(f"Service mode: auto-set endpoint name to {hostname}")
+            # Automatic service/start-all.bat mode.
+            endpoint_name = hostname
+
+            log.info(
+                "Service mode: auto-set endpoint name to %s",
+                endpoint_name
+            )
+
+        agent_config["AIBOO"]["endpoint_name"] = endpoint_name
+
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                agent_config.write(f)
+
+            log.info(
+                "Endpoint configuration saved: %s",
+                config_path
+            )
+
+        except OSError as exc:
+            log.error(
+                "Could not save endpoint configuration: %s",
+                exc
+            )
+
     else:
-        log.info(f"Using existing endpoint name: {current_name}")
+        log.info(
+            "Using existing endpoint name: %s",
+            current_name
+        )
+
+    # Surface the resolved backend target so misconfiguration is obvious.
+    log.info(
+        "Backend target: %s (api_key %s)",
+        agent_config.get("AIBOO", "remote_url"),
+        "set" if agent_config.get("AIBOO", "api_key") else "MISSING",
+    )
 
 
 def run_api_server(event_bus):
     """Run the FastAPI server in a background thread."""
-    # Use the configured port (default 8001) so the frontend, plugin and
-    # remote log senders — which all target port 8001 — can reach the agent.
-    log.info("[INFO] Starting API server on http://%s:%s", config.api_host, config.api_port)
+
+    log.info(
+        "[INFO] Starting API server on http://%s:%s",
+        config.api_host,
+        config.api_port,
+    )
+
     app = create_app(event_bus)
-    uvicorn.run(app, host=config.api_host, port=config.api_port, log_level="info")
+
+    uvicorn.run(
+        app,
+        host=config.api_host,
+        port=config.api_port,
+        log_level="info",
+    )
 
 
 async def main():
-    # Ensure endpoint name is configured before anything else
+
+    # Configure endpoint before starting services.
     ensure_endpoint_config()
 
+    # Create event bus.
     bus = EventBus()
 
-    api_thread = threading.Thread(target=run_api_server, args=(bus,), daemon=True)
+    # Start FastAPI server.
+    api_thread = threading.Thread(
+        target=run_api_server,
+        args=(bus,),
+        daemon=True,
+    )
+
     api_thread.start()
 
+    # Give API server time to initialize.
     await asyncio.sleep(2)
 
+    # Start orchestrator.
     orchestrator = Orchestrator(bus)
+
     await orchestrator.start()
 
-    log.info("[STARTUP] AiBoO started — API on port %s, orchestrator active", config.api_port)
+    log.info(
+        "[STARTUP] AiBoO started — API on port %s, orchestrator active",
+        config.api_port,
+    )
 
     try:
         while True:
             await asyncio.sleep(1)
+
     except KeyboardInterrupt:
         log.warning("Shutting down...")
+
     finally:
-        await orchestrator.shutdown()
+
+        try:
+            await orchestrator.shutdown()
+        except Exception as exc:
+            log.error(
+                "Error while shutting down orchestrator: %s",
+                exc,
+            )
+
         log.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
+
     try:
         asyncio.run(main())
+
     except KeyboardInterrupt:
         log.warning("Interrupted by user.")
+
+    except Exception:
+        log.exception("AiBoO Agent failed to start.")
+        sys.exit(1)
