@@ -36,10 +36,13 @@ try:
     WINDOWS_AVAILABLE = True
 except ImportError:
     WINDOWS_AVAILABLE = False
-    print("Warning: pywin32 not installed. Windows Event Log ingestion disabled.")
+    # Not on Windows (or pywin32 missing): the ingestor logs a warning and stays idle.
 
 from core.event_bus import EventBus
 from core.events import ThreatEvent, ThreatType, Severity
+from log_ingestion.windows_event_parser import (
+    BRUTE_FORCE_EVENT_IDS, BruteForceTracker, extract_fields, should_drop, task_is_suspicious,
+)
 
 log = logging.getLogger("WindowsIngestor")
 
@@ -48,13 +51,26 @@ log = logging.getLogger("WindowsIngestor")
 # Rule loading (YAML-based, no more hardcoded dicts)
 # ============================================================
 
-# Safe fallback rules — used only if YAML fails to load
+# Safe fallback rules — used only if YAML fails to load.
+# Keys are (channel, event_id): an event ID only means something inside its
+# own log (e.g. ID 1102 in the Application log is NOT "audit log cleared").
 _FALLBACK_RULES = {
-    4625: (ThreatType.IDENTITY_MISMATCH, Severity.HIGH),
-    1102: (ThreatType.ANOMALOUS_BEHAVIOR, Severity.CRITICAL),
+    ("Security", 4625): (ThreatType.IDENTITY_MISMATCH, Severity.MEDIUM),
+    ("Security", 4740): (ThreatType.IDENTITY_MISMATCH, Severity.HIGH),
+    ("Security", 1102): (ThreatType.ANOMALOUS_BEHAVIOR, Severity.CRITICAL),
 }
 
-_FALLBACK_CHANNELS = ["Security", "System", "Application"]
+_FALLBACK_CHANNELS = ["Security", "System"]
+
+# Default channel for a rule that does not name one
+_SYSTEM_LOG_EVENT_IDS = {7045, 7040, 7036, 104}
+
+_DEFAULT_SETTINGS = {
+    "brute_force_threshold": 5,
+    "brute_force_window_seconds": 300,
+    "max_events_per_poll": 2000,
+    "poll_interval_seconds": 2.0,
+}
 
 
 def _resolve_config_path() -> str:
@@ -62,14 +78,11 @@ def _resolve_config_path() -> str:
     Resolve path to config/event_rules.yaml — works both when running
     as a script and when bundled as a PyInstaller .exe.
     """
-    # PyInstaller: sys.executable is the .exe path
     if getattr(sys, "frozen", False):
         base = os.path.dirname(sys.executable)
     else:
-        # Running from source: this file is at agent/log_ingestion/windows_ingestor.py
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-    # Try a few common locations
     candidates = [
         os.path.join(base, "config", "event_rules.yaml"),
         os.path.join(base, "event_rules.yaml"),
@@ -78,53 +91,76 @@ def _resolve_config_path() -> str:
     for path in candidates:
         if os.path.exists(path):
             return path
-    return candidates[0]  # return first even if missing, for logging
+    return candidates[0]
+
+
+def _default_channel(event_id: int) -> str:
+    return "System" if event_id in _SYSTEM_LOG_EVENT_IDS else "Security"
+
+
+def parse_rules(data: dict):
+    """
+    Parse the YAML structure into (mapping, channels, settings).
+    Split out from file loading so it can be unit-tested.
+    """
+    mapping = {}
+    for rule in (data or {}).get("rules", []) or []:
+        try:
+            event_id = int(rule["event_id"])
+            channel = str(rule.get("channel") or _default_channel(event_id))
+            threat_type = ThreatType(rule["threat_type"])
+            severity = Severity(rule["severity"])
+            mapping[(channel.lower(), event_id)] = (threat_type, severity)
+        except (KeyError, ValueError, TypeError) as e:
+            log.warning(f"Skipping invalid rule {rule}: {e}")
+
+    channels = (data or {}).get("channels") or list(_FALLBACK_CHANNELS)
+    settings = dict(_DEFAULT_SETTINGS)
+    bf = (data or {}).get("brute_force") or {}
+    if isinstance(bf, dict):
+        if "threshold" in bf:
+            settings["brute_force_threshold"] = int(bf["threshold"])
+        if "window_seconds" in bf:
+            settings["brute_force_window_seconds"] = int(bf["window_seconds"])
+    return mapping, channels, settings
+
+
+def _fallback():
+    return ({(c.lower(), e): v for (c, e), v in _FALLBACK_RULES.items()},
+            list(_FALLBACK_CHANNELS), dict(_DEFAULT_SETTINGS))
 
 
 def _load_rules_from_yaml():
     """
-    Load event ID mapping and log channels from config/event_rules.yaml.
-    Returns (mapping_dict, channels_list, source_label).
+    Load event rules, channels and settings from config/event_rules.yaml.
+    Returns (mapping, channels, settings, source_label).
     """
     if not YAML_AVAILABLE:
         log.warning("pyyaml not available — using fallback rules")
-        return _FALLBACK_RULES, _FALLBACK_CHANNELS, "fallback (no pyyaml)"
+        return (*_fallback(), "fallback (no pyyaml)")
 
     config_path = _resolve_config_path()
     if not os.path.exists(config_path):
         log.warning(f"Rules file not found at {config_path} — using fallback rules")
-        return _FALLBACK_RULES, _FALLBACK_CHANNELS, "fallback (no file)"
+        return (*_fallback(), "fallback (no file)")
 
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
-
-        # Build event_id -> (ThreatType, Severity) mapping
-        mapping = {}
-        for rule in data.get("rules", []):
-            try:
-                event_id = int(rule["event_id"])
-                threat_type = ThreatType(rule["threat_type"])
-                severity = Severity(rule["severity"])
-                mapping[event_id] = (threat_type, severity)
-            except (KeyError, ValueError) as e:
-                log.warning(f"Skipping invalid rule {rule}: {e}")
-
-        channels = data.get("channels", _FALLBACK_CHANNELS)
+        mapping, channels, settings = parse_rules(data)
         if not mapping:
             log.warning("YAML loaded but no valid rules found — using fallback")
-            return _FALLBACK_RULES, channels, "fallback (empty yaml)"
-
+            fb_map, _, _ = _fallback()
+            return fb_map, channels, settings, "fallback (empty yaml)"
         log.info(f"Loaded {len(mapping)} event rules from {config_path}")
-        return mapping, channels, config_path
-
+        return mapping, channels, settings, config_path
     except Exception as e:
         log.error(f"Failed to load rules from {config_path}: {e}")
-        return _FALLBACK_RULES, _FALLBACK_CHANNELS, "fallback (parse error)"
+        return (*_fallback(), "fallback (parse error)")
 
 
 # Load rules at import time
-EVENT_ID_MAPPING, DEFAULT_CHANNELS, RULES_SOURCE = _load_rules_from_yaml()
+EVENT_ID_MAPPING, DEFAULT_CHANNELS, INGEST_SETTINGS, RULES_SOURCE = _load_rules_from_yaml()
 
 
 SEVERITY_WEIGHTS = {"low": 1, "medium": 2, "high": 3, "critical": 4}
@@ -156,30 +192,49 @@ class BaselineStats:
 
 
 class WindowsEventIngestor:
+    """
+    Tails the classic Windows event logs (Security, System, ...).
+
+    At start-up it remembers the newest record number in each log and from
+    then on only reads records that arrive AFTER that — old history is
+    never replayed. Every poll cycle visits every channel in turn.
+    """
+
     def __init__(
         self,
         bus: EventBus,
         log_names: list[str] = None,
         min_severity: Severity = Severity.HIGH,
+        rules: Optional[dict] = None,
+        settings: Optional[dict] = None,
     ):
-        if not WINDOWS_AVAILABLE:
-            raise RuntimeError("win32evtlog not available. Install pywin32.")
-
         self.bus = bus
-        self.log_names = log_names or DEFAULT_CHANNELS
+        self.log_names = list(log_names or DEFAULT_CHANNELS)
         self.min_severity = min_severity
+        self.rules = rules if rules is not None else EVENT_ID_MAPPING
+        self.settings = {**_DEFAULT_SETTINGS, **INGEST_SETTINGS, **(settings or {})}
         self._running = False
         self._event_queue: queue.Queue = queue.Queue(maxsize=10000)
         self._baseline = BaselineStats()
+        self._brute_force = BruteForceTracker(
+            threshold=self.settings["brute_force_threshold"],
+            window_seconds=self.settings["brute_force_window_seconds"],
+        )
+        self._stats = {"read": 0, "published": 0, "dropped_noise": 0}
+
+        if not WINDOWS_AVAILABLE:
+            log.warning("pywin32 not available — Windows Event Log ingestion disabled on this OS.")
+            return
 
         log.info(
             "WindowsEventIngestor initialized — %d rules loaded from %s",
-            len(EVENT_ID_MAPPING),
-            RULES_SOURCE,
+            len(self.rules), RULES_SOURCE,
         )
-        log.info("Monitoring %d log channels: %s", len(self.log_names), self.log_names)
 
     async def start(self, tail_only: bool = True):
+        if not WINDOWS_AVAILABLE:
+            log.warning("Windows Event Log ingestion skipped (not running on Windows / no pywin32).")
+            return
         log.info(f"Starting Windows Event Log ingestion from: {self.log_names}")
         self._running = True
 
@@ -192,186 +247,210 @@ class WindowsEventIngestor:
 
         await self._process_events()
 
-    def _poll_events(self, tail_only: bool):
-        for log_name in self.log_names:
-            try:
-                hand = win32evtlog.OpenEventLog(None, log_name)
-                flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
+    # ------------------------------------------------------------------
+    # Reading (runs in a background thread)
+    # ------------------------------------------------------------------
 
-                while self._running:
-                    try:
-                        events = win32evtlog.ReadEventLog(hand, flags, 0)
-                    except Exception as read_err:
-                        log.debug(f"Read error on {log_name}: {read_err}")
+    @staticmethod
+    def _newest_record(log_name: str) -> int:
+        hand = win32evtlog.OpenEventLog(None, log_name)
+        try:
+            total = win32evtlog.GetNumberOfEventLogRecords(hand)
+            oldest = win32evtlog.GetOldestEventLogRecord(hand)
+            return (oldest + total - 1) if total else 0
+        finally:
+            win32evtlog.CloseEventLog(hand)
+
+    def _read_new_records(self, log_name: str, last_seen: int) -> tuple[list, int]:
+        """
+        Return (records newer than last_seen in chronological order, new last_seen).
+        Reads backwards from the newest record and stops at last_seen.
+        """
+        newest = self._newest_record(log_name)
+        if newest == last_seen:
+            return [], last_seen
+        if newest < last_seen:
+            # Log was cleared (record numbers restarted): read what's there now
+            log.warning("Event log %s was cleared or wrapped — resyncing", log_name)
+            last_seen = 0
+
+        limit = int(self.settings["max_events_per_poll"])
+        collected = []
+        hand = win32evtlog.OpenEventLog(None, log_name)
+        try:
+            flags = win32evtlog.EVENTLOG_BACKWARDS_READ | win32evtlog.EVENTLOG_SEQUENTIAL_READ
+            done = False
+            while not done:
+                batch = win32evtlog.ReadEventLog(hand, flags, 0)
+                if not batch:
+                    break
+                for ev in batch:
+                    if ev.RecordNumber <= last_seen:
+                        done = True
                         break
+                    collected.append(ev)
+                    if len(collected) >= limit:
+                        log.warning("More than %d new events in %s — skipping older ones", limit, log_name)
+                        done = True
+                        break
+        finally:
+            win32evtlog.CloseEventLog(hand)
 
-                    for event in events:
-                        try:
-                            self._event_queue.put((log_name, event), timeout=1)
-                        except queue.Full:
-                            log.warning(f"Event queue full — dropping event from {log_name}")
+        if collected:
+            last_seen = max(last_seen, max(ev.RecordNumber for ev in collected))
+        collected.reverse()
+        return collected, last_seen
 
-                    threading.Event().wait(0.5)
-
+    def _poll_events(self, tail_only: bool):
+        last_seen: dict[str, int] = {}
+        for name in self.log_names:
+            if "/" in name:
+                # Modern channels (Microsoft-Windows-.../Operational) cannot be
+                # opened with the classic OpenEventLog API.
+                log.info("Skipping channel '%s' (not readable with the classic event log API)", name)
+                continue
+            try:
+                last_seen[name] = self._newest_record(name) if tail_only else 0
+                log.info("Watching '%s' for new events (starting after record %d)", name, last_seen[name])
             except Exception as e:
-                log.error(f"Failed to read log {log_name}: {e}")
+                hint = " — run the agent as Administrator to read the Security log" \
+                    if name.lower() == "security" else ""
+                log.error("Cannot open event log '%s': %s%s", name, e, hint)
+
+        if not last_seen:
+            log.error("No Windows event logs could be opened — ingestion idle.")
+            return
+
+        interval = float(self.settings["poll_interval_seconds"])
+        error_logged: set[str] = set()
+        stop = threading.Event()
+        while self._running:
+            for name in list(last_seen):
+                try:
+                    records, last_seen[name] = self._read_new_records(name, last_seen[name])
+                    error_logged.discard(name)
+                except Exception as e:
+                    if name not in error_logged:
+                        log.warning("Read error on '%s': %s", name, e)
+                        error_logged.add(name)
+                    continue
+                for ev in records:
+                    try:
+                        self._event_queue.put((name, ev), timeout=1)
+                    except queue.Full:
+                        log.warning("Event queue full — dropping event from %s", name)
+            stop.wait(interval)
+
+    # ------------------------------------------------------------------
+    # Processing (async)
+    # ------------------------------------------------------------------
 
     async def _process_events(self):
         loop = asyncio.get_event_loop()
         while self._running:
             try:
                 log_name, event = await loop.run_in_executor(
-                    None, self._event_queue.get, True, 0.1
+                    None, self._event_queue.get, True, 0.5
                 )
-                threat_event = self._normalize_event(log_name, event)
-                if threat_event and threat_event.severity.weight >= self.min_severity.weight:
-                    self._baseline.update(threat_event.threat_type.value, threat_event.timestamp)
-                    await self.bus.publish(threat_event)
             except queue.Empty:
-                await asyncio.sleep(0.1)
+                continue
+            try:
+                self._stats["read"] += 1
+                threat_event = self._normalize_event(log_name, event)
+                if threat_event is None:
+                    continue
+                threat_event = self._apply_brute_force(threat_event)
+                if threat_event.severity.weight >= self.min_severity.weight:
+                    self._baseline.update(threat_event.threat_type.value, threat_event.timestamp)
+                    self._stats["published"] += 1
+                    log.info("Windows event %s -> %s: %s",
+                             threat_event.payload.get("event_id_raw"),
+                             threat_event.severity.value,
+                             threat_event.payload.get("description"))
+                    await self.bus.publish(threat_event)
             except Exception as e:
                 log.error(f"Error processing event: {e}")
 
+    def _apply_brute_force(self, threat_event: ThreatEvent) -> ThreatEvent:
+        """Escalate repeated failed logons (same user or IP) to one HIGH alert."""
+        p = threat_event.payload
+        if p.get("event_id_raw") not in BRUTE_FORCE_EVENT_IDS:
+            return threat_event
+        if p.get("event_id_raw") == 4776 and not p.get("failure_reason"):
+            return threat_event
+        ts = threat_event.timestamp if isinstance(threat_event.timestamp, datetime) else datetime.now()
+        hit = self._brute_force.record(p, ts.replace(tzinfo=None))
+        if not hit:
+            return threat_event
+        window_min = max(int(self.settings["brute_force_window_seconds"]) // 60, 1)
+        who = f"user '{hit['key']}'" if hit["kind"] == "user" else f"IP {hit['key']}"
+        p["brute_force"] = True
+        p["failed_attempts"] = hit["count"]
+        p["description"] = (
+            f"Possible password guessing: {hit['count']} failed logons for {who} "
+            f"in {window_min} min (last: {p.get('failure_reason', 'unknown reason')}"
+            + (f", from {p['src_ip']}" if p.get("src_ip") not in (None, "", "unknown") else "")
+            + ")"
+        )
+        if threat_event.severity.weight < Severity.HIGH.weight:
+            threat_event.severity = Severity.HIGH
+        return threat_event
+
     def _normalize_event(self, log_name: str, event) -> Optional[ThreatEvent]:
         try:
-            event_id = event.EventID
-            threat_type, severity = EVENT_ID_MAPPING.get(
-                event_id, (ThreatType.ANOMALOUS_BEHAVIOR, Severity.MEDIUM)
-            )
+            # Classic API returns the full 32-bit ID (qualifiers in the high
+            # word, e.g. 7045 arrives as 0x40001B85) — keep the real ID.
+            event_id = int(event.EventID) & 0xFFFF
+            rule = self.rules.get((log_name.lower(), event_id))
+            if rule is None:
+                return None  # not a rule we watch in this channel
+            threat_type, severity = rule
 
-            strings = event.StringInserts or []
+            strings = list(event.StringInserts or [])
+            fields = extract_fields(event_id, strings)
+            if should_drop(event_id, fields):
+                self._stats["dropped_noise"] += 1
+                return None
 
-            # ---- Base payload with standardised CSDE fields ----
+            # A new scheduled task is only interesting if it runs something
+            # script-like; updaters register harmless tasks all the time.
+            if event_id == 4698 and not task_is_suspicious(fields.get("task_command", "")):
+                severity = Severity.MEDIUM
+
+            ts = event.TimeGenerated
             payload = {
                 "event_id_raw": event_id,
+                "record_number": getattr(event, "RecordNumber", None),
                 "log_name": log_name,
                 "computer_name": event.ComputerName,
-                "time_generated": event.TimeGenerated.isoformat(),
-                "timestamp": event.TimeGenerated.isoformat(),
-                "strings": strings,
+                "time_generated": ts.isoformat(),
+                "timestamp": ts.isoformat(),
+                "strings": strings[:25],
                 "user_id": "unknown",
                 "entity_id": "unknown",
                 "src_ip": "unknown",
                 "location": "",
                 "detected_location": "",
                 "claimed_location": "",
-                "device_id": "",
+                "device_id": event.ComputerName or "",
                 "anomaly_score": 0.0,
+                "windows_event": True,
             }
-
-            # ---- Field extraction by event ID ----
-            if event_id == 4625:  # Failed logon
-                user_id = strings[5] if len(strings) > 5 else "unknown"
-                src_ip = strings[18] if len(strings) > 18 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "src_ip": src_ip,
-                    "failure_reason": strings[2] if len(strings) > 2 else "unknown",
-                })
-            elif event_id == 4624:  # Successful logon
-                user_id = strings[5] if len(strings) > 5 else "unknown"
-                src_ip = strings[18] if len(strings) > 18 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "src_ip": src_ip,
-                })
-            elif event_id == 4648:  # Explicit credentials (RunAs)
-                user_id = strings[5] if len(strings) > 5 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                })
-            elif event_id == 4672:  # Admin logon
-                user_id = strings[1] if len(strings) > 1 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                })
-            elif event_id == 4688:  # Process creation
-                user_id = strings[4] if len(strings) > 4 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "process_name": strings[5] if len(strings) > 5 else "unknown",
-                    "command_line": strings[7] if len(strings) > 7 else "unknown",
-                })
-            elif event_id in (4673, 4674):  # Privilege escalation
-                user_id = strings[0] if len(strings) > 0 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "privilege": strings[2] if len(strings) > 2 else "unknown",
-                })
-            elif event_id == 1102:  # Audit log cleared
-                user_id = strings[1] if len(strings) > 1 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "severity_reason": "audit_log_cleared",
-                })
-            elif event_id == 4720:  # User account created
-                user_id = strings[0] if len(strings) > 0 else "unknown"
-                target_user = strings[1] if len(strings) > 1 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "target_user": target_user,
-                })
-            elif event_id == 5140:  # Network share accessed
-                user_id = strings[6] if len(strings) > 6 else "unknown"
-                share_name = strings[1] if len(strings) > 1 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "share_name": share_name,
-                })
-            elif event_id == 4768:  # Kerberos TGT
-                user_id = strings[0] if len(strings) > 0 else "unknown"
-                src_ip = strings[9] if len(strings) > 9 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "src_ip": src_ip,
-                })
-            elif event_id == 4769:  # Kerberos service ticket
-                user_id = strings[0] if len(strings) > 0 else "unknown"
-                src_ip = strings[6] if len(strings) > 6 else "unknown"
-                payload.update({
-                    "user_id": user_id,
-                    "entity_id": user_id,
-                    "src_ip": src_ip,
-                })
-            elif event_id == 7045:  # System log — new service
-                service_name = strings[0] if len(strings) > 0 else "unknown"
-                payload.update({
-                    "service_name": service_name,
-                    "entity_id": "system",
-                    "user_id": "system",
-                })
-            else:
-                # Generic fallback: try to get user from strings[0]
-                if strings and strings[0]:
-                    user_id = strings[0]
-                    if user_id and user_id != "unknown":
-                        payload["user_id"] = user_id
-                        payload["entity_id"] = user_id
-
-            # Ensure entity_id is always set
-            if payload["entity_id"] == "unknown" and payload["user_id"] != "unknown":
-                payload["entity_id"] = payload["user_id"]
-
-            # Compute anomaly score
-            anomaly_score = self._calculate_anomaly_score(threat_type.value)
-            payload["anomaly_score"] = anomaly_score
+            payload.update(fields)
+            if not payload.get("description"):
+                payload["description"] = f"Windows event {event_id} in the {log_name} log"
+            if payload.get("user_id") in (None, "", "-"):
+                payload["user_id"] = "unknown"
+            payload["entity_id"] = payload["user_id"] if payload["user_id"] != "unknown" \
+                else (payload.get("device_id") or "unknown")
+            payload["anomaly_score"] = self._calculate_anomaly_score(threat_type.value)
 
             return ThreatEvent(
                 source=f"windows_event_log:{log_name}",
                 threat_type=threat_type,
                 severity=severity,
                 payload=payload,
-                timestamp=event.TimeGenerated,
+                timestamp=ts,
             )
         except Exception as e:
             log.debug(f"Failed to normalize event: {e}")
@@ -388,4 +467,5 @@ class WindowsEventIngestor:
 
     async def stop(self):
         self._running = False
-        log.info("Windows Event Ingestor stopped")
+        log.info("Windows Event Ingestor stopped (read=%d, published=%d, noise dropped=%d)",
+                 self._stats["read"], self._stats["published"], self._stats["dropped_noise"])

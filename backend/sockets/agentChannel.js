@@ -119,6 +119,7 @@ export function registerAgentChannel(io) {
         cmd.status = data.status || cmd.status;
         cmd.completedAt = new Date().toISOString();
         cmd.error = data.error || null;
+        if (data.result && typeof data.result === 'object') cmd.result = data.result;
       }
       io.emit('command:ack', data);
       logger.info(
@@ -180,6 +181,7 @@ export function registerAgentChannel(io) {
         sentAt: command.sent_at,
         completedAt: null,
         error: null,
+        result: null,
       });
       trimCommandHistory();
 

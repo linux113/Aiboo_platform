@@ -232,3 +232,64 @@ export const apiHelpers = {
 };
 
 export default api;
+// ============================================================
+//  Remote command helpers (agent command channel)
+// ============================================================
+
+export interface CommandOutcome {
+  status: "executed" | "failed" | "timeout";
+  error?: string | null;
+  result?: Record<string, unknown> | null;
+}
+
+/**
+ * Poll GET /agent/commands until the agent acknowledges `cmdId` as
+ * executed or failed (or the timeout passes).
+ */
+export async function waitForCommand(
+  cmdId: string,
+  timeoutMs = 20000,
+  onProgress?: (status: string) => void
+): Promise<CommandOutcome> {
+  const deadline = Date.now() + timeoutMs;
+  let last = "sent";
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 1000));
+    try {
+      const res = await api.get("/agent/commands");
+      const list: {
+        cmd_id: string;
+        status: string;
+        error?: string | null;
+        result?: Record<string, unknown> | null;
+      }[] = Array.isArray(res.data?.commands) ? res.data.commands : [];
+      const cmd = list.find((c) => c.cmd_id === cmdId);
+      if (!cmd) continue;
+      if (cmd.status === "executed" || cmd.status === "failed") {
+        return { status: cmd.status, error: cmd.error ?? null, result: cmd.result ?? null };
+      }
+      if (cmd.status !== last) {
+        last = cmd.status;
+        onProgress?.(cmd.status);
+      }
+    } catch {
+      /* keep polling */
+    }
+  }
+  return { status: "timeout" };
+}
+
+/** Human-readable message from an axios error. */
+export function apiErrorMessage(e: unknown, fallback = "Request failed"): string {
+  const err = e as {
+    response?: { data?: { error?: string; message?: string; detail?: string } };
+    message?: string;
+  };
+  return (
+    err.response?.data?.error ||
+    err.response?.data?.message ||
+    err.response?.data?.detail ||
+    err.message ||
+    fallback
+  );
+}

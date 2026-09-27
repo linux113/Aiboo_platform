@@ -249,6 +249,82 @@ class CorrelationEngine:
                     return str(entity)
         return None
 
+    # Values that identify nobody in particular — never link findings on them
+    _IGNORED_ENTITIES = {
+        "", "unknown", "none", "null", "-", "?", "n/a",
+        "system", "local service", "network service", "anonymous logon",
+        "127.0.0.1", "::1", "0.0.0.0", "localhost",
+    }
+    _ENTITY_KEYS = ("user_id", "src_ip", "entity_id", "target_user", "dst_ip")
+
+    def _entities(self, finding: AgentFinding) -> set[str]:
+        """
+        Every concrete identity (user / IP) mentioned by a finding.
+
+        Two findings are only linked when they share one of these. Machine
+        names are deliberately NOT used: on a single PC every event shares
+        the machine name, which linked unrelated events together.
+        """
+        meta = finding.metadata or {}
+        containers = [meta]
+        for key in ("payload", "raw_payload"):
+            c = meta.get(key)
+            if isinstance(c, dict):
+                containers.append(c)
+                raw = c.get("raw_payload")
+                if isinstance(raw, dict):
+                    containers.append(raw)
+
+        machine_names = set()
+        for c in containers:
+            for key in ("device_id", "computer_name"):
+                if c.get(key):
+                    machine_names.add(str(c[key]).strip().lower())
+
+        found: set[str] = set()
+        for c in containers:
+            for key in self._ENTITY_KEYS:
+                val = c.get(key)
+                if val is None or isinstance(val, (dict, list)):
+                    continue
+                v = str(val).strip().lower()
+                if "\\" in v:
+                    v = v.split("\\")[-1]
+                if v in self._IGNORED_ENTITIES or v.endswith("$") or v in machine_names:
+                    continue
+                if v.startswith(("dwm-", "umfd-")):
+                    continue
+                found.add(v)
+        return found
+
+    def _match_by_entity(self, required_types: set) -> tuple[list[AgentFinding], str] | tuple[None, None]:
+        """
+        Find one finding per required type that all mention the same entity.
+        Prefers the most recent evidence. Returns (findings, entity).
+        """
+        # entity -> {threat_type: newest finding}
+        by_entity: dict[str, dict] = defaultdict(dict)
+        newest_ts: dict[str, datetime] = {}
+        for ttype in required_types:
+            for f in sorted(self._buffer[ttype], key=lambda x: _ts_aware(x.timestamp), reverse=True):
+                for ent in self._entities(f):
+                    if ttype not in by_entity[ent]:
+                        by_entity[ent][ttype] = f
+                        ts = _ts_aware(f.timestamp)
+                        if ent not in newest_ts or ts > newest_ts[ent]:
+                            newest_ts[ent] = ts
+
+        candidates = [
+            ent for ent, per_type in by_entity.items()
+            if set(per_type) >= set(required_types)
+            # must be at least two different underlying events
+            and len({f.event_id for f in per_type.values()}) > 1
+        ]
+        if not candidates:
+            return None, None
+        best = max(candidates, key=lambda e: newest_ts.get(e, datetime.min.replace(tzinfo=timezone.utc)))
+        return [by_entity[best][t] for t in required_types], best
+
     async def _evaluate_patterns(self) -> None:
         active_types = {t for t, findings in self._buffer.items() if findings}
 
@@ -257,15 +333,10 @@ class CorrelationEngine:
             if not required_types.issubset(active_types):
                 continue
 
-            # Gather the most recent finding per required type
-            matched: list[AgentFinding] = []
-            for ttype in required_types:
-                recent = sorted(
-                    self._buffer[ttype], key=lambda f: f.timestamp, reverse=True
-                )
-                if recent:
-                    matched.append(recent[0])
-
+            # Only link findings that are about the SAME user or IP.
+            # (Before, any two findings within 5 minutes were linked — e.g. a
+            # ransomware test got "correlated" with a SYSTEM logon.)
+            matched, entity = self._match_by_entity(required_types)
             if not matched:
                 continue
 
@@ -274,17 +345,18 @@ class CorrelationEngine:
             if max_weight < pattern["min_severity"].weight:
                 continue
 
-            # Also ensure they are from distinct sources or different agents to avoid self-correlation
-            # (but we allow same agent if different types)
-            await self._emit_correlated_alert(pattern, matched)
-            # Clear buffer to avoid duplicate alerts for the same pattern
+            await self._emit_correlated_alert(pattern, matched, entity)
+            # Remove just the linked findings so they aren't reused
+            used = {id(f) for f in matched}
             for ttype in required_types:
-                self._buffer[ttype] = []
+                self._buffer[ttype] = [f for f in self._buffer[ttype] if id(f) not in used]
+            active_types = {t for t, findings in self._buffer.items() if findings}
 
     async def _emit_correlated_alert(
         self,
         pattern: dict,
         findings: list[AgentFinding],
+        entity: str | None = None,
     ) -> None:
         avg_conf = sum(f.confidence for f in findings) / len(findings)
         boosted = min(avg_conf + pattern["boost"], 1.0)
@@ -320,8 +392,9 @@ class CorrelationEngine:
             severity=max_sev,
             confidence=round(boosted, 2),
             description=(
-                f"[CORRELATED] {pattern['name']}. "
-                f"Linked findings: {', '.join(f.agent_name for f in findings)}."
+                f"[CORRELATED] {pattern['name']}"
+                + (f" (same entity: {entity})" if entity else "")
+                + f". Linked findings: {', '.join(f.agent_name for f in findings)}."
             ),
             findings=findings,
             actions=all_actions,

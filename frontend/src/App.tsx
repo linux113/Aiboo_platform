@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { io, Socket } from "socket.io-client";
 import { cn } from "./utils/cn";
-import api, { authH, setToken as storeToken, getToken, clearToken, API, SOCKET_URL, CV_URL, AGENT_URL } from "./utils/api";
+import api, { authH, setToken as storeToken, getToken, clearToken, API, SOCKET_URL, CV_URL, AGENT_URL, waitForCommand, apiErrorMessage } from "./utils/api";
 import { logger } from "./utils/logger";
 import Login from "./Login";
 import TopBar from "./components/TopBar";
@@ -89,6 +89,8 @@ export default function App() {
   const [correlated, setCorrelated] = useState<CorrelatedAlert[]>([]);
   const [gateDecisions, setGateDecisions] = useState<GateDecision[]>([]);
   const [pseudoLocks, setPseudoLocks] = useState<PseudoLock[]>([]);
+  // lock ids already shown, so updates (e.g. "restoring") don't re-notify
+  const seenLocksRef = useRef<Set<string>>(new Set());
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [userName, setUserName] = useState("Akshay Upadhyay");
   const [userEmail, setUserEmail] = useState("admin@example.com");
@@ -161,7 +163,9 @@ export default function App() {
       setFindings(extract<AgentFinding>(f));
       setCorrelated(extract<CorrelatedAlert>(cor));
       setGateDecisions(extract<GateDecision>(gates));
-      setPseudoLocks(extract<PseudoLock>(locks));
+      const lockList = extract<PseudoLock>(locks);
+      lockList.forEach(l => seenLocksRef.current.add(l.lock_id));
+      setPseudoLocks(lockList);
 
       // ---- CHANGED: parse endpoint objects ----
       const endpointList: EndpointInfo[] = Array.isArray(endpointsResp.data)
@@ -324,14 +328,24 @@ export default function App() {
     });
     socket.on("agent:gate", (g: GateDecision) => setGateDecisions(p => [g, ...p.slice(0, 199)]));
     socket.on("agent:pseudo-lock", (l: PseudoLock) => {
+      const isNew = !seenLocksRef.current.has(l.lock_id);
+      seenLocksRef.current.add(l.lock_id);
       setPseudoLocks(p => {
         const e = p.find(x => x.lock_id === l.lock_id);
-        return e ? p.map(x => x.lock_id === l.lock_id ? l : x) : [l, ...p];
+        return e ? p.map(x => x.lock_id === l.lock_id ? { ...x, ...l } : x) : [l, ...p];
       });
-      addNotif("warning", "Pseudo-Lock Applied", `Endpoint isolation active: ${l.lock_id}`);
+      if (isNew && l.active && !l.restoring) {
+        addNotif("warning", "Pseudo-Lock Applied",
+          l.decoy_port ? `Decoy port ${l.decoy_port} opened on ${l.source || "endpoint"} (${l.lock_id})` : `Endpoint isolation active: ${l.lock_id}`);
+      }
     });
-    socket.on("agent:pseudo-lock-restore", ({ lock_id }: { lock_id: string }) =>
-      setPseudoLocks(p => p.map(l => l.lock_id === lock_id ? { ...l, active: false } : l))
+    socket.on("agent:pseudo-lock-restore", ({ lock_id, restored_at, message }: { lock_id: string; restored_at?: string; message?: string }) =>
+      setPseudoLocks(p => p.map(l => l.lock_id === lock_id
+        ? { ...l, active: false, restoring: false, restored_at: restored_at || new Date().toISOString(), restore_message: message || l.restore_message }
+        : l))
+    );
+    socket.on("war-room:opened", (w: { opened_by?: string; note?: string }) =>
+      addNotif("critical", "War Room Opened", `${w.opened_by || "An analyst"} opened a war room${w.note ? `: ${w.note}` : ""}`)
     );
 
     // ---- NEW: live response actions for Isolation & Termination tab ----
@@ -398,12 +412,40 @@ export default function App() {
     return () => clearInterval(hiv);
   }, [token]);
 
+  // Restore = ask the agent that opened the decoy to close the real port.
+  // The lock only flips to RESTORED once the agent confirms.
   const restoreLock = async (lockId: string) => {
+    const setLock = (patch: Partial<PseudoLock>) =>
+      setPseudoLocks(p => p.map(l => l.lock_id === lockId ? { ...l, ...patch } : l));
+    setLock({ restoring: true });
     try {
-      await api.post(`${API}/agent/pseudo-locks/${lockId}/restore`, {}, authH());
-      setPseudoLocks(p => p.map(l => l.lock_id === lockId ? { ...l, active: false } : l));
-    } catch {
-      addNotif("warning", "Failed to restore lock", "Could not restore pseudo-lock");
+      const res = await api.post(`${API}/agent/pseudo-locks/${lockId}/restore`, {}, authH());
+      const data = res.data || {};
+      if (data.already_restored) {
+        setLock({ active: false, restoring: false });
+        return;
+      }
+      if (!data.dispatched) {
+        // agent offline: backend cleared it and explained why
+        setLock({ active: false, restoring: false, restored_at: new Date().toISOString(), restore_message: data.note });
+        addNotif("warning", "Lock cleared on dashboard only", data.note || "Agent not connected");
+        return;
+      }
+      const outcome = await waitForCommand(data.cmd_id);
+      if (outcome.status === "executed") {
+        const msg = String(outcome.result?.message || "Decoy port closed");
+        setLock({ active: false, restoring: false, restored_at: new Date().toISOString(), restore_message: msg });
+        addNotif("info", "Pseudo-Lock Restored", `${lockId}: ${msg}`);
+      } else if (outcome.status === "failed") {
+        setLock({ restoring: false });
+        addNotif("warning", "Restore failed", outcome.error || "Agent could not close the decoy");
+      } else {
+        setLock({ restoring: false });
+        addNotif("warning", "Restore pending", `No answer from ${data.endpoint} within 20s - check the agent window`);
+      }
+    } catch (e) {
+      setLock({ restoring: false });
+      addNotif("warning", "Failed to restore lock", apiErrorMessage(e, "Could not restore pseudo-lock"));
     }
   };
 
@@ -472,7 +514,7 @@ export default function App() {
               </div>
             ) : (
               <>
-                {active === "dashboard" && <DashboardModule threats={threats} detections={detections} cameras={cameras} findings={findings} correlated={correlated} activeLocks={activeLocks} sources={sources} />}
+                {active === "dashboard" && <DashboardModule threats={threats} detections={detections} cameras={cameras} findings={findings} correlated={correlated} activeLocks={activeLocks} sources={sources} onNotify={addNotif} />}
                 {active === "surveillance" && <SurveillanceModule cameras={cameras} detections={detections} onCamsChange={setCameras} />}
                 {active === "intelligence" && <IntelligenceModule detections={detections} cameras={cameras} findings={findings} />}
                 {active === "agent" && (

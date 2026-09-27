@@ -33,6 +33,7 @@ import json
 import re
 
 from core.base_agent import BaseAgent
+from core.local_events import is_windows_event, windows_event_finding
 from core.event_bus import EventBus
 from core.events import (
     AgentFinding, ResponseAction, Severity,
@@ -140,6 +141,10 @@ class ZeroTrustAgent(BaseAgent):
     5. Behavioral verification (how you normally behave)
     """
     
+    # Owns identity events read from the Windows Event Log (logon failures,
+    # lockouts). Other Windows events are reported by CyberThreatAgent.
+    windows_event_types = frozenset({ThreatType.IDENTITY_MISMATCH})
+
     def __init__(self, bus: EventBus) -> None:
         super().__init__("ZeroTrustAgent", bus)
         
@@ -194,6 +199,12 @@ class ZeroTrustAgent(BaseAgent):
         Perform Zero Trust analysis on the event.
         This is the main entry point for all Zero Trust evaluations.
         """
+        # Windows Event Log records carry no identity factors (token,
+        # biometrics, behaviour profile). Verifying them always "FAILED",
+        # so just report what Windows recorded.
+        if is_windows_event(event):
+            return windows_event_finding(self.name, event)
+
         # Determine event type and route to appropriate handler
         if event.threat_type == ThreatType.ACCESS_REQUEST:
             return await self._handle_access_request(event)
@@ -419,7 +430,7 @@ class ZeroTrustAgent(BaseAgent):
             actions.append(ResponseAction.ISOLATE_ASSET)
             actions.append(ResponseAction.ESCALATE_SOC)
             severity = Severity.CRITICAL
-            summary = f"🚨 HONEYPOT ACCESS detected from {src_ip} to {dst_ip}:{dst_port}"
+            summary = f"HONEYPOT ACCESS detected from {src_ip} to {dst_ip}:{dst_port}"
         
         elif traffic_anomaly.get("is_anomalous", False):
             risk_score += 0.4
@@ -435,6 +446,7 @@ class ZeroTrustAgent(BaseAgent):
         
         else:
             summary = f"Network traffic verified: {src_ip} -> {dst_ip}:{dst_port}"
+            severity = Severity.LOW  # all clear: not an alert
         
         return AgentFinding(
             agent_name=self.name,
@@ -481,7 +493,7 @@ class ZeroTrustAgent(BaseAgent):
             actions.append(ResponseAction.NOTIFY_SECURITY)
             actions.append(ResponseAction.ESCALATE_SOC)
             severity = Severity.CRITICAL
-            summary = f"🚨 UNAUTHORIZED PHYSICAL ACCESS to restricted zone: {zone} by {user_id}"
+            summary = f"UNAUTHORIZED PHYSICAL ACCESS to restricted zone: {zone} by {user_id}"
         
         elif not badge_scan or not face_match:
             risk_score = 0.5
@@ -497,6 +509,7 @@ class ZeroTrustAgent(BaseAgent):
         
         else:
             summary = f"Physical access granted to {zone} by {user_id}"
+            severity = Severity.LOW  # all clear: not an alert
         
         return AgentFinding(
             agent_name=self.name,
@@ -542,6 +555,7 @@ class ZeroTrustAgent(BaseAgent):
             summary = f"Medium behavioral anomaly for {user_id}: {details}"
         else:
             summary = f"Behavioral profile normal for {user_id}"
+            severity = Severity.LOW  # all clear: not an alert
         
         return AgentFinding(
             agent_name=self.name,
@@ -588,6 +602,7 @@ class ZeroTrustAgent(BaseAgent):
         
         else:
             summary = f"Insider activity normal for {user_id}"
+            severity = Severity.LOW  # all clear: not an alert
         
         return AgentFinding(
             agent_name=self.name,
@@ -920,7 +935,7 @@ class ZeroTrustAgent(BaseAgent):
         # Check if destination IP is in honeypot range
         for hp_ip in honeypot_ips:
             if self._ip_in_network(dst_ip, hp_ip):
-                log.warning(f"🚨 Honeypot access detected: {src_ip} -> {dst_ip}:{dst_port}")
+                log.warning(f"Honeypot access detected: {src_ip} -> {dst_ip}:{dst_port}")
                 return True
         
         return False

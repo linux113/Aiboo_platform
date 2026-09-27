@@ -19,6 +19,7 @@ from .events import (
     CorrelatedAlert,
     GateDecision,
     ResponseAction,
+    PseudoLockUpdate,
 )
 from .config import config
 from .alert_queue import OfflineQueueManager
@@ -146,6 +147,7 @@ class DashboardBridge:
         self._bus.subscribe(GateDecision, self._on_gate_decision)
         # NEW: every executed response action (isolate / terminate / quarantine / etc.)
         self._bus.subscribe(ActionRecord, self._on_action)
+        self._bus.subscribe(PseudoLockUpdate, self._on_pseudo_lock_update)
 
         log.info(
             "DashboardBridge subscribed to AgentFinding, CorrelatedAlert, "
@@ -219,24 +221,37 @@ class DashboardBridge:
         payload["source"] = self._endpoint_id
 
         await self._queue.add_to_endpoint("findings", payload)
+        # Pseudo-lock rows are NOT created here any more: a finding only
+        # *asks* for a lock. The row is created by _on_pseudo_lock_update
+        # once PseudoLockAgent has really opened the decoy port.
 
-        # Also handle pseudo‑lock if action includes it
-        is_pseudo_lock = (
-            any(a == ResponseAction.PSEUDO_LOCK for a in event.actions)
-            or "lock_id" in event.metadata
-        )
-        if is_pseudo_lock:
-            lock_payload = {
-                "lock_id": event.metadata.get("lock_id", f"lock_{event.event_id}"),
+    async def _on_pseudo_lock_update(self, event: PseudoLockUpdate) -> None:
+        """A decoy port was really opened (active) or really closed."""
+        if event.active:
+            payload = {
+                "lock_id": event.lock_id,
                 "event_id": event.event_id,
-                "agent": event.agent_name,
-                "severity": event.severity.value if hasattr(event.severity, 'value') else str(event.severity),
+                "agent": event.agent,
+                "severity": (event.severity or "high").lower(),
                 "summary": event.summary,
                 "active": True,
                 "locked_at": _as_iso(event.timestamp),
+                "decoy_port": event.decoy_port,
+                "decoy_endpoint": event.decoy_endpoint,
+                "original_endpoint": event.original_endpoint,
                 "source": self._endpoint_id,
             }
-            await self._queue.add_to_endpoint("pseudo-lock", lock_payload)
+            await self._queue.add_to_endpoint("pseudo-lock", payload)
+        else:
+            payload = {
+                "lock_id": event.lock_id,
+                "restored_at": _as_iso(event.timestamp),
+                "decoy_port": event.decoy_port,
+                "hits": event.hits,
+                "message": event.message,
+                "source": self._endpoint_id,
+            }
+            await self._queue.add_to_endpoint("pseudo-lock-restore", payload)
 
     async def _on_correlated(self, event: CorrelatedAlert) -> None:
         payload = _serialize(event)
@@ -322,21 +337,7 @@ class DashboardBridge:
                 status,
             )
 
-            # Extra fan-out for pseudo-locks so the legacy pseudo-lock view
-            # stays populated even when the action came from the engine
-            # directly rather than from an AgentFinding.
-            if action == "pseudo_lock" and status in ("success", "active"):
-                lock_payload = {
-                    "lock_id": event.metadata.get("lock_id", payload["id"]),
-                    "event_id": payload["triggered_by"] or payload["id"],
-                    "agent": payload["agent"],
-                    "severity": payload["severity"],
-                    "summary": payload["details"] or payload["reason"] or "Pseudo-lock deployed",
-                    "active": True,
-                    "locked_at": payload["timestamp"],
-                    "source": self._endpoint_id,
-                }
-                await self._queue.add_to_endpoint("pseudo-lock", lock_payload)
+            # (Pseudo-lock rows come from PseudoLockUpdate, not from here.)
 
         except Exception as exc:  # never let a bridge failure kill the engine
             log.exception("Failed to forward ActionRecord: %s", exc)

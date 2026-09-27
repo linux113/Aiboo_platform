@@ -26,7 +26,7 @@ from core.base_agent import BaseAgent
 from core.event_bus import EventBus
 from core.events import (
     AgentFinding, ResponseAction, Severity,
-    ThreatEvent, ThreatType, PseudoLockRestoreRequest,
+    ThreatEvent, ThreatType, PseudoLockRestoreRequest, PseudoLockUpdate,
 )
 
 
@@ -102,7 +102,7 @@ class PseudoLockAgent(BaseAgent):
             finding.event_id, finding.agent_name, finding.severity.value,
         )
         try:
-            await self._apply_pseudo_lock(finding)
+            await self.open_lock(f"lock_{finding.event_id}", finding)
         except Exception as exc:
             self.log.error(
                 "Failed to apply pseudo-lock for event [%s]: %s",
@@ -114,14 +114,38 @@ class PseudoLockAgent(BaseAgent):
     # ============================================================
 
     async def _apply_pseudo_lock(self, finding: AgentFinding) -> None:
+        """Backwards-compatible wrapper."""
+        await self.open_lock(f"lock_{finding.event_id}", finding)
+
+    @staticmethod
+    def _original_endpoint(event) -> str:
+        meta = getattr(event, "metadata", None) or {}
+        raw = meta.get("raw_payload") or {}
+        payload = meta.get("payload") or {}
+        if not raw and isinstance(payload, dict):
+            raw = payload.get("raw_payload") or payload
+        src = (raw.get("src_ip") or raw.get("target") or raw.get("user_id")
+               or meta.get("target") or "unknown")
+        port = raw.get("dst_port", "unknown")
+        return f"{src}:{port}"
+
+    async def open_lock(self, lock_id: str, event=None) -> LockRecord:
         """
-        Bind a real TCP listener on a random high port.
+        Bind a real TCP listener on a random high port for ``lock_id``.
 
         The decoy accepts any connection, sends a fake service banner,
         reads up to 1 KB of client data, and logs everything. This is a
         genuine honeypot — `netstat` shows the listener and a live
         `telnet <agent-ip> <port>` will connect.
+
+        If the lock is already active (several agents flagged the same
+        event) the existing decoy is returned — no second socket is opened,
+        so every open port can always be closed again by Restore.
         """
+        existing = self._lock_registry.get(lock_id)
+        if existing and not existing.restored and lock_id in self._decoy_servers:
+            return existing
+
         decoy_port = _random_decoy_port()
         server: Optional[asyncio.AbstractServer] = None
 
@@ -148,14 +172,9 @@ class PseudoLockAgent(BaseAgent):
                 "all candidate ports were in use"
             )
 
-        # Extract original endpoint details for the record
-        meta      = finding.metadata.get("raw_payload", {}) or {}
-        orig_port = meta.get("dst_port", "unknown")
-        src_ip    = meta.get("src_ip", meta.get("user_id", "unknown"))
-        orig_ep   = f"{src_ip}:{orig_port}"
-        decoy_ep  = f"0.0.0.0:{decoy_port}"
+        orig_ep = self._original_endpoint(event) if event is not None else "unknown"
+        decoy_ep = f"0.0.0.0:{decoy_port}"
 
-        lock_id = f"lock_{finding.event_id}"
         record = LockRecord(
             original_endpoint=orig_ep,
             decoy_endpoint=decoy_ep,
@@ -165,32 +184,27 @@ class PseudoLockAgent(BaseAgent):
         self._decoy_servers[lock_id] = server
 
         self.log.warning(
-            "⚑  PSEUDO_LOCK applied — REAL decoy listening on 0.0.0.0:%s  "
+            "PSEUDO_LOCK applied — REAL decoy listening on 0.0.0.0:%s  "
             "[lock_id=%s, original=%s]",
             decoy_port, lock_id, orig_ep,
         )
 
-        # Publish a follow-up finding so the orchestrator sees the action taken
-        confirmation = AgentFinding(
-            agent_name  = self.name,
-            event_id    = finding.event_id,
-            threat_type = finding.threat_type,
-            severity    = finding.severity,
-            confidence  = 1.0,
-            summary     = (
-                f"Pseudo-Lock applied. Decoy listening on 0.0.0.0:{decoy_port}. "
+        severity = getattr(event, "severity", Severity.HIGH)
+        await self.bus.publish(PseudoLockUpdate(
+            lock_id=lock_id,
+            active=True,
+            event_id=str(getattr(event, "event_id", "") or ""),
+            agent=str(getattr(event, "agent_name", "") or self.name),
+            severity=severity.value if hasattr(severity, "value") else str(severity),
+            summary=(
+                f"Decoy listening on 0.0.0.0:{decoy_port}. "
                 f"Original endpoint {orig_ep} tracked for restore."
             ),
-            actions     = [ResponseAction.LOG, ResponseAction.ALERT_DASHBOARD],
-            metadata    = {
-                "lock_id":           lock_id,
-                "original_endpoint": orig_ep,
-                "decoy_endpoint":    decoy_ep,
-                "decoy_port":        decoy_port,
-                "listener_active":   True,
-            },
-        )
-        await self.bus.publish(confirmation)
+            decoy_port=decoy_port,
+            decoy_endpoint=decoy_ep,
+            original_endpoint=orig_ep,
+        ))
+        return record
 
     # ============================================================
     # Decoy connection handler
@@ -209,7 +223,7 @@ class PseudoLockAgent(BaseAgent):
         logs the peer IP and payload, then closes.
         """
         peer = writer.get_extra_info("peername")
-        self.log.warning("🎯 DECOY HIT from %s on port %s", peer, decoy_port)
+        self.log.warning("DECOY HIT from %s on port %s", peer, decoy_port)
 
         # Increment hit counter on the matching record
         for rec in self._lock_registry.values():
@@ -230,13 +244,13 @@ class PseudoLockAgent(BaseAgent):
             data = await asyncio.wait_for(reader.read(1024), timeout=10.0)
             if data:
                 self.log.warning(
-                    "🎯 DECOY DATA from %s (%d bytes): %r",
+                    "DECOY DATA from %s (%d bytes): %r",
                     peer, len(data), data[:200],
                 )
             else:
-                self.log.info("🎯 Decoy connection from %s closed with no data", peer)
+                self.log.info("Decoy connection from %s closed with no data", peer)
         except asyncio.TimeoutError:
-            self.log.info("🎯 Decoy connection from %s timed out (no data)", peer)
+            self.log.info("Decoy connection from %s timed out (no data)", peer)
         except Exception as exc:
             self.log.debug("Decoy read error from %s: %s", peer, exc)
 
@@ -264,6 +278,30 @@ class PseudoLockAgent(BaseAgent):
                 req.lock_id,
             )
 
+    async def remote_restore(self, target: str, params: Optional[dict] = None) -> dict:
+        """
+        Called by the CommandChannel when the dashboard presses Restore.
+
+        Closes the decoy if it is open. If this agent has no such open
+        decoy (already closed, or the agent was restarted — restarts close
+        every decoy), the dashboard is told so and the lock is cleared.
+        """
+        lock_id = str(target or "").strip()
+        if not lock_id:
+            raise RuntimeError("restore_pseudo_lock needs a lock id")
+        record = self._lock_registry.get(lock_id)
+        if record and not record.restored:
+            port = record.decoy_port
+            await self.restore(lock_id)
+            return {"lock_id": lock_id, "closed": True, "decoy_port": port,
+                    "message": f"Decoy port {port} closed"}
+
+        message = ("No open decoy for this lock on this PC "
+                   "(already closed, or the agent restarted — restarts close all decoys)")
+        self.log.info("Restore %s: %s", lock_id, message)
+        await self.bus.publish(PseudoLockUpdate(lock_id=lock_id, active=False, message=message))
+        return {"lock_id": lock_id, "closed": False, "message": message}
+
     async def restore(self, lock_id: str) -> bool:
         """
         Close the decoy listener and mark the record as restored.
@@ -279,7 +317,7 @@ class PseudoLockAgent(BaseAgent):
         if server:
             server.close()
             try:
-                await server.wait_closed()
+                await asyncio.wait_for(server.wait_closed(), timeout=5)
             except Exception as exc:
                 self.log.debug("Error closing decoy server for %s: %s", lock_id, exc)
 
@@ -288,6 +326,15 @@ class PseudoLockAgent(BaseAgent):
             "Endpoint %s restored. Decoy on %s closed. (Total hits: %d)",
             record.original_endpoint, record.decoy_endpoint, record.hits,
         )
+        await self.bus.publish(PseudoLockUpdate(
+            lock_id=lock_id,
+            active=False,
+            decoy_port=record.decoy_port,
+            decoy_endpoint=record.decoy_endpoint,
+            original_endpoint=record.original_endpoint,
+            hits=record.hits,
+            message=f"Decoy port {record.decoy_port} closed",
+        ))
         return True
 
     # ============================================================

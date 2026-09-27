@@ -1,54 +1,69 @@
 # AiBoO Event Rules
 # Edit this file to add/change detection rules — no rebuild required.
+#
+# How it works
+#   * Only events listed below are looked at; everything else is ignored.
+#   * Each rule belongs to one log ("channel"). If a rule has no channel,
+#     it defaults to Security (7045 defaults to System).
+#   * Only HIGH and CRITICAL events are sent to the agents / dashboard.
+#     LOW and MEDIUM rules are kept for context (e.g. single failed logons
+#     are counted by the brute-force detector below).
+#   * Built-in service accounts (SYSTEM, LOCAL SERVICE, NETWORK SERVICE,
+#     DWM-*, UMFD-*, computer accounts ending in $) are ignored for logon
+#     and privilege events — they log in hundreds of times a day.
 
+# Classic event logs to watch. Channels containing "/" (for example
+# Microsoft-Windows-PowerShell/Operational) cannot be read by the classic
+# event log API and are skipped with a note in the agent log.
 channels:
   - Security
   - System
-  - Application
-  - Microsoft-Windows-PowerShell/Operational
-  - Microsoft-Windows-TaskScheduler/Operational
-  - Microsoft-Windows-Windows Defender/Operational
-  - Microsoft-Windows-WinRM/Operational
+
+# One wrong password is a typo. This many failures for the same user or
+# the same source IP inside the window becomes one HIGH alert.
+brute_force:
+  threshold: 5
+  window_seconds: 300
 
 rules:
   # ---- Authentication ----
-  - event_id: 4624
+  - event_id: 4624          # successful logon (context only)
     threat_type: identity_mismatch
     severity: low
-  - event_id: 4625
-    threat_type: identity_mismatch
-    severity: high
-  - event_id: 4648
+  - event_id: 4625          # failed logon -> counted; HIGH only on a burst
     threat_type: identity_mismatch
     severity: medium
-  - event_id: 4672
+  - event_id: 4648          # logon with explicit credentials (RunAs, saved creds)
     threat_type: identity_mismatch
-    severity: high
-  - event_id: 4740
+    severity: medium
+  - event_id: 4672          # admin privileges assigned at logon (happens on every admin logon)
+    threat_type: identity_mismatch
+    severity: low
+  - event_id: 4740          # account locked out
     threat_type: identity_mismatch
     severity: high
 
   # ---- Account Management ----
-  - event_id: 4720
+  - event_id: 4720          # user account created
     threat_type: insider_threat
     severity: high
-  - event_id: 4726
+  - event_id: 4726          # user account deleted
     threat_type: insider_threat
     severity: high
-  - event_id: 4728
+  - event_id: 4728          # member added to global security group
     threat_type: insider_threat
     severity: high
-  - event_id: 4732
+  - event_id: 4732          # member added to local group (e.g. Administrators)
     threat_type: insider_threat
     severity: high
 
-  # ---- Privilege Escalation ----
+  # ---- Privilege use (very noisy: browsers and games trigger it) ----
   - event_id: 4673
     threat_type: insider_threat
-    severity: high
+    severity: low
   - event_id: 4674
     threat_type: insider_threat
-    severity: high
+    severity: low
 
   # ---- Process ----
   - event_id: 4688
@@ -58,16 +73,16 @@ rules:
     threat_type: anomalous_behavior
     severity: low
 
-  # ---- Network ----
+  # ---- Network (Windows Filtering Platform) ----
   - event_id: 5156
     threat_type: network_intrusion
-    severity: medium
+    severity: low
   - event_id: 5157
     threat_type: network_intrusion
-    severity: high
+    severity: medium
   - event_id: 5158
     threat_type: network_intrusion
-    severity: medium
+    severity: low
 
   # ---- Object Access ----
   - event_id: 4656
@@ -78,21 +93,22 @@ rules:
     severity: medium
 
   # ---- Persistence ----
-  - event_id: 4697
+  - event_id: 4697          # service installed (Security log)
     threat_type: anomalous_behavior
     severity: high
-  - event_id: 4698
+  - event_id: 4698          # scheduled task created (HIGH only if it runs script-like commands)
     threat_type: anomalous_behavior
     severity: high
-  - event_id: 7045
+  - event_id: 7045          # service installed (System log)
+    channel: System
     threat_type: anomalous_behavior
     severity: high
 
   # ---- Defense Evasion ----
-  - event_id: 1102
+  - event_id: 1102          # Security audit log cleared
     threat_type: anomalous_behavior
     severity: critical
-  - event_id: 4719
+  - event_id: 4719          # audit policy changed
     threat_type: anomalous_behavior
     severity: high
   - event_id: 4657
@@ -107,16 +123,16 @@ rules:
     threat_type: insider_threat
     severity: medium
 
-  # ---- Kerberos ----
+  # ---- Kerberos / NTLM (mostly on domain controllers) ----
   - event_id: 4768
     threat_type: identity_mismatch
     severity: medium
   - event_id: 4769
     threat_type: identity_mismatch
     severity: medium
-  - event_id: 4771
+  - event_id: 4771          # Kerberos pre-auth failed -> counted by brute-force detector
     threat_type: identity_mismatch
-    severity: high
-  - event_id: 4776
+    severity: medium
+  - event_id: 4776          # NTLM validation (successes ignored, failures counted)
     threat_type: identity_mismatch
-    severity: high
+    severity: medium

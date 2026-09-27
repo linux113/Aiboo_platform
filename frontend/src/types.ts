@@ -95,6 +95,15 @@ export interface PseudoLock {
   active: boolean;
   locked_at: string;
   restored_at?: string;
+  /** endpoint (agent) that opened the decoy */
+  source?: string;
+  decoy_port?: number | null;
+  decoy_endpoint?: string;
+  original_endpoint?: string;
+  /** restore command sent, waiting for the agent to close the port */
+  restoring?: boolean;
+  restore_message?: string;
+  hits?: number;
 }
 
 export interface Notification {

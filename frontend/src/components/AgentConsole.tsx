@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from "react";
 import { cn } from "../utils/cn";
-import api, { authH, AGENT_URL } from "../utils/api";
+import api, { waitForCommand, apiErrorMessage } from "../utils/api";
 import { sevCls, threatIcon, verdictCls } from "../utils/helpers";
 import type {
   ActionRecord,
@@ -142,6 +142,7 @@ export default function AgentConsole({
     severity: "high",
     src_ip: "10.0.0.1",
     dst_port: "443",
+    user_id: "",
   });
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState("");
@@ -161,9 +162,9 @@ export default function AgentConsole({
   const [dispatchResult, setDispatchResult] = useState("");
   const [dispatchStatus, setDispatchStatus] = useState<"ok" | "err" | "">("");
 
-  // ---- Poll online agents every 10s while the tab is open ----
+  // ---- Poll online agents every 10s while the Actions or Send tab is open ----
   useEffect(() => {
-    if (tab !== "actions") return;
+    if (tab !== "actions" && tab !== "send") return;
     let cancelled = false;
 
     const load = async () => {
@@ -240,32 +241,45 @@ export default function AgentConsole({
     return map;
   }, [actions]);
 
+  // Send Event goes Dashboard -> backend -> agent command channel, so it
+  // works for any connected agent (not only one on this PC / port 8001).
   const sendEvent = async () => {
+    if (!dispatchEndpoint) {
+      setSendResult("❌ No agent connected — start the agent and wait for it to appear in the list");
+      return;
+    }
     setSending(true);
     setSendResult("");
+    const endpoint = dispatchEndpoint;
     try {
-      const res = await api.post(
-        `${AGENT_URL}/events`,
-        {
-          timestamp: new Date().toISOString(),
+      const payload: Record<string, unknown> = {};
+      if (form.src_ip.trim()) payload.src_ip = form.src_ip.trim();
+      if (form.dst_port.trim()) payload.dst_port = parseInt(form.dst_port, 10) || form.dst_port.trim();
+      if (form.user_id.trim()) payload.user_id = form.user_id.trim();
+      const res = await api.post("/agent/test-event", {
+        endpoint_id: endpoint,
+        event: {
           source: form.source,
           event_type: form.event_type,
           message: form.message,
           severity: form.severity,
-          payload: {
-            src_ip: form.src_ip,
-            dst_port: parseInt(form.dst_port) || 443,
-          },
+          payload,
         },
-        authH()
-      );
-      setSendResult(`✅ Event accepted — ID: ${res.data.event_id}`);
-      onSendTestEvent(res.data);
+      });
+      const cmdId = res.data?.cmd_id || "";
+      setSendResult(`⏳ Sent to ${endpoint} — waiting for the agent…`);
+      const outcome = await waitForCommand(cmdId, 15000);
+      if (outcome.status === "executed") {
+        const id = String(outcome.result?.event_id || "?");
+        setSendResult(`✅ ${endpoint} accepted the event — ID: ${id}. Findings appear in a few seconds (only high/critical results are shown).`);
+        onSendTestEvent(outcome.result);
+      } else if (outcome.status === "failed") {
+        setSendResult(`❌ ${endpoint} rejected the event: ${outcome.error || "unknown error"}`);
+      } else {
+        setSendResult(`⚠️ No answer from ${endpoint} within 15s — check the agent window`);
+      }
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } }; message?: string };
-      setSendResult(
-        `❌ ${err.response?.data?.detail || err.message || "Failed — is agent service running on port 8001?"}`
-      );
+      setSendResult(`❌ ${apiErrorMessage(e, "Failed to send event")}`);
     } finally {
       setSending(false);
     }
@@ -656,7 +670,13 @@ export default function AgentConsole({
                       </div>
                       <p className="text-xs text-slate-300 mb-1">{lock.summary}</p>
                       <div className="text-[10px] text-slate-500 space-y-0.5">
-                        <div>Agent: {lock.agent}</div>
+                        <div>Agent: {lock.agent}{lock.source ? ` · Endpoint: ${lock.source}` : ""}</div>
+                        {lock.decoy_port ? (
+                          <div className="text-amber-300/80">
+                            Decoy port: {lock.decoy_port}{lock.active ? " (open)" : " (closed)"}
+                            {typeof lock.hits === "number" && lock.hits > 0 ? ` · ${lock.hits} hit(s)` : ""}
+                          </div>
+                        ) : null}
                         <div>
                           Locked: {new Date(lock.locked_at).toLocaleString()}
                         </div>
@@ -665,14 +685,19 @@ export default function AgentConsole({
                             Restored: {new Date(lock.restored_at).toLocaleString()}
                           </div>
                         )}
+                        {lock.restore_message && (
+                          <div className="text-slate-400">{lock.restore_message}</div>
+                        )}
                       </div>
                     </div>
                     {lock.active && (
                       <button
                         onClick={() => onRestoreLock(lock.lock_id)}
-                        className="flex-shrink-0 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-500/20 transition font-medium"
+                        disabled={!!lock.restoring}
+                        title="Ask the agent to close the decoy port"
+                        className="flex-shrink-0 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-500/20 transition font-medium disabled:opacity-50"
                       >
-                        Restore
+                        {lock.restoring ? "Closing…" : "Restore"}
                       </button>
                     )}
                   </div>
@@ -1055,15 +1080,33 @@ export default function AgentConsole({
           {tab === "send" && (
             <div className="max-w-lg space-y-4">
               <div className="rounded-lg border border-cyan-500/20 bg-cyan-500/5 p-3 text-[11px] text-cyan-300/80">
-                Send a threat event directly to the AiBoO agent service. The
-                tri-gate pipeline will process it and results appear in
-                real-time.
+                Send a test threat event to a connected agent. The agent runs
+                it through its detection pipeline and any high/critical
+                findings appear in the Findings tab in real time.
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold uppercase tracking-[0.15em] text-slate-400 mb-1.5">
+                  Agent
+                </label>
+                <select
+                  value={dispatchEndpoint}
+                  onChange={(e) => setDispatchEndpoint(e.target.value)}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:outline-none"
+                >
+                  {onlineAgents.length === 0 && <option value="">No agents connected</option>}
+                  {onlineAgents.map((a) => (
+                    <option key={a.endpointId} value={a.endpointId}>
+                      {a.endpointId}{a.hostname && a.hostname !== a.endpointId ? ` (${a.hostname})` : ""}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="grid grid-cols-2 gap-3">
                 {[
                   { l: "Source", k: "source" },
                   { l: "Source IP", k: "src_ip" },
                   { l: "Destination Port", k: "dst_port" },
+                  { l: "User (optional)", k: "user_id" },
                   { l: "Message", k: "message" },
                 ].map((f) => (
                   <div
@@ -1128,7 +1171,7 @@ export default function AgentConsole({
               </div>
               <button
                 onClick={sendEvent}
-                disabled={sending}
+                disabled={sending || !dispatchEndpoint}
                 className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 py-2.5 text-sm font-bold text-slate-950 hover:from-cyan-400 hover:to-emerald-400 transition disabled:opacity-50 shadow-lg"
               >
                 {sending ? "Sending..." : "Send Test Event"}

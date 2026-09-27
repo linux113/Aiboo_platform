@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import psutil
 import hashlib
+import os
 import re
 from typing import Optional, List, Dict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from core.base_agent import BaseAgent
+from core.local_events import is_windows_event, windows_event_finding
 from core.event_bus import EventBus
 from core.events import (
     AgentFinding, ResponseAction, Severity,
@@ -41,13 +43,35 @@ _CRITICAL_SIGNATURES = {
     "DATA_EXFIL",
 }
 
-# Memory threat patterns
+# Memory threat patterns.
+# Kept deliberately narrow: loose words like "crypt", "wallet" or "cmd"
+# matched normal software (crypto wallets, BitLocker, cmd.exe, VS Code...).
 _MEMORY_THREAT_PATTERNS = {
-    "ransomware": ["ransom", "crypt", "encrypt", "decrypt", "locker", "bitlocker", "wallet"],
-    "suspicious_processes": ["powershell", "cmd", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "certutil"],
-    "malicious_powershell": ["-enc", "-encodedcommand", "bypass", "hidden", "downloadstring", "webclient", "invoke-expression", "iex", "invoke-command"],
+    # Process-name fragments of well-known ransomware families
+    "ransomware": ["ransom", "wannacry", "wncry", "wanadecryptor", "locky", "ryuk",
+                   "lockbit", "conti", "cerber", "revil", "sodinokibi", "blackcat"],
+    # Windows "living off the land" binaries — matched on the exact exe name
+    "suspicious_processes": ["powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
+                             "mshta.exe", "rundll32.exe", "regsvr32.exe", "certutil.exe", "bitsadmin.exe"],
+    # Command-line fragments that are rare in legitimate use
+    "malicious_powershell": ["downloadstring(", "downloadfile(", "invoke-expression", "iex(", "iex (",
+                             "frombase64string(", "net.webclient", "-urlcache", "/transfer ",
+                             "invoke-shellcode", "invoke-mimikatz"],
     "suspicious_memory": [b"MZ", b"powershell", b"cmd.exe", b"rundll32"]
 }
+
+# Opt-in "high RAM" alert (off by default: browsers/IDEs use >500 MB normally).
+# Set AIBOO_MEMORY_ALERT_MB=4000 (for example) to enable it.
+try:
+    _MEMORY_ALERT_MB = int(os.getenv("AIBOO_MEMORY_ALERT_MB", "0") or 0)
+except ValueError:
+    _MEMORY_ALERT_MB = 0
+
+_ENCODED_CMD_RE = re.compile(r"\s-(?:e|ec|en|enc|enco|encodedcommand)\s+([A-Za-z0-9+/=]{50,})", re.IGNORECASE)
+_LOLBIN_DOWNLOAD_NAMES = ("powershell.exe", "pwsh.exe", "certutil.exe", "bitsadmin.exe",
+                          "mshta.exe", "rundll32.exe", "regsvr32.exe", "wscript.exe", "cscript.exe", "cmd.exe")
+_DOWNLOAD_MARKERS = ("downloadstring(", "downloadfile(", "invoke-webrequest", "iwr ", "start-bitstransfer",
+                     "-urlcache", "/transfer ", "net.webclient")
 
 # Memory scan interval (seconds)
 _MEMORY_SCAN_INTERVAL = 30
@@ -80,6 +104,11 @@ class MemoryThreat:
 
 
 class CyberThreatAgent(BaseAgent):
+    # Reports non-identity events read from the Windows Event Log
+    windows_event_types = frozenset({
+        ThreatType.NETWORK_INTRUSION, ThreatType.ANOMALOUS_BEHAVIOR, ThreatType.INSIDER_THREAT,
+    })
+
     def __init__(self, bus: EventBus) -> None:
         super().__init__("CyberThreatAgent", bus)
         self._memory_scan_running = False
@@ -150,8 +179,11 @@ class CyberThreatAgent(BaseAgent):
             except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
+        # Forget processes that have exited (instead of clearing everything,
+        # which re-alerted on every still-running process).
         if len(self._scanned_processes) > 1000:
-            self._scanned_processes.clear()
+            alive = {f"{p.pid}_{p.info.get('name')}" for p in psutil.process_iter(['name'])}
+            self._scanned_processes = {k: v for k, v in self._scanned_processes.items() if k in alive}
 
         return threats
 
@@ -171,7 +203,7 @@ class CyberThreatAgent(BaseAgent):
                 )
 
         for susp in _MEMORY_THREAT_PATTERNS["suspicious_processes"]:
-            if susp in name:
+            if name == susp:
                 cmdline = ' '.join(proc.info['cmdline']).lower() if proc.info['cmdline'] else ""
                 for pattern in _MEMORY_THREAT_PATTERNS["malicious_powershell"]:
                     if pattern in cmdline:
@@ -189,37 +221,42 @@ class CyberThreatAgent(BaseAgent):
         if not cmdline:
             return None
 
-        if "powershell" in cmdline:
-            base64_count = cmdline.count('-enc') + cmdline.count('-encodedcommand')
-            if base64_count > 0:
-                base64_match = re.search(r'-enc\s+([A-Za-z0-9+/=]+)', cmdline)
-                if base64_match:
-                    b64_string = base64_match.group(1)
-                    if len(b64_string) > 50:
-                        return MemoryThreat(
-                            pid=proc.info['pid'],
-                            process_name=proc.info['name'],
-                            threat_type="ENCODED_POWERSHELL",
-                            confidence=0.80,
-                            details=f"PowerShell with long encoded command ({len(b64_string)} chars)"
-                        )
+        name = (proc.info.get('name') or "").lower()
 
-        download_patterns = ["downloadstring", "webclient", "invoke-webrequest", "curl", "wget"]
-        for pattern in download_patterns:
-            if pattern in cmdline:
+        if name in ("powershell.exe", "pwsh.exe", "powershell", "pwsh"):
+            base64_match = _ENCODED_CMD_RE.search(" " + cmdline)
+            if base64_match:
+                b64_string = base64_match.group(1)
                 return MemoryThreat(
                     pid=proc.info['pid'],
                     process_name=proc.info['name'],
-                    threat_type="SUSPICIOUS_DOWNLOAD",
-                    confidence=0.75,
-                    details=f"Process attempting to download file: {pattern}"
+                    threat_type="ENCODED_POWERSHELL",
+                    confidence=0.80,
+                    details=f"PowerShell with long encoded command ({len(b64_string)} chars)"
                 )
+
+        # Downloads are only suspicious from script hosts / LOLBins, not from
+        # curl, browsers, package managers or updaters.
+        if name in _LOLBIN_DOWNLOAD_NAMES and ("http://" in cmdline or "https://" in cmdline):
+            for pattern in _DOWNLOAD_MARKERS:
+                if pattern in cmdline:
+                    return MemoryThreat(
+                        pid=proc.info['pid'],
+                        process_name=proc.info['name'],
+                        threat_type="SUSPICIOUS_DOWNLOAD",
+                        confidence=0.75,
+                        details=f"{proc.info['name']} downloading from the internet ({pattern.strip()})"
+                    )
         return None
 
     async def _check_memory_usage(self, proc) -> Optional[MemoryThreat]:
+        # High RAM use is not a security signal on its own (browsers, IDEs
+        # and games routinely use GBs). Disabled unless explicitly enabled.
+        if _MEMORY_ALERT_MB <= 0:
+            return None
         try:
             memory_info = proc.info['memory_info']
-            if memory_info and memory_info.rss > 500 * 1024 * 1024:
+            if memory_info and memory_info.rss > _MEMORY_ALERT_MB * 1024 * 1024:
                 return MemoryThreat(
                     pid=proc.info['pid'],
                     process_name=proc.info['name'],
@@ -360,10 +397,14 @@ class CyberThreatAgent(BaseAgent):
     async def analyse(self, event: ThreatEvent) -> AgentFinding:
         await asyncio.sleep(0.05)
 
+        if is_windows_event(event):
+            return windows_event_finding(self.name, event)
+
         p = event.payload
         actions: list[ResponseAction] = [ResponseAction.LOG, ResponseAction.ALERT_DASHBOARD]
         confidence = 0.55
         severity = event.severity
+        extra_meta: dict = {}
 
         # ── Memory threat detection (existing) ──────────────────
         if event.source == "memory_scanner" or p.get("memory_threat_type"):
@@ -371,31 +412,33 @@ class CyberThreatAgent(BaseAgent):
             process_name = p.get("process_name", "unknown")
             pid = p.get("pid", 0)
             details = p.get("details", "")
+            # Top-level pid/process_name let the response engine find the
+            # process. The engine decides whether to kill it (only when
+            # auto_response is on, and never for protected system processes).
+            extra_meta = {"pid": pid, "process_name": process_name}
 
             if memory_threat_type == "RANSOMWARE":
                 confidence = 0.95
                 severity = Severity.CRITICAL
                 actions.extend([
+                    ResponseAction.TERMINATE_PROCESS,
                     ResponseAction.ISOLATE_ASSET,
                     ResponseAction.PSEUDO_LOCK,
                     ResponseAction.ESCALATE_SOC,
                     ResponseAction.NOTIFY_SECURITY
                 ])
-                await self._terminate_process(pid)
-                summary = f"🚨 RANSOMWARE DETECTED! Process: {process_name} (PID: {pid}) - {details}"
+                summary = f"RANSOMWARE SUSPECTED: {process_name} (PID {pid}) - {details}"
 
             elif memory_threat_type in ["ENCODED_POWERSHELL", "SUSPICIOUS_DOWNLOAD"]:
                 confidence = 0.85
                 severity = Severity.HIGH
                 actions.extend([ResponseAction.TERMINATE_PROCESS, ResponseAction.NOTIFY_SECURITY])
-                await self._terminate_process(pid)
                 summary = f"Malicious process detected: {process_name} (PID: {pid}) - {details}"
 
             elif memory_threat_type == "SUSPICIOUS_PROCESS":
                 confidence = 0.80
                 severity = Severity.HIGH
                 actions.append(ResponseAction.TERMINATE_PROCESS)
-                await self._terminate_process(pid)
                 summary = f"Suspicious process: {process_name} (PID: {pid}) - {details}"
 
             elif memory_threat_type == "HIGH_MEMORY_USAGE":
@@ -457,7 +500,7 @@ class CyberThreatAgent(BaseAgent):
             if enc_result["is_anomalous"]:
                 summary_parts.append(f"Encrypted traffic anomaly: {enc_result['reason']}")
             if honeypot_result["is_honeypot"]:
-                summary_parts.append(f"🚨 HONEYPOT ACCESS: {honeypot_result['reason']}")
+                summary_parts.append(f"HONEYPOT ACCESS: {honeypot_result['reason']}")
             summary = " — ".join(summary_parts)
 
         # ── Insider threat ──────────────────────────────────────
@@ -488,5 +531,5 @@ class CyberThreatAgent(BaseAgent):
             confidence=round(confidence, 2),
             summary=summary,
             actions=list(dict.fromkeys(actions)),
-            metadata={"raw_payload": p},
+            metadata={"raw_payload": p, **extra_meta},
         )

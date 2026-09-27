@@ -121,6 +121,9 @@ class RealResponseEngine:
     def __init__(self, bus: EventBus, auto_response: bool = True):
         self.bus = bus
         self._active_jit_grants: Dict[str, Dict[str, Any]] = {}
+        # Set by the orchestrator to the PseudoLockAgent, so a pseudo_lock
+        # action opens a REAL decoy listener (and Restore can close it).
+        self.pseudo_lock_provider = None
 
         # ---- Auto-termination policy ----
         # auto_response=False -> engine only runs explicit remote commands.
@@ -486,9 +489,14 @@ class RealResponseEngine:
         record = self._build_action_record(action, event)
         await self._publish_action(record)
 
-        # 2) Run the real handler
+        # 2) Run the real handler (a handler may return a details string)
         try:
-            await handler(event)
+            result = await handler(event)
+            if isinstance(result, str) and result:
+                record.details = result
+            elif isinstance(result, dict):
+                record.details = str(result.get("details") or record.details or "")
+                record.metadata.update(result.get("metadata") or {})
         except Exception as exc:
             record.status = ActionStatus.FAILED.value
             record.success = False
@@ -714,7 +722,18 @@ class RealResponseEngine:
         log.warning("Isolated IP %s via Windows Firewall", src_ip)
 
     async def _pseudo_lock_firewall(self, event: Event):
-        log.warning("Pseudo-lock active for event %s", event.event_id)
+        provider = self.pseudo_lock_provider
+        if provider is None:
+            log.warning("Pseudo-lock requested for event %s but no decoy provider is running",
+                        event.event_id)
+            raise RuntimeError("Pseudo-lock agent is not running on this endpoint")
+        lock_id = f"lock_{event.event_id}"
+        record = await provider.open_lock(lock_id, event)
+        log.warning("Pseudo-lock active for event %s (decoy %s)", event.event_id, record.decoy_endpoint)
+        return {
+            "details": f"Decoy listening on {record.decoy_endpoint} (lock {lock_id})",
+            "metadata": {"lock_id": lock_id, "decoy_port": record.decoy_port},
+        }
 
     async def _lock_user_account(self, event: Event):
         payload = (event.metadata or {}).get("payload", {}) or {}

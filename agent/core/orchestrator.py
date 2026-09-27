@@ -15,6 +15,7 @@ from core.alert_queue import OfflineQueueManager
 from core.backend_bridge import DashboardBridge
 from core.process_killer import ProcessKiller  # <-- NEW IMPORT
 from core.command_channel import CommandChannel
+from core.test_event_injector import make_test_event_handler
 
 # Remote actions the dashboard is allowed to trigger on this endpoint
 # (matches the "Dispatch Remote Action" dropdown in the dashboard).
@@ -88,6 +89,11 @@ class Orchestrator:
         self.auto_response = _cfg_bool(self.config, 'auto_response', False)
         self.remote_commands = _cfg_bool(self.config, 'remote_commands', True)
         self.real_response = RealResponseEngine(bus, auto_response=self.auto_response)
+        # pseudo_lock actions open a REAL decoy via the PseudoLockAgent
+        self.pseudo_lock_agent = next(
+            (a for a in self.agents if isinstance(a, PseudoLockAgent)), None
+        )
+        self.real_response.pseudo_lock_provider = self.pseudo_lock_agent
 
         # ---- Zero Trust engines (existing) ----
         self.behavioral_dna = BehavioralDNAEngine(bus)
@@ -135,6 +141,7 @@ class Orchestrator:
                 api_key=self.config.get('api_key'),
                 endpoint_id=self.dashboard_bridge._endpoint_id,
                 allowed_actions=REMOTE_ALLOWED_ACTIONS,
+                local_handlers=self._local_command_handlers(),
             )
 
         # ---- Process killer (demo: kills notepad.exe / calc.exe every 3s) ----
@@ -143,6 +150,14 @@ class Orchestrator:
         # Enable with  process_killer = true  in config.ini.
         self.process_killer_enabled = _cfg_bool(self.config, 'process_killer', False)
         self.process_killer = ProcessKiller(interval=3.0)
+
+    def _local_command_handlers(self) -> dict:
+        """Dashboard commands handled by agent components directly."""
+        handlers = {"inject_test_event": make_test_event_handler(self.bus)}
+        if self.pseudo_lock_agent is not None:
+            # Restore button on the Locks tab -> close the real decoy port
+            handlers["restore_pseudo_lock"] = self.pseudo_lock_agent.remote_restore
+        return handlers
 
     def _load_config(self) -> dict:
         """
@@ -255,12 +270,16 @@ class Orchestrator:
                 log.info("Memory scanning activated for CyberThreatAgent")
 
         # ---- Start Windows Event Log ingestion ----
-        try:
-            await self.windows_ingestor.start(tail_only=True)
-            log.info("Windows Event Log ingestion active — monitoring Security, System, Application logs")
-        except Exception as e:
-            log.warning(f"Windows Event Log ingestion failed: {e}")
-            log.warning("Running in demo mode with predefined events")
+        # Runs as a background task: ingestor.start() loops forever, and
+        # awaiting it here meant start() never returned on Windows (so the
+        # "AiBoO started" message and clean Ctrl+C shutdown never happened).
+        async def _run_ingestor():
+            try:
+                await self.windows_ingestor.start(tail_only=True)
+            except Exception as e:
+                log.warning(f"Windows Event Log ingestion failed: {e}")
+
+        self._ingestor_task = asyncio.create_task(_run_ingestor())
 
         log.info(
             "Platform ready — tri-gate pipeline + %d specialist agents + "

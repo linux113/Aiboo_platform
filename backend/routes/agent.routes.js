@@ -1,5 +1,4 @@
 import express from 'express';
-import axios from 'axios';
 import { getIO } from '../config/socket.js';
 import { protect, authorize } from '../middleware/auth.js';
 import logger from '../utils/logger.js';
@@ -512,11 +511,21 @@ router.post('/pseudo-lock', validateAgentOrJWT, (req, res) => {
   res.json({ ok: true });
 });
 
+// Agent reports that a decoy port was really closed
 router.post('/pseudo-lock-restore', validateAgentOrJWT, (req, res) => {
-  const { lock_id } = req.body;
-  if (store.pseudoLocks[lock_id]) {
-    store.pseudoLocks[lock_id].active = false;
-    emit('agent:pseudo-lock-restore', { lock_id });
+  const { lock_id, restored_at, message, hits } = req.body || {};
+  const lock = store.pseudoLocks[lock_id];
+  if (lock) {
+    lock.active = false;
+    lock.restoring = false;
+    lock.restored_at = restored_at || new Date().toISOString();
+    if (message) lock.restore_message = String(message);
+    if (hits !== undefined) lock.hits = hits;
+    emit('agent:pseudo-lock-restore', {
+      lock_id,
+      restored_at: lock.restored_at,
+      message: lock.restore_message || '',
+    });
   }
   res.json({ ok: true });
 });
@@ -544,18 +553,99 @@ router.get('/stats', protect, (req, res) => {
   });
 });
 
-// ---- Restore lock (existing) ----
-router.post('/pseudo-locks/:lockId/restore', async (req, res) => {
+// ---- Restore lock: ask the agent that owns the decoy to close it ----
+// The agent closes the real listening port and then reports back via
+// POST /pseudo-lock-restore, which flips the lock to "restored".
+router.post('/pseudo-locks/:lockId/restore', protect, authorize('admin', 'analyst'), (req, res) => {
   const { lockId } = req.params;
-  if (store.pseudoLocks[lockId]) {
-    store.pseudoLocks[lockId].active = false;
-    emit('agent:pseudo-lock-restore', { lock_id: lockId });
+  const lock = store.pseudoLocks[lockId];
+  if (!lock) {
+    return res.status(404).json({ ok: false, error: `Lock '${lockId}' not found` });
   }
-  const agentUrl = process.env.AGENT_SERVICE_URL || 'http://localhost:8001';
-  axios.post(`${agentUrl}/pseudo-locks/${lockId}/restore`).catch((err) => {
-    logger.warn(`Failed to notify agent service: ${err.message}`);
+  if (!lock.active) {
+    return res.json({ ok: true, already_restored: true });
+  }
+
+  const channel = req.app.get('agentChannel');
+  const endpoint = lock.source;
+  if (channel && endpoint && channel.isOnline(endpoint)) {
+    const result = channel.dispatch(endpoint, 'restore_pseudo_lock', lockId, {});
+    if (!result.ok) return res.status(404).json(result);
+    lock.restoring = true;
+    emit('agent:pseudo-lock', lock);
+    logger.info(`Restore of ${lockId} dispatched to ${endpoint} (${result.cmd_id})`);
+    return res.status(202).json({ ok: true, dispatched: true, cmd_id: result.cmd_id, endpoint });
+  }
+
+  // The agent that opened the decoy is not connected. If its process has
+  // stopped, the decoy port closed with it; if it is only disconnected,
+  // the port stays open until it reconnects or restarts. Say so honestly.
+  lock.active = false;
+  lock.restoring = false;
+  lock.restored_at = new Date().toISOString();
+  lock.restore_message =
+    `Agent '${endpoint || 'unknown'}' is not connected - cleared on the dashboard only. ` +
+    'Decoy ports close automatically when the agent stops.';
+  emit('agent:pseudo-lock-restore', {
+    lock_id: lockId,
+    restored_at: lock.restored_at,
+    message: lock.restore_message,
   });
-  res.json({ ok: true });
+  return res.json({ ok: true, dispatched: false, note: lock.restore_message });
+});
+
+// ---- Send Event tab: inject a test event on a connected agent ----
+const TEST_EVENT_TYPES = new Set([
+  'network_intrusion', 'identity_mismatch', 'physical_intrusion',
+  'insider_threat', 'anomalous_behavior', 'correlated_attack',
+]);
+const TEST_SEVERITIES = new Set(['low', 'medium', 'high', 'critical']);
+
+router.post('/test-event', protect, authorize('admin', 'analyst'), (req, res) => {
+  const { endpoint_id, event } = req.body || {};
+  if (!endpoint_id) {
+    return res.status(400).json({ ok: false, error: 'endpoint_id is required' });
+  }
+  const ev = event && typeof event === 'object' ? event : {};
+  const eventType = String(ev.event_type || '').toLowerCase();
+  const severity = String(ev.severity || '').toLowerCase();
+  if (!TEST_EVENT_TYPES.has(eventType)) {
+    return res.status(400).json({ ok: false, error: `Unknown event type '${ev.event_type}'` });
+  }
+  if (!TEST_SEVERITIES.has(severity)) {
+    return res.status(400).json({ ok: false, error: `Unknown severity '${ev.severity}'` });
+  }
+  const channel = req.app.get('agentChannel');
+  if (!channel) {
+    return res.status(503).json({ ok: false, error: 'Agent channel not initialized' });
+  }
+  const spec = {
+    source: String(ev.source || 'dashboard-test').slice(0, 64),
+    event_type: eventType,
+    severity,
+    message: String(ev.message || '').slice(0, 500),
+    payload: ev.payload && typeof ev.payload === 'object' ? ev.payload : {},
+  };
+  const result = channel.dispatch(String(endpoint_id), 'inject_test_event', '', { event: spec });
+  if (!result.ok) return res.status(404).json(result);
+  logger.info(`Test event (${eventType}/${severity}) sent to ${endpoint_id} (${result.cmd_id})`);
+  res.status(202).json(result);
+});
+
+// ---- Dashboard playbook: Open War Room ----
+// Alerts every logged-in dashboard at once (real-time broadcast).
+router.post('/war-room', protect, authorize('admin', 'analyst'), (req, res) => {
+  const entry = {
+    id: `war_${Date.now()}`,
+    type: 'war_room',
+    opened_by: req.user?.name || req.user?.email || String(req.user?.id || 'unknown'),
+    note: String(req.body?.note || '').slice(0, 300),
+    timestamp: new Date().toISOString(),
+  };
+  push(store.responseLog, entry);
+  emit('war-room:opened', entry);
+  logger.warn(`War room opened by ${entry.opened_by}${entry.note ? `: ${entry.note}` : ''}`);
+  res.status(201).json({ ok: true, ...entry });
 });
 
 // ---- Health check (no auth) ----

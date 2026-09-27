@@ -8,9 +8,15 @@ from datetime import datetime, timezone
 from abc import ABC, abstractmethod
 from .event_bus import EventBus
 from .events import AgentFinding, ThreatEvent
+from .local_events import is_windows_event
 
 
 class BaseAgent(ABC):
+    # Threat types this agent turns into a finding when the event was read
+    # from this PC's Windows Event Log. Empty = the agent ignores Windows
+    # events, so one Windows event produces one finding instead of five.
+    windows_event_types: frozenset = frozenset()
+
     def __init__(self, name: str, bus: EventBus) -> None:
         self.name = name
         self.bus  = bus
@@ -40,6 +46,8 @@ class BaseAgent(ABC):
         return hashlib.md5(json_str.encode()).hexdigest()
 
     async def _handle(self, event: ThreatEvent) -> None:
+        if is_windows_event(event) and event.threat_type not in self.windows_event_types:
+            return
         # Deduplicate by fingerprint within TTL
         fingerprint = self._get_fingerprint(event)
         now = datetime.now(timezone.utc).timestamp()

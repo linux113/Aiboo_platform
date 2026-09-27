@@ -192,6 +192,27 @@ class PseudoLockRestoreRequest:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
+@dataclass
+class PseudoLockUpdate:
+    """
+    Published by PseudoLockAgent whenever a decoy listener is really opened
+    (active=True) or really closed (active=False). The dashboard bridge
+    forwards it, so the Locks tab only shows locks that exist on the PC.
+    """
+    lock_id: str
+    active: bool
+    event_id: str = ""
+    agent: str = "PseudoLockAgent"
+    severity: str = "high"
+    summary: str = ""
+    decoy_port: int | None = None
+    decoy_endpoint: str = ""
+    original_endpoint: str = ""
+    hits: int = 0
+    message: str = ""
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 # ── Zero Trust models ─────────────────────────────────────────────────────────
 
 @dataclass

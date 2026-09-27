@@ -32,3 +32,6 @@ anthropic>=0.3.0
 
 # Caching for bounded dicts:
 cachetools>=5.0
+
+# Windows event rules file (config/event_rules.yaml)
+pyyaml>=6.0

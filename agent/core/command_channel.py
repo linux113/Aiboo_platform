@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
-from typing import Optional, TYPE_CHECKING
+from typing import Awaitable, Callable, Dict, Optional, TYPE_CHECKING
 
 import socketio
 
@@ -47,8 +47,14 @@ class CommandChannel:
         api_key: str,
         endpoint_id: Optional[str] = None,
         allowed_actions: Optional[set] = None,
+        local_handlers: Optional[Dict[str, Callable[[str, dict], Awaitable[Optional[dict]]]]] = None,
     ) -> None:
         self._engine = engine
+        # Commands handled by agent components directly instead of the
+        # response engine, e.g. "restore_pseudo_lock" -> PseudoLockAgent,
+        # "inject_test_event" -> publish a test ThreatEvent on the bus.
+        # handler(target, params) may return a small dict sent back in the ack.
+        self._local_handlers = dict(local_handlers or {})
         self._backend_url = (backend_url or "").rstrip("/")
         self._api_key = api_key
         self._endpoint_id = endpoint_id or socket.gethostname()
@@ -100,10 +106,13 @@ class CommandChannel:
         self._sio.on("connect_error", on_connect_error, namespace=NAMESPACE)
         self._sio.on("command", on_command, namespace=NAMESPACE)
 
-    async def _ack(self, cmd_id, status: str, error: Optional[str] = None) -> None:
+    async def _ack(self, cmd_id, status: str, error: Optional[str] = None,
+                   result: Optional[dict] = None) -> None:
         payload = {"cmd_id": cmd_id, "endpoint_id": self._endpoint_id, "status": status}
         if error:
             payload["error"] = error
+        if result:
+            payload["result"] = result
         try:
             await self._sio.emit("agent:command-ack", payload, namespace=NAMESPACE)
         except Exception as exc:  # socket may have dropped mid-command
@@ -122,7 +131,8 @@ class CommandChannel:
         # ACK receipt immediately so the dashboard shows "received"
         await self._ack(cmd_id, "received")
 
-        if self._allowed_actions is not None and action not in self._allowed_actions:
+        if (self._allowed_actions is not None and action not in self._allowed_actions
+                and action not in self._local_handlers):
             err = f"Action '{action}' is not allowed on this endpoint"
             log.warning("Remote command rejected: %s", err)
             await self._ack(cmd_id, "failed", err)
@@ -130,6 +140,12 @@ class CommandChannel:
 
         try:
             params = {**params, "cmd_id": cmd_id}
+            local = self._local_handlers.get(action)
+            if local is not None:
+                result = await local(target, params)
+                await self._ack(cmd_id, "executed",
+                                result=result if isinstance(result, dict) else None)
+                return
             await self._engine.execute_remote_action(action, target, params)
             await self._ack(cmd_id, "executed")
         except Exception as exc:
