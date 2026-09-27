@@ -1,0 +1,122 @@
+# AiBoO Event Rules
+# Edit this file to add/change detection rules — no rebuild required.
+
+channels:
+  - Security
+  - System
+  - Application
+  - Microsoft-Windows-PowerShell/Operational
+  - Microsoft-Windows-TaskScheduler/Operational
+  - Microsoft-Windows-Windows Defender/Operational
+  - Microsoft-Windows-WinRM/Operational
+
+rules:
+  # ---- Authentication ----
+  - event_id: 4624
+    threat_type: identity_mismatch
+    severity: low
+  - event_id: 4625
+    threat_type: identity_mismatch
+    severity: high
+  - event_id: 4648
+    threat_type: identity_mismatch
+    severity: medium
+  - event_id: 4672
+    threat_type: identity_mismatch
+    severity: high
+  - event_id: 4740
+    threat_type: identity_mismatch
+    severity: high
+
+  # ---- Account Management ----
+  - event_id: 4720
+    threat_type: insider_threat
+    severity: high
+  - event_id: 4726
+    threat_type: insider_threat
+    severity: high
+  - event_id: 4728
+    threat_type: insider_threat
+    severity: high
+  - event_id: 4732
+    threat_type: insider_threat
+    severity: high
+
+  # ---- Privilege Escalation ----
+  - event_id: 4673
+    threat_type: insider_threat
+    severity: high
+  - event_id: 4674
+    threat_type: insider_threat
+    severity: high
+
+  # ---- Process ----
+  - event_id: 4688
+    threat_type: anomalous_behavior
+    severity: medium
+  - event_id: 4689
+    threat_type: anomalous_behavior
+    severity: low
+
+  # ---- Network ----
+  - event_id: 5156
+    threat_type: network_intrusion
+    severity: medium
+  - event_id: 5157
+    threat_type: network_intrusion
+    severity: high
+  - event_id: 5158
+    threat_type: network_intrusion
+    severity: medium
+
+  # ---- Object Access ----
+  - event_id: 4656
+    threat_type: insider_threat
+    severity: medium
+  - event_id: 4663
+    threat_type: insider_threat
+    severity: medium
+
+  # ---- Persistence ----
+  - event_id: 4697
+    threat_type: anomalous_behavior
+    severity: high
+  - event_id: 4698
+    threat_type: anomalous_behavior
+    severity: high
+  - event_id: 7045
+    threat_type: anomalous_behavior
+    severity: high
+
+  # ---- Defense Evasion ----
+  - event_id: 1102
+    threat_type: anomalous_behavior
+    severity: critical
+  - event_id: 4719
+    threat_type: anomalous_behavior
+    severity: high
+  - event_id: 4657
+    threat_type: insider_threat
+    severity: medium
+
+  # ---- Lateral Movement ----
+  - event_id: 5140
+    threat_type: insider_threat
+    severity: medium
+  - event_id: 5145
+    threat_type: insider_threat
+    severity: medium
+
+  # ---- Kerberos ----
+  - event_id: 4768
+    threat_type: identity_mismatch
+    severity: medium
+  - event_id: 4769
+    threat_type: identity_mismatch
+    severity: medium
+  - event_id: 4771
+    threat_type: identity_mismatch
+    severity: high
+  - event_id: 4776
+    threat_type: identity_mismatch
+    severity: high
