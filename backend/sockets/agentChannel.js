@@ -73,6 +73,14 @@ export function registerAgentChannel(io) {
 
     logger.info(`Agent channel connected: ${endpointId} (${hostname})`);
 
+    // If this endpoint was already connected (fast reconnect / duplicate
+    // agent), drop the stale socket so commands go to the live one.
+    const previous = agents.get(endpointId);
+    if (previous && previous.socket.id !== socket.id) {
+      logger.warn(`Agent channel: replacing stale connection for ${endpointId}`);
+      previous.socket.disconnect(true);
+    }
+
     agents.set(endpointId, {
       socket,
       endpointId,
@@ -100,6 +108,13 @@ export function registerAgentChannel(io) {
     // Agent acknowledges receipt or completion of a command
     socket.on('agent:command-ack', (data) => {
       const cmd = pendingCommands.get(data?.cmd_id);
+      // Only the agent the command was sent to may acknowledge it
+      if (cmd && cmd.endpoint_id !== endpointId) {
+        logger.warn(`Ignoring ack for ${data?.cmd_id} from wrong endpoint ${endpointId}`);
+        return;
+      }
+      const entry = agents.get(endpointId);
+      if (entry) entry.lastSeen = new Date().toISOString();
       if (cmd) {
         cmd.status = data.status || cmd.status;
         cmd.completedAt = new Date().toISOString();
@@ -115,8 +130,14 @@ export function registerAgentChannel(io) {
     // ---- disconnect ---------------------------------------------------
     socket.on('disconnect', (reason) => {
       logger.warn(`Agent channel disconnected: ${endpointId} (${reason})`);
-      agents.delete(endpointId);
-      io.emit('agents:online', Array.from(agents.keys()));
+      // Only remove the registry entry if it still points at THIS socket;
+      // otherwise a late disconnect of an old socket would wipe out the
+      // agent's new, live connection.
+      const current = agents.get(endpointId);
+      if (current && current.socket.id === socket.id) {
+        agents.delete(endpointId);
+        io.emit('agents:online', Array.from(agents.keys()));
+      }
     });
   });
 

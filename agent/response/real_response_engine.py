@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
@@ -35,7 +36,7 @@ def _validate_user_id(user_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Never-kill list — processes whose termination would BSOD, break the OS,
+# Never-kill list - processes whose termination would BSOD, break the OS,
 # or kill our own agent. Checked by name (case-insensitive) before any kill.
 # ---------------------------------------------------------------------------
 _PROTECTED_PROCESS_NAMES = {
@@ -104,7 +105,7 @@ class RealResponseEngine:
         resulting ActionRecord so the Isolation & Termination tab shows it.
 
         Configure via environment variables:
-            AIBOO_AUTO_TERMINATE=0|1          (default: 1 — enabled)
+            AIBOO_AUTO_TERMINATE=0|1          (default: 1 - enabled)
             AIBOO_AUTO_TERMINATE_SEVERITIES   (default: "high,critical")
             AIBOO_AUTO_TERMINATE_MIN_CONF     (default: "0.8")
             AIBOO_DRY_RUN=1                   (skip actual kills, log only)
@@ -113,16 +114,17 @@ class RealResponseEngine:
         execute_remote_action() is the entry point for commands pushed by the
         backend over the CommandChannel WebSocket. It wraps the incoming
         command in a synthetic AgentFinding so the normal _execute_action
-        pipeline runs unchanged — ActionRecords get published, DashboardBridge
+        pipeline runs unchanged - ActionRecords get published, DashboardBridge
         forwards them, the dashboard shows the row.
     """
 
-    def __init__(self, bus: EventBus):
+    def __init__(self, bus: EventBus, auto_response: bool = True):
         self.bus = bus
         self._active_jit_grants: Dict[str, Dict[str, Any]] = {}
 
         # ---- Auto-termination policy ----
-        self._auto_terminate_enabled = os.getenv(
+        # auto_response=False -> engine only runs explicit remote commands.
+        self._auto_terminate_enabled = auto_response and os.getenv(
             "AIBOO_AUTO_TERMINATE", "1"
         ).lower() in ("1", "true", "yes", "on")
 
@@ -154,26 +156,26 @@ class RealResponseEngine:
 
         if self._auto_terminate_enabled:
             log.warning(
-                "AUTO-TERMINATE ENABLED — severities=%s, min_confidence=%.2f, "
+                "AUTO-TERMINATE ENABLED - severities=%s, min_confidence=%.2f, "
                 "dry_run=%s",
                 sorted(self._auto_terminate_severities),
                 self._auto_terminate_min_confidence,
                 self._dry_run,
             )
         else:
-            log.info("Auto-terminate disabled (set AIBOO_AUTO_TERMINATE=1 to enable)")
+            log.info("Auto-terminate disabled")
 
     def start(self):
         self.bus.subscribe(GateDecision, self._on_decision)
         self.bus.subscribe(AgentFinding, self._on_finding)
-        log.info("Real Response Engine — ACTIVE (Zero Trust + auto-response)")
+        log.info("Real Response Engine - ACTIVE (Zero Trust + auto-response)")
 
     # ============================================================
     # Event handlers
     # ============================================================
 
     async def _on_decision(self, decision: GateDecision):
-        """Gate 3 BLOCK → run every action in the decision."""
+        """Gate 3 BLOCK -> run every action in the decision."""
         if decision.gate != GateLevel.GATE_3 or decision.verdict != GateVerdict.BLOCK:
             return
         for action in decision.actions:
@@ -242,7 +244,7 @@ class RealResponseEngine:
             return
 
         log.warning(
-            "AUTO-TERMINATE → pid=%s threat=%s severity=%s confidence=%.2f",
+            "AUTO-TERMINATE -> pid=%s threat=%s severity=%s confidence=%.2f",
             pid, threat, severity, finding.confidence,
         )
 
@@ -264,7 +266,7 @@ class RealResponseEngine:
         Entry point for commands pushed via the CommandChannel WebSocket.
 
         Wraps the incoming action in a synthetic AgentFinding so the normal
-        _execute_action pipeline runs unchanged — ActionRecords get published,
+        _execute_action pipeline runs unchanged - ActionRecords get published,
         DashboardBridge forwards them, the dashboard shows the row.
 
         Called by CommandChannel._handle_command() when the backend
@@ -273,10 +275,11 @@ class RealResponseEngine:
         Args:
             action_name: ResponseAction value string, e.g. "terminate_process"
             target:      target identifier (pid / ip / user_id / device_id)
-            params:      optional dict — pid, src_ip, user_id, device_id,
+            params:      optional dict - pid, src_ip, user_id, device_id,
                          process_name, severity, confidence, etc.
         """
-        params = params or {}
+        params = dict(params or {})
+        target = str(target or "").strip()
 
         try:
             action = ResponseAction(action_name)
@@ -285,18 +288,70 @@ class RealResponseEngine:
             raise RuntimeError(f"Unknown action: {action_name}")
 
         log.warning(
-            "REMOTE ACTION → %s (target=%s)", action.value, target,
+            "REMOTE ACTION -> %s (target=%s)", action.value, target or "-",
         )
+
+        # ---- Resolve / validate the target for the chosen action ----
+        # The dashboard sends a single free-text "target". Map it to the
+        # field the handler actually needs (pid, src_ip, user_id, ...).
+        if action == ResponseAction.TERMINATE_PROCESS:
+            pids = self._resolve_remote_pids(target, params)
+            if len(pids) > 1:
+                # A process name matched several instances: kill each one
+                # (each gets its own ActionRecord row on the dashboard).
+                errors = []
+                for pid in pids:
+                    sub = {**params, "pid": pid}
+                    try:
+                        await self.execute_remote_action(action.value, str(pid), sub)
+                    except Exception as exc:
+                        errors.append(f"{pid}: {exc}")
+                if errors:
+                    raise RuntimeError(
+                        f"{len(errors)}/{len(pids)} kills failed - " + "; ".join(errors)
+                    )
+                return
+            params["pid"] = pids[0]
+            if not params.get("process_name"):
+                try:
+                    params["process_name"] = psutil.Process(pids[0]).name()
+                except Exception:
+                    pass  # process gone / access denied - handler reports it
+        elif action in (ResponseAction.ISOLATE_ASSET,
+                        ResponseAction.BLOCK_ACCESS,
+                        ResponseAction.ALLOW_ACCESS):
+            params["src_ip"] = self._validate_remote_ip(params.get("src_ip") or target)
+        elif action in (ResponseAction.REVOKE_IDENTITY,
+                        ResponseAction.FORCE_LOGOUT,
+                        ResponseAction.REVOKE_SESSION,
+                        ResponseAction.CHALLENGE_MFA,
+                        ResponseAction.STEP_UP_AUTH,
+                        ResponseAction.GRANT_TEMP_PRIVILEGE,
+                        ResponseAction.SCHEDULE_PRIVILEGE_REVOCATION):
+            user_id = str(params.get("user_id") or target).strip()
+            if not user_id:
+                raise RuntimeError(f"{action.value} needs a user ID as target")
+            if not _validate_user_id(user_id):
+                raise RuntimeError(f"Invalid user_id format: {user_id}")
+            if action == ResponseAction.REVOKE_IDENTITY and self._is_current_user(user_id):
+                raise RuntimeError(
+                    f"Refusing to disable '{user_id}': it is the account the agent "
+                    f"is running as (you would lock yourself out)"
+                )
+            params["user_id"] = user_id
+        elif action == ResponseAction.QUARANTINE_DEVICE:
+            if not (params.get("device_id") or target):
+                raise RuntimeError("quarantine_device needs a device ID as target")
 
         # Build a payload that the existing _extract_* helpers understand.
         # The helpers look for pid / src_ip / user_id / device_id in
         # metadata.payload, metadata.payload.raw_payload, or metadata directly.
         payload: Dict[str, Any] = {
             "target": target,
-            "src_ip": params.get("src_ip") or target,
+            "src_ip": params.get("src_ip"),
             "pid": params.get("pid"),
-            "user_id": params.get("user_id") or target,
-            "device_id": params.get("device_id") or target,
+            "user_id": params.get("user_id") or (target if action == ResponseAction.PSEUDO_LOCK else None),
+            "device_id": params.get("device_id") or (target if action == ResponseAction.QUARANTINE_DEVICE else None),
             "process_name": params.get("process_name"),
             "jit_duration_minutes": params.get("jit_duration_minutes"),
         }
@@ -310,7 +365,10 @@ class RealResponseEngine:
         except ValueError:
             severity = Severity.HIGH
 
-        confidence = float(params.get("confidence", 1.0))
+        try:
+            confidence = float(params.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
 
         synthetic = AgentFinding(
             agent_name="RemoteCommand",
@@ -318,7 +376,7 @@ class RealResponseEngine:
             threat_type=ThreatType.ANOMALOUS_BEHAVIOR,
             severity=severity,
             confidence=confidence,
-            summary=f"Remote command from dashboard: {action.value} → {target}",
+            summary=f"Remote command from dashboard: {action.value} -> {target}",
             actions=[action],
             metadata={
                 "payload": payload,
@@ -328,10 +386,78 @@ class RealResponseEngine:
             },
         )
 
-        await self._execute_action(action, synthetic)
+        record = await self._execute_action(action, synthetic)
+        if record is None:
+            raise RuntimeError(f"No handler for action: {action.value}")
+        if record.status == ActionStatus.FAILED.value:
+            # Surface the failure to the CommandChannel so the dashboard
+            # gets a "failed" ack with the real reason.
+            raise RuntimeError(record.error or f"{action.value} failed")
+
+    # ---- Remote target helpers ----
+
+    def _resolve_remote_pids(self, target: str, params: Dict[str, Any]) -> list:
+        """Target may be a PID ("1234") or a process name ("notepad.exe")."""
+        raw_pid = params.get("pid")
+        if raw_pid not in (None, ""):
+            try:
+                return [int(raw_pid)]
+            except (TypeError, ValueError):
+                raise RuntimeError(f"Invalid PID: {raw_pid}")
+        if not target:
+            raise RuntimeError("terminate_process needs a PID or process name as target")
+        if target.isdigit():
+            return [int(target)]
+
+        wanted = target.lower()
+        if not wanted.endswith(".exe"):
+            alt = wanted + ".exe"
+        else:
+            alt = wanted[:-4]
+        pids = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+            except Exception:
+                continue
+            if name in (wanted, alt) and proc.info["pid"] != self._self_pid:
+                pids.append(proc.info["pid"])
+        if not pids:
+            raise RuntimeError(f"No running process named '{target}'")
+        params.setdefault("process_name", target)
+        return sorted(pids)
+
+    @staticmethod
+    def _validate_remote_ip(value: Any) -> str:
+        """Only allow a single, specific IP (never 'any', 0.0.0.0, or a subnet)."""
+        text = str(value or "").strip()
+        if not text:
+            raise RuntimeError("This action needs an IP address as target")
+        try:
+            ip = ipaddress.ip_address(text)
+        except ValueError:
+            raise RuntimeError(f"'{text}' is not a valid IP address")
+        if ip.is_unspecified or ip.is_loopback:
+            raise RuntimeError(f"Refusing to block {text} (loopback/unspecified address)")
+        return str(ip)
+
+    @staticmethod
+    def _is_current_user(user_id: str) -> bool:
+        names = set()
+        for getter in (lambda: os.getlogin(),
+                       lambda: os.environ.get("USERNAME", ""),
+                       lambda: os.environ.get("USER", "")):
+            try:
+                n = getter()
+                if n:
+                    names.add(n.lower())
+            except Exception:
+                pass
+        uid = user_id.lower().split("\\")[-1]
+        return uid in names
 
     # ============================================================
-    # Action dispatch — wraps every handler with ActionRecord publishing
+    # Action dispatch - wraps every handler with ActionRecord publishing
     # ============================================================
 
     async def _execute_action(self, action: ResponseAction, event: Event):
@@ -354,7 +480,7 @@ class RealResponseEngine:
         handler = handlers.get(action)
         if not handler:
             log.warning("No handler for action: %s", action.value)
-            return
+            return None
 
         # 1) PENDING record so the tab shows the action instantly
         record = self._build_action_record(action, event)
@@ -369,10 +495,11 @@ class RealResponseEngine:
             record.error = f"{type(exc).__name__}: {exc}"
             record.details = record.details or f"{action.value} failed"
             await self._publish_action(record)
-            log.exception(
-                "Action %s FAILED for event %s", action.value, event.event_id
+            log.error(
+                "Action %s FAILED for event %s: %s",
+                action.value, event.event_id, record.error,
             )
-            return
+            return record
 
         # 3) Finalise
         _, final_status = _ACTION_META.get(action, ("unknown", ActionStatus.SUCCESS))
@@ -385,6 +512,7 @@ class RealResponseEngine:
         record.success = True
         record.error = None
         await self._publish_action(record)
+        return record
 
     # ============================================================
     # ActionRecord helpers
@@ -425,6 +553,12 @@ class RealResponseEngine:
         if threat is not None:
             metadata["threat_type"] = threat.value if hasattr(threat, "value") else str(threat)
         metadata.update(extra_meta)
+        ev_meta = getattr(event, "metadata", None) or {}
+        if ev_meta.get("remote"):
+            metadata["remote"] = True
+            metadata["triggered_from"] = "dashboard"
+            if ev_meta.get("cmd_id"):
+                metadata["cmd_id"] = ev_meta["cmd_id"]
 
         return ActionRecord(
             action_id=f"act_{uuid.uuid4().hex[:12]}",
@@ -613,7 +747,7 @@ class RealResponseEngine:
 
         Raises on failure so the dispatch wrapper marks the ActionRecord as
         FAILED, which is what the dashboard shows. Never returns quietly on
-        error — silent success is what makes EDRs untrustworthy.
+        error - silent success is what makes EDRs untrustworthy.
         """
         payload = (event.metadata or {}).get("payload", {}) or {}
         raw = payload.get("raw_payload", {}) or {}
@@ -650,7 +784,7 @@ class RealResponseEngine:
             raise RuntimeError(f"Process {pid} does not exist (already gone?)")
         except psutil.AccessDenied:
             raise RuntimeError(
-                f"Access denied reading pid {pid} — run agent as Administrator"
+                f"Access denied reading pid {pid} - run agent as Administrator"
             )
 
         try:
@@ -665,29 +799,45 @@ class RealResponseEngine:
             proc.terminate()
         except psutil.AccessDenied:
             raise RuntimeError(
-                f"Access denied terminating {real_name} ({pid}) — "
+                f"Access denied terminating {real_name} ({pid}) - "
                 f"run agent as Administrator/SYSTEM"
             )
         except Exception as exc:
             raise RuntimeError(f"terminate() failed for {pid}: {exc}")
 
-        try:
-            proc.wait(timeout=2)
-        except psutil.TimeoutExpired:
-            log.warning("Process %s ignored SIGTERM, force-killing", pid)
+        def _gone() -> bool:
+            # A killed process can linger as a zombie until its parent
+            # reaps it - it is no longer running, so count it as gone.
             try:
-                proc.kill()
-                proc.wait(timeout=2)
-            except psutil.AccessDenied:
-                raise RuntimeError(
-                    f"Access denied force-killing {real_name} ({pid})"
-                )
-            except Exception as exc:
-                raise RuntimeError(f"kill() failed for {pid}: {exc}")
+                return (not proc.is_running()) or proc.status() == psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return True
+
+        # Wait without blocking the event loop (other commands, heartbeats)
+        try:
+            await asyncio.to_thread(proc.wait, 2)
+        except psutil.TimeoutExpired:
+            if not _gone():
+                log.warning("Process %s ignored terminate, force-killing", pid)
+                try:
+                    proc.kill()
+                    await asyncio.to_thread(proc.wait, 2)
+                except psutil.NoSuchProcess:
+                    pass
+                except psutil.AccessDenied:
+                    raise RuntimeError(
+                        f"Access denied force-killing {real_name} ({pid})"
+                    )
+                except psutil.TimeoutExpired:
+                    pass  # checked by _gone() below
+                except Exception as exc:
+                    raise RuntimeError(f"kill() failed for {pid}: {exc}")
+        except psutil.NoSuchProcess:
+            pass
         except Exception as exc:
             raise RuntimeError(f"wait() failed for {pid}: {exc}")
 
-        if proc.is_running():
+        if not _gone():
             raise RuntimeError(
                 f"Process {real_name} ({pid}) is still running after kill"
             )

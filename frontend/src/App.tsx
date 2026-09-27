@@ -206,58 +206,37 @@ export default function App() {
     }
   }, [token]);
 
-  // ---- NEW: retry an action by re-posting it to /api/agent/actions ----
+  // ---- Retry an action: re-dispatch it to the agent over the command channel ----
+  // (Previously this only re-posted a "pending" record to the backend, so
+  // nothing was ever executed on the endpoint.)
   const handleRetryAction = useCallback(async (record: ActionRecord) => {
-    const payload = {
-      action: record.action,
-      target: record.target,
-      target_type: record.target_type,
-      endpoint: record.endpoint,
-      source: record.source,
-      agent: record.agent,
-      severity: record.severity,
-      reason: record.reason,
-      triggered_by: record.triggered_by,
-      status: "pending",
-      details: "Manual retry requested from dashboard",
-      retried_from: record.id,
-      metadata: { ...(record.metadata || {}), retried_from: record.id },
-    };
-
-    // Optimistic local entry so the tab reacts instantly
-    const optimistic: ActionRecord = {
-      ...record,
-      id: `local-${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      status: "pending",
-      success: false,
-      error: null,
-      details: "Manual retry requested from dashboard",
-      retried_from: record.id,
-    };
-    setActions(prev => mergeActions(prev, [optimistic]));
+    const endpoint = record.endpoint || record.source;
+    const meta = (record.metadata || {}) as Record<string, unknown>;
+    const target = String(
+      meta.pid ?? meta.src_ip ?? meta.user_id ?? meta.device_id ?? record.target ?? ""
+    );
+    const params: Record<string, unknown> = { retried_from: record.id };
+    if (meta.pid !== undefined) params.pid = meta.pid;
 
     try {
-      const res = await api.post(`${API}/agent/actions`, payload, authH());
-      const stored: ActionRecord | undefined = res?.data?.actions?.[0];
-      if (stored) {
-        setActions(prev =>
-          mergeActions(
-            prev.filter(a => a.id !== optimistic.id),
-            [stored],
-          ),
-        );
-      }
-    } catch (err) {
-      console.error("Retry failed", err);
-      setActions(prev =>
-        prev.map(a =>
-          a.id === optimistic.id
-            ? { ...a, status: "failed", success: false, error: "Failed to re-issue action" }
-            : a,
-        ),
+      const res = await api.post(`${API}/agent/commands`, {
+        endpoint_id: endpoint,
+        action: record.action,
+        target,
+        params,
+      }, authH());
+      addNotif(
+        "info",
+        "Retry Dispatched",
+        `${record.action} → ${target} sent to ${endpoint} (cmd ${res?.data?.cmd_id || "?"})`,
       );
-      addNotif("warning", "Retry Failed", `Could not re-issue ${record.action}`);
+    } catch (err: any) {
+      console.error("Retry failed", err);
+      addNotif(
+        "warning",
+        "Retry Failed",
+        err?.response?.data?.error || `Could not re-dispatch ${record.action} to ${endpoint}`,
+      );
     }
   }, []);
 

@@ -16,6 +16,10 @@ import httpx
 
 log = logging.getLogger("AlertQueue")
 
+# Endpoints that should be delivered right away instead of waiting for the
+# next 30s retry cycle (dashboard users are watching these in real time).
+URGENT_ENDPOINTS = {"actions", "pseudo-lock", "pseudo-lock-restore"}
+
 # Path to the SQLite database file (saved in the agent's root directory)
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alerts_queue.db")
 
@@ -46,6 +50,7 @@ class OfflineQueueManager:
         self._db_lock = threading.Lock()
         self._running = False
         self._retry_thread = None
+        self._wake = threading.Event()
 
         # Ensure the database and table exist
         self._init_db()
@@ -98,7 +103,10 @@ class OfflineQueueManager:
             "endpoint": endpoint,
             "payload": payload,
         }
-        return await asyncio.to_thread(self._add_sync, wrapped)
+        alert_id = await asyncio.to_thread(self._add_sync, wrapped)
+        if endpoint in URGENT_ENDPOINTS:
+            self._wake.set()   # flush now instead of waiting up to 30s
+        return alert_id
 
     def _add_sync(self, wrapped_payload: dict) -> int:
         """Synchronous DB insert (runs in a thread pool)."""
@@ -135,6 +143,7 @@ class OfflineQueueManager:
     def stop_retry(self):
         """Stop the retry worker gracefully."""
         self._running = False
+        self._wake.set()
         if self._retry_thread and self._retry_thread.is_alive():
             self._retry_thread.join(timeout=3)
         log.info("Offline retry worker stopped")
@@ -147,6 +156,7 @@ class OfflineQueueManager:
         """
         while self._running:
             try:
+                self._wake.clear()   # anything queued after this point re-wakes us
                 pending = self._get_pending_alerts()
                 if pending:
                     log.info("Retry worker: %d pending alert(s) to send", len(pending))
@@ -158,10 +168,12 @@ class OfflineQueueManager:
                             endpoint = wrapped.get("endpoint", "findings")
                             inner_payload = wrapped.get("payload", {})
 
-                            url = f"{self.remote_url}/api/agent/{endpoint}"
+                            url = f"{(self.remote_url or '').rstrip('/')}/api/agent/{endpoint}"
                             headers = {
                                 "Content-Type": "application/json",
                                 "X-API-Key": self.api_key,
+                                # Skip ngrok's free-tier browser interstitial page
+                                "ngrok-skip-browser-warning": "true",
                             }
 
                             response = httpx.post(
@@ -187,11 +199,13 @@ class OfflineQueueManager:
                             log.error("Retry worker unexpected error for alert %d: %s", alert_id, e)
                             self._increment_attempt(alert_id)
 
-                # Wait 30 seconds before next check
+                # Wait 30 seconds before next check - or less if an urgent
+                # item (e.g. a response action) was queued in the meantime.
                 for _ in range(30):
                     if not self._running:
                         break
-                    time.sleep(1)
+                    if self._wake.wait(timeout=1):
+                        break
 
             except Exception as e:
                 log.error("Retry worker loop crashed: %s", e)

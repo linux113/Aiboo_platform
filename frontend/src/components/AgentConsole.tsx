@@ -34,7 +34,7 @@ const ACTION_FILTERS: {
 
 // ---- Remote dispatch action catalogue ----
 const DISPATCH_ACTIONS: { value: string; label: string; placeholder: string }[] = [
-  { value: "terminate_process", label: "Terminate process", placeholder: "PID (e.g. 1234)" },
+  { value: "terminate_process", label: "Terminate process", placeholder: "PID or process name (e.g. 1234 or notepad.exe)" },
   { value: "isolate_asset", label: "Isolate IP (inbound)", placeholder: "IP (e.g. 203.0.113.100)" },
   { value: "block_access", label: "Block IP (inbound)", placeholder: "IP (e.g. 10.0.0.45)" },
   { value: "quarantine_device", label: "Quarantine device", placeholder: "Device ID (e.g. DEV-ABC123)" },
@@ -282,6 +282,47 @@ export default function AgentConsole({
   };
 
   // ---- Remote dispatch handler ----
+  // 1) POST /agent/commands  -> backend pushes the command to the agent
+  // 2) Poll GET /agent/commands for the agent's ack
+  //    (sent -> received -> executed | failed) and show the real outcome.
+  const pollCommandStatus = async (cmdId: string, endpoint: string, label: string) => {
+    const deadline = Date.now() + 20000;
+    let lastStatus = "sent";
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        const res = await api.get("/agent/commands");
+        const list: { cmd_id: string; status: string; error?: string | null }[] =
+          Array.isArray(res.data?.commands) ? res.data.commands : [];
+        const cmd = list.find((c) => c.cmd_id === cmdId);
+        if (!cmd) continue;
+        if (cmd.status === "executed") {
+          setDispatchResult(`✅ Done on ${endpoint}: ${label}`);
+          setDispatchStatus("ok");
+          onRefreshActions?.();
+          return;
+        }
+        if (cmd.status === "failed") {
+          setDispatchResult(`❌ Failed on ${endpoint}: ${cmd.error || "unknown error"}`);
+          setDispatchStatus("err");
+          onRefreshActions?.();
+          return;
+        }
+        if (cmd.status !== lastStatus) {
+          lastStatus = cmd.status;
+          setDispatchResult(`⏳ ${endpoint} received the command — executing ${label}…`);
+          setDispatchStatus("");
+        }
+      } catch {
+        /* keep polling */
+      }
+    }
+    setDispatchResult(
+      `⚠️ No result from ${endpoint} within 20s — check the agent window for errors`
+    );
+    setDispatchStatus("err");
+  };
+
   const dispatchRemote = async () => {
     if (!dispatchEndpoint) {
       setDispatchResult("❌ No agent selected");
@@ -293,35 +334,51 @@ export default function AgentConsole({
       setDispatchStatus("err");
       return;
     }
+    const target = dispatchTarget.trim();
+    if (!target) {
+      setDispatchResult(`❌ Enter a target: ${dispatchPlaceholder}`);
+      setDispatchStatus("err");
+      return;
+    }
 
     setDispatching(true);
     setDispatchResult("");
     setDispatchStatus("");
 
+    const params: Record<string, unknown> = {};
+    if (dispatchAction === "terminate_process" && /^\d+$/.test(target)) {
+      params.pid = parseInt(target, 10);
+    }
+
+    const endpoint = dispatchEndpoint;
+    const label = `${dispatchAction} → ${target}`;
+    let cmdId = "";
     try {
       const res = await api.post("/agent/commands", {
-        endpoint_id: dispatchEndpoint,
+        endpoint_id: endpoint,
         action: dispatchAction,
-        target: dispatchTarget,
-        params: {},
+        target,
+        params,
       });
 
-      const cmdId = res.data?.cmd_id || "unknown";
-      setDispatchResult(`✅ Dispatched (cmd ${cmdId}) — awaiting agent ack`);
-      setDispatchStatus("ok");
+      cmdId = res.data?.cmd_id || "";
+      setDispatchResult(`⏳ Sent to ${endpoint} (cmd ${cmdId || "?"}) — waiting for agent…`);
+      setDispatchStatus("");
       setDispatchTarget("");
     } catch (e: unknown) {
       const err = e as {
-        response?: { data?: { error?: string } };
+        response?: { data?: { error?: string; message?: string } };
         message?: string;
       };
       setDispatchResult(
-        `❌ ${err.response?.data?.error || err.message || "Dispatch failed"}`
+        `❌ ${err.response?.data?.error || err.response?.data?.message || err.message || "Dispatch failed"}`
       );
       setDispatchStatus("err");
     } finally {
       setDispatching(false);
     }
+
+    if (cmdId) await pollCommandStatus(cmdId, endpoint, label);
   };
 
   const tabs = [

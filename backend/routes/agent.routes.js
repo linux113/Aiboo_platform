@@ -23,7 +23,11 @@ const store = {
 const MAX = 200;
 const ACTIONS_MAX = 500; // Response actions accumulate faster than findings
 const push = (arr, item) => { arr.unshift(item); if (arr.length > MAX) arr.pop(); };
+// Upsert by id: an action is reported several times as it progresses
+// (pending -> success/failed). Keep one row per action, newest state first.
 const pushAction = (item) => {
+  const idx = store.actions.findIndex((a) => a.id === item.id);
+  if (idx !== -1) store.actions.splice(idx, 1);
   store.actions.unshift(item);
   if (store.actions.length > ACTIONS_MAX) store.actions.pop();
 };
@@ -388,7 +392,9 @@ router.get('/actions/stats', protect, (req, res) => {
 // ============================================================
 
 // POST /api/agent/commands – dispatch an action to a specific agent
-router.post('/commands', protect, (req, res) => {
+// Remote actions change the endpoint (kill processes, firewall rules), so
+// viewers are not allowed to dispatch them.
+router.post('/commands', protect, authorize('admin', 'analyst'), (req, res) => {
   try {
     const { endpoint_id, action, target, params } = req.body || {};
 

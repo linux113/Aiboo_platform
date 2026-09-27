@@ -4,6 +4,7 @@ import asyncio
 import logging
 import configparser
 import os
+import sys
 from .event_bus import EventBus
 from gates import Gate1Perimeter, Gate2Behavioural, Gate3Adaptive, GateResponseBridge
 from log_ingestion import WindowsEventIngestor
@@ -13,6 +14,23 @@ from core.zero_trust_pep import ZeroTrustPEP
 from core.alert_queue import OfflineQueueManager
 from core.backend_bridge import DashboardBridge
 from core.process_killer import ProcessKiller  # <-- NEW IMPORT
+from core.command_channel import CommandChannel
+
+# Remote actions the dashboard is allowed to trigger on this endpoint
+# (matches the "Dispatch Remote Action" dropdown in the dashboard).
+REMOTE_ALLOWED_ACTIONS = {
+    "terminate_process", "isolate_asset", "block_access", "quarantine_device",
+    "force_logout", "revoke_identity", "pseudo_lock",
+}
+
+
+def _cfg_bool(cfg: dict, key: str, default: bool) -> bool:
+    val = str(cfg.get(key, "")).strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
 
 log = logging.getLogger("Orchestrator")
 
@@ -62,7 +80,14 @@ class Orchestrator:
 
         # ---- Real Windows Event Log ingestion ----
         self.windows_ingestor = WindowsEventIngestor(bus)
-        # self.real_response = RealResponseEngine(bus)    # DISABLED
+
+        # ---- Real response engine (executes actions on THIS PC) ----
+        # Always created so remote commands from the dashboard can run.
+        # Automatic responses (auto-kill / firewall / account lock on Gate 3
+        # BLOCK) stay OFF unless config.ini has  auto_response = true
+        self.auto_response = _cfg_bool(self.config, 'auto_response', False)
+        self.remote_commands = _cfg_bool(self.config, 'remote_commands', True)
+        self.real_response = RealResponseEngine(bus, auto_response=self.auto_response)
 
         # ---- Zero Trust engines (existing) ----
         self.behavioral_dna = BehavioralDNAEngine(bus)
@@ -87,7 +112,13 @@ class Orchestrator:
         self.anomaly_detection = AnomalyDetectionEngine(bus)
 
         # ---- MERN dashboard bridge ----
-        self.dashboard_bridge = DashboardBridge(bus, backend_url='https://stuffy-volley-had.ngrok-free.dev')
+        # Backend URL comes from config.ini [AIBOO] remote_url (or NODE_BACKEND env).
+        self.dashboard_bridge = DashboardBridge(
+            bus,
+            backend_url=self.config.get('remote_url'),
+            api_key=self.config.get('api_key'),
+            endpoint_id=self.config.get('endpoint_name') or None,
+        )
 
         # ---- Offline queue ----
         self.queue_manager = OfflineQueueManager(
@@ -95,22 +126,57 @@ class Orchestrator:
             api_key=self.config.get('api_key')
         )
 
-        # ---- Process killer (local actions) ----
+        # ---- Remote command channel (dashboard -> this PC) ----
+        self.command_channel = None
+        if self.remote_commands:
+            self.command_channel = CommandChannel(
+                self.real_response,
+                backend_url=self.config.get('remote_url'),
+                api_key=self.config.get('api_key'),
+                endpoint_id=self.dashboard_bridge._endpoint_id,
+                allowed_actions=REMOTE_ALLOWED_ACTIONS,
+            )
+
+        # ---- Process killer (demo: kills notepad.exe / calc.exe every 3s) ----
+        # OFF by default: it silently killed any Notepad/Calculator the user
+        # opened (and made remote-terminate testing impossible).
+        # Enable with  process_killer = true  in config.ini.
+        self.process_killer_enabled = _cfg_bool(self.config, 'process_killer', False)
         self.process_killer = ProcessKiller(interval=3.0)
 
     def _load_config(self) -> dict:
-        """Load configuration from config.ini in the same directory."""
-        config = configparser.ConfigParser()
-        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.ini')
-        if os.path.exists(config_path):
-            config.read(config_path)
-            if 'AIBOO' in config:
-                return dict(config['AIBOO'])
-        # Fallback defaults
+        """
+        Load [AIBOO] settings from config.ini.
+
+        Search order (first hit wins):
+          1. Next to the executable (PyInstaller frozen build)
+          2. The agent/ directory (source checkout)
+          3. The current working directory
+        Falls back to NODE_BACKEND env / localhost if no config.ini is found.
+        """
+        candidates = []
+        if getattr(sys, 'frozen', False):
+            candidates.append(os.path.join(os.path.dirname(sys.executable), 'config.ini'))
+        candidates.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config.ini'))
+        candidates.append(os.path.join(os.getcwd(), 'config.ini'))
+
+        for config_path in candidates:
+            if os.path.exists(config_path):
+                config = configparser.ConfigParser()
+                config.read(config_path)
+                if 'AIBOO' in config:
+                    cfg = dict(config['AIBOO'])
+                    cfg['remote_url'] = (cfg.get('remote_url') or '').strip().rstrip('/') \
+                        or os.getenv('NODE_BACKEND', 'http://localhost:4000')
+                    log.info("Loaded config from %s (backend=%s)",
+                             os.path.abspath(config_path), cfg['remote_url'])
+                    return cfg
+
+        log.warning("config.ini not found — falling back to NODE_BACKEND / localhost")
         return {
-            'remote_url': 'https://stuffy-volley-had.ngrok-free.dev',
-            'api_key': 'dev-key-change-in-production',
-            'endpoint_name': 'Unknown_PC',
+            'remote_url': os.getenv('NODE_BACKEND', 'http://localhost:4000').rstrip('/'),
+            'api_key': os.getenv('AGENT_API_KEY', 'dev-key-change-in-production'),
+            'endpoint_name': '',
             'server_ip': '192.168.1.100'
         }
 
@@ -127,7 +193,12 @@ class Orchestrator:
         self.correlation.start()
         # self.dashboard.start()          # DISABLED
         # self.response_eng.start()       # DISABLED
-        # self.real_response.start()      # DISABLED
+        if self.auto_response:
+            self.real_response.start()
+            log.warning("Real Response Engine: AUTO-RESPONSE ON (auto_response = true)")
+        else:
+            log.info("Real Response Engine ready - remote commands only "
+                     "(set auto_response = true in config.ini for automatic actions)")
 
         # ---- Start Zero Trust engines ----
         self.behavioral_dna.start()
@@ -163,9 +234,18 @@ class Orchestrator:
         )
         log.info("Offline alert queue and retry worker started")
 
+        # ---- Start remote command channel ----
+        if self.command_channel:
+            self.command_channel.start()
+        else:
+            log.info("Remote commands disabled (remote_commands = false in config.ini)")
+
         # ---- Start process killer (local actions) ----
-        await self.process_killer.start()   # <-- NEW
-        log.info("Process killer started – listening for high/critical alerts")
+        if self.process_killer_enabled:
+            await self.process_killer.start()
+            log.info("Process killer started - notepad.exe/calc.exe will be killed")
+        else:
+            log.info("Process killer disabled (set process_killer = true to enable)")
 
         # ---- Register specialist agents ----
         for agent in self.agents:
@@ -185,15 +265,20 @@ class Orchestrator:
         log.info(
             "Platform ready — tri-gate pipeline + %d specialist agents + "
             "Zero Trust engines + Layer 2 engines + Layer 3 CSDE + "
-            "offline queue + process killer (local actions enabled)",
+            "offline queue + remote command channel",
             len(self.agents)
         )
 
     async def shutdown(self) -> None:
         log.info("Shutting down AiBoO...")
 
+        # ---- Stop remote command channel ----
+        if self.command_channel:
+            await self.command_channel.stop()
+
         # ---- Stop process killer ----
-        await self.process_killer.stop()   # <-- NEW
+        if self.process_killer_enabled:
+            await self.process_killer.stop()
 
         # ---- Stop offline queue ----
         self.queue_manager.stop_retry()
