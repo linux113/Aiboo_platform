@@ -2,6 +2,9 @@
 
 export type NavId =
   | "dashboard"
+  | "executive"
+  | "alerts"
+  | "reports"
   | "surveillance"
   | "intelligence"
   | "agent"
@@ -78,6 +81,18 @@ export interface CorrelatedAlert {
   findings: AgentFinding[];
   actions: string[];
   timestamp: string;
+  source?: string;
+  // attack-chain details from the agent's incident correlator
+  incident?: {
+    stages: { key: string; label: string }[];
+    users: string[];
+    ips: string[];
+    pcs?: string[];
+    max_risk: number;
+    count: number;
+    span_minutes?: number;
+    kind: "attack_chain" | "repeated";
+  };
 }
 
 // ---- TriGate (Gate 1 Trust -> Gate 2 Intent -> Gate 3 Impact) ----
@@ -315,4 +330,127 @@ export interface ChatMsg {
   content: string;
   isTyping?: boolean;
   meta?: { confidence?: number; sources?: string };
+}
+
+
+// ============================================================
+//  Alert management, analytics, compliance (Task 29)
+// ============================================================
+export type AlertStatus = "open" | "acknowledged" | "closed";
+export type CloseReason = "resolved" | "false_positive" | "duplicate" | "accepted_risk";
+
+export interface AlertNote { by: string; text: string; at: string }
+export interface AlertHistory { by: string; action: string; from?: string; to?: string; text?: string; at: string }
+
+export interface SecurityAlert {
+  alertId: string;
+  kind: "trigate" | "finding" | "incident";
+  source: string;
+  title: string;
+  description: string;
+  severity: Severity;
+  riskScore: number;
+  verdict?: string;
+  pattern?: string;
+  entity?: string;
+  subject?: string;
+  srcIp?: string;
+  status: AlertStatus;
+  assignee: string;
+  closeReason: CloseReason | "";
+  notes: AlertNote[];
+  history?: AlertHistory[];
+  historyCount?: number;
+  occurrences: number;
+  firstSeen: string;
+  lastSeen: string;
+  acknowledgedAt?: string;
+  acknowledgedBy?: string;
+  closedAt?: string;
+  closedBy?: string;
+  data?: Record<string, any>;
+}
+
+export interface AlertList {
+  total: number;
+  page: number;
+  limit: number;
+  counts: Record<AlertStatus, number>;
+  alerts: SecurityAlert[];
+  storage: "mongodb" | "memory";
+}
+
+export interface TrendPoint { date: string; critical: number; high: number; medium: number; low: number; total: number; closed: number }
+export interface NamedCount { name: string; count: number }
+
+export interface ComplianceCheck {
+  id: string;
+  title: string;
+  status: "pass" | "fail" | "warn" | "unknown";
+  detail: string;
+  iso27001: string[];
+  nist_csf: string[];
+  weight: number;
+  fix: string;
+}
+
+export interface FrameworkSummary { controls: number; met: number; failing: string[]; assessed: number; score: number | null }
+
+export interface ComplianceReport {
+  endpoint: string;
+  checked_at?: string;
+  checkedAt?: string;
+  score: number | null;
+  counts: Partial<Record<"pass" | "fail" | "warn" | "unknown", number>>;
+  frameworks: Record<string, FrameworkSummary>;
+  checks: ComplianceCheck[];
+}
+
+export interface Analytics {
+  generatedAt: string;
+  days: number;
+  tz: string;
+  kpis: {
+    totalAlerts: number; previousAlerts: number; changePct: number | null;
+    open: number; acknowledged: number; openCritical: number; openHigh: number; closed: number; unassigned: number;
+    mttaMinutes: number | null; mttrMinutes: number | null; falsePositiveRate: number | null;
+    incidents: number; blocked: number; held: number; endpoints: number; endpointsOnline: number; avgCompliance: number | null;
+  };
+  posture: { score: number; level: "good" | "fair" | "poor" | "critical"; alertPenalty: number; compliancePenalty: number };
+  bySeverity: Record<Severity, number>;
+  openBySeverity: Record<Severity, number>;
+  byStatus: Record<string, number>;
+  byKind: Record<string, number>;
+  byCloseReason: Record<string, number>;
+  topPatterns: NamedCount[];
+  topEntities: NamedCount[];
+  topSources: NamedCount[];
+  topIps: NamedCount[];
+  trend: TrendPoint[];
+  gateVerdicts: Record<string, number>;
+  intel: { feedEntries: number; matches: number; scans: number; behaviourAlerts: number; incidents: number; restrictions: number; throttles: number };
+  compliance: {
+    average: number | null;
+    endpoints: { endpoint: string; score: number | null; counts: ComplianceReport["counts"]; checkedAt?: string; frameworks: Record<string, FrameworkSummary> }[];
+    failing: { id: string; title: string; status: string; endpoints: string[]; fix: string; iso: string[]; nist: string[] }[];
+    trend: { date: string; score: number | null }[];
+  };
+  recentCritical: Pick<SecurityAlert, "alertId" | "title" | "severity" | "status" | "riskScore" | "source" | "entity" | "firstSeen" | "assignee">[];
+}
+
+export interface AgentStatusReport {
+  endpoint: string;
+  received_at: string;
+  auto_response?: boolean;
+  threat_intel?: {
+    connection_scan?: boolean; interval_seconds?: number; scans?: number; matches?: number; last_error?: string;
+    feeds?: { key: string; name: string; url: string; entries: number; updated: string; error: string }[];
+    feed_entries?: number; abuseipdb?: boolean;
+  };
+  behaviour?: { enabled?: boolean; users?: number; learned?: number; alerts?: number; min_logons?: number; min_days?: number };
+  correlation?: { open_incidents?: number; tracked?: number; emitted?: number; window_minutes?: number };
+  access_control?: {
+    restrictions?: { user: string; until: string; minutes_left: number; reason: string }[];
+    throttles?: { segment: string; kbps: number; until: string; minutes_left: number }[];
+  };
 }

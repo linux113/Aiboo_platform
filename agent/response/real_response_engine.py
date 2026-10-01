@@ -146,6 +146,10 @@ _ACTION_META: Dict[ResponseAction, tuple] = {
     ResponseAction.GRANT_TEMP_PRIVILEGE:            ("identity", ActionStatus.ACTIVE),
     ResponseAction.SCHEDULE_PRIVILEGE_REVOCATION:   ("identity", ActionStatus.SUCCESS),
     ResponseAction.NOTIFY_SECURITY:                 ("unknown",  ActionStatus.SUCCESS),
+    ResponseAction.RESTRICT_IDENTITY:               ("identity", ActionStatus.ACTIVE),
+    ResponseAction.LIFT_RESTRICTION:                ("identity", ActionStatus.SUCCESS),
+    ResponseAction.THROTTLE_SEGMENT:                ("ip",       ActionStatus.ACTIVE),
+    ResponseAction.REMOVE_THROTTLE:                 ("ip",       ActionStatus.SUCCESS),
 }
 
 Event = Union[GateDecision, AgentFinding]
@@ -381,7 +385,16 @@ class RealResponseEngine:
                         ResponseAction.BLOCK_ACCESS,
                         ResponseAction.ALLOW_ACCESS):
             params["src_ip"] = self._validate_remote_ip(params.get("src_ip") or target)
+        elif action in (ResponseAction.THROTTLE_SEGMENT, ResponseAction.REMOVE_THROTTLE):
+            segment = str(params.get("segment") or target).strip()
+            try:
+                params["segment"] = str(ipaddress.ip_network(segment, strict=False))
+            except ValueError:
+                raise RuntimeError(f"{action.value} needs an IP address or range, e.g. 203.0.113.7 "
+                                   f"or 192.168.1.0/24 (got {segment!r})")
         elif action in (ResponseAction.REVOKE_IDENTITY,
+                        ResponseAction.RESTRICT_IDENTITY,
+                        ResponseAction.LIFT_RESTRICTION,
                         ResponseAction.FORCE_LOGOUT,
                         ResponseAction.REVOKE_SESSION,
                         ResponseAction.CHALLENGE_MFA,
@@ -393,7 +406,9 @@ class RealResponseEngine:
                 raise RuntimeError(f"{action.value} needs a user ID as target")
             if not _validate_user_id(user_id):
                 raise RuntimeError(f"Invalid user_id format: {user_id}")
-            if action == ResponseAction.REVOKE_IDENTITY and self._is_current_user(user_id):
+            if action in (ResponseAction.REVOKE_IDENTITY, ResponseAction.RESTRICT_IDENTITY,
+                          ResponseAction.FORCE_LOGOUT, ResponseAction.REVOKE_SESSION) \
+                    and self._is_current_user(user_id):
                 raise RuntimeError(
                     f"Refusing to disable '{user_id}': it is the account the agent "
                     f"is running as (you would lock yourself out)"
@@ -414,6 +429,9 @@ class RealResponseEngine:
             "device_id": params.get("device_id") or (target if action == ResponseAction.QUARANTINE_DEVICE else None),
             "process_name": params.get("process_name"),
             "jit_duration_minutes": params.get("jit_duration_minutes"),
+            "segment": params.get("segment"),
+            "minutes": params.get("minutes"),
+            "kbps": params.get("kbps"),
         }
 
         # Only keep keys with real values so _pick() falls through cleanly
@@ -536,6 +554,10 @@ class RealResponseEngine:
             ResponseAction.STEP_UP_AUTH: self._step_up_auth,
             ResponseAction.GRANT_TEMP_PRIVILEGE: self._grant_temp_privilege,
             ResponseAction.SCHEDULE_PRIVILEGE_REVOCATION: self._schedule_privilege_revocation,
+            ResponseAction.RESTRICT_IDENTITY: self._restrict_identity,
+            ResponseAction.LIFT_RESTRICTION: self._lift_restriction,
+            ResponseAction.THROTTLE_SEGMENT: self._throttle_segment,
+            ResponseAction.REMOVE_THROTTLE: self._remove_throttle,
         }
         handler = handlers.get(action)
         if not handler:
@@ -676,8 +698,14 @@ class RealResponseEngine:
                 return str(device_id), {"device_id": device_id}
             return event.event_id, {}
 
+        if action in (ResponseAction.THROTTLE_SEGMENT, ResponseAction.REMOVE_THROTTLE):
+            seg = _pick("segment", "src_ip", "ip")
+            return (str(seg), {"segment": seg}) if seg else (event.event_id, {})
+
         if action in (
             ResponseAction.REVOKE_IDENTITY,
+            ResponseAction.RESTRICT_IDENTITY,
+            ResponseAction.LIFT_RESTRICTION,
             ResponseAction.FORCE_LOGOUT,
             ResponseAction.REVOKE_SESSION,
             ResponseAction.CHALLENGE_MFA,
@@ -973,43 +1001,80 @@ class RealResponseEngine:
             )
         log.warning("Blocked IP %s via Windows Firewall", src_ip)
 
-    async def _challenge_mfa(self, event: Event):
-        user_id = self._extract_user_id(event)
-        log.warning(
-            "MFA challenge sent to %s (event %s)",
-            user_id or "unknown user", event.event_id,
-        )
+    # ---- Dynamic access control (real Windows changes, see access_control.py) ----
 
-    async def _revoke_session(self, event: Event):
-        user_id = self._extract_user_id(event)
-        if user_id:
-            log.warning("All sessions revoked for user %s", user_id)
-        else:
-            log.warning("Session %s revoked", event.event_id)
+    @staticmethod
+    def _access_control():
+        from response.access_control import get_access_control
+        return get_access_control()
 
-    async def _quarantine_device(self, event: Event):
+    def _payload_value(self, event: Event, key: str):
         payload = (event.metadata or {}).get("payload", {}) or {}
-        device_id = payload.get("device_id") or payload.get("device_info", {}).get("device_id")
-        if not device_id:
-            raw = payload.get("raw_payload", {}) or {}
-            device_id = raw.get("device_id")
-        if not device_id:
-            raise RuntimeError("Cannot quarantine: missing device ID")
-        log.warning("Device %s quarantined (event %s)", device_id, event.event_id)
+        v = payload.get(key)
+        if v in (None, ""):
+            v = (payload.get("raw_payload", {}) or {}).get(key)
+        if v in (None, ""):
+            v = (event.metadata or {}).get(key)
+        return v
 
-    async def _force_logout(self, event: Event):
+    def _require_user(self, event: Event, what: str) -> str:
         user_id = self._extract_user_id(event)
-        if user_id:
-            log.warning("Forced logout for user %s", user_id)
-        else:
-            log.warning("Forced logout for event %s", event.event_id)
+        if not user_id or user_id == "unknown":
+            raise RuntimeError(f"Cannot {what}: no user name in this alert")
+        if not _validate_user_id(user_id):
+            raise RuntimeError(f"Invalid user_id format: {user_id}")
+        return user_id
+
+    async def _restrict_identity(self, event: Event):
+        user_id = self._require_user(event, "restrict the account")
+        minutes = self._payload_value(event, "minutes") or 30
+        reason = getattr(event, "reason", "") or getattr(event, "summary", "") or ""
+        return await asyncio.to_thread(self._access_control().restrict_identity, user_id, minutes, reason)
+
+    async def _lift_restriction(self, event: Event):
+        user_id = self._require_user(event, "lift the restriction")
+        return await asyncio.to_thread(self._access_control().lift_restriction, user_id)
+
+    async def _throttle_segment(self, event: Event):
+        seg = self._payload_value(event, "segment") or self._payload_value(event, "src_ip")
+        if not seg:
+            raise RuntimeError("Cannot throttle: no IP address / range given")
+        return await asyncio.to_thread(self._access_control().throttle, seg,
+                                       self._payload_value(event, "kbps") or 256,
+                                       self._payload_value(event, "minutes") or 30)
+
+    async def _remove_throttle(self, event: Event):
+        seg = self._payload_value(event, "segment") or self._payload_value(event, "src_ip")
+        if not seg:
+            raise RuntimeError("Cannot remove throttle: no IP address / range given")
+        return await asyncio.to_thread(self._access_control().remove_throttle, seg)
+
+    async def _challenge_mfa(self, event: Event):
+        # Windows has no MFA prompt of its own: locking the screen forces the
+        # person at the keyboard to prove who they are (password / PIN / Hello).
+        return await asyncio.to_thread(self._access_control().lock_screen)
 
     async def _step_up_auth(self, event: Event):
-        user_id = self._extract_user_id(event)
-        log.warning(
-            "Step-up auth required for %s (event %s)",
-            user_id or "unknown user", event.event_id,
-        )
+        return await asyncio.to_thread(self._access_control().lock_screen)
+
+    async def _logoff(self, event: Event):
+        user_id = self._require_user(event, "log off")
+        name = user_id.split("\\")[-1]
+        sessions = await asyncio.to_thread(self._access_control().logoff_user, name)
+        return f"Logged off '{name}' ({len(sessions)} session(s): {', '.join(map(str, sessions))})"
+
+    async def _revoke_session(self, event: Event):
+        return await self._logoff(event)
+
+    async def _force_logout(self, event: Event):
+        return await self._logoff(event)
+
+    async def _quarantine_device(self, event: Event):
+        # Honest: there is no network-access-control system connected, so we
+        # do not pretend. Use Isolate Host (firewall) or Throttle Segment.
+        raise RuntimeError(
+            "Device quarantine needs a network access control (NAC) / switch integration, which is "
+            "not connected. Use 'Isolate Host' (firewall block) or 'Throttle Segment' instead.")
 
     async def _grant_temp_privilege(self, event: Event):
         user_id = self._extract_user_id(event)

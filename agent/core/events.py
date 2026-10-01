@@ -87,6 +87,12 @@ class ResponseAction(str, Enum):
     GRANT_TEMP_PRIVILEGE = "grant_temp_privilege"
     SCHEDULE_PRIVILEGE_REVOCATION = "schedule_privilege_revocation"
 
+    # ---- Dynamic access control (response/access_control.py) ----
+    RESTRICT_IDENTITY = "restrict_identity"    # disable account for N min + log off, auto re-enable
+    LIFT_RESTRICTION = "lift_restriction"      # re-enable now
+    THROTTLE_SEGMENT = "throttle_segment"      # Windows QoS bandwidth limit to an IP / range
+    REMOVE_THROTTLE = "remove_throttle"
+
     # ---- Layer 3 Cyber‑Physical Convergence actions ----
     NOTIFY_HR = "notify_hr"          # Alert Human Resources
     NOTIFY_LEGAL = "notify_legal"    # Alert Legal department

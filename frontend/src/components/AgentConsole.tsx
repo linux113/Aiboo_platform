@@ -27,9 +27,9 @@ const ACTION_FILTERS: {
 }[] = [
   { key: "all", label: "All", actions: null },
   { key: "terminated", label: "Terminated", actions: ["terminate_process", "force_logout"] },
-  { key: "isolated", label: "Isolated", actions: ["isolate_asset", "block_access", "lock_zone"] },
+  { key: "isolated", label: "Isolated", actions: ["isolate_asset", "block_access", "lock_zone", "throttle_segment"] },
   { key: "quarantined", label: "Quarantined", actions: ["quarantine_device", "quarantine_file"] },
-  { key: "pseudo-locked", label: "Pseudo-Locked", actions: ["pseudo_lock", "revoke_identity"] },
+  { key: "pseudo-locked", label: "Pseudo-Locked", actions: ["pseudo_lock", "revoke_identity", "restrict_identity"] },
   { key: "failed", label: "Failed", actions: null }, // special-cased on status
 ];
 
@@ -42,6 +42,12 @@ const DISPATCH_ACTIONS: { value: string; label: string; placeholder: string }[] 
   { value: "force_logout", label: "Force logout", placeholder: "User ID" },
   { value: "revoke_identity", label: "Revoke identity", placeholder: "User ID" },
   { value: "pseudo_lock", label: "Pseudo-lock", placeholder: "User ID or IP" },
+  // dynamic access control - real Windows changes, undone automatically
+  { value: "restrict_identity", label: "Restrict account 30 min (auto re-enable)", placeholder: "Windows user name" },
+  { value: "lift_restriction", label: "Lift account restriction now", placeholder: "Windows user name" },
+  { value: "throttle_segment", label: "Throttle IP / range 256 kbps, 30 min", placeholder: "IP or range (e.g. 45.95.147.3 or 192.168.1.0/24)" },
+  { value: "remove_throttle", label: "Remove throttle", placeholder: "Same IP or range as before" },
+  { value: "step_up_auth", label: "Lock screen (user must sign in again)", placeholder: "Windows user name" },
 ];
 
 // ---- Status badge styles ----
@@ -238,9 +244,9 @@ export default function AgentConsole({
     for (const r of actions) {
       if (r.status === "failed") map.failed++;
       if (["terminate_process", "force_logout"].includes(r.action)) map.terminated++;
-      if (["isolate_asset", "block_access", "lock_zone"].includes(r.action)) map.isolated++;
+      if (["isolate_asset", "block_access", "lock_zone", "throttle_segment"].includes(r.action)) map.isolated++;
       if (["quarantine_device", "quarantine_file"].includes(r.action)) map.quarantined++;
-      if (["pseudo_lock", "revoke_identity"].includes(r.action)) map["pseudo-locked"]++;
+      if (["pseudo_lock", "revoke_identity", "restrict_identity"].includes(r.action)) map["pseudo-locked"]++;
     }
     return map;
   }, [actions]);
@@ -512,7 +518,11 @@ export default function AgentConsole({
             <div className="space-y-3">
               {correlated.length === 0 && (
                 <div className="py-8 text-center">
-                  <p className="text-slate-500 text-sm">No correlated alerts yet</p>
+                  <p className="text-slate-500 text-sm">No attack chains yet</p>
+                  <p className="mt-1 text-[11px] text-slate-600">
+                    An incident appears when TriGate events for the same user, IP or PC show 2+ attack stages within 60 minutes
+                    (e.g. password guessing, then a new admin account), or 3 BLOCKs of the same kind.
+                  </p>
                 </div>
               )}
               {correlated.map((a) => (
@@ -525,8 +535,9 @@ export default function AgentConsole({
                     <div className="flex-1">
                       <div className="flex items-center gap-2 flex-wrap">
                         <span className="text-sm font-bold text-slate-100">
-                          CORRELATED ALERT
+                          {a.incident?.kind === "repeated" ? "REPEATED ATTACK" : a.incident ? "ATTACK CHAIN" : "CORRELATED ALERT"}
                         </span>
+                        {a.source && <span className="text-[10px] text-slate-400">🖥️ {a.source}</span>}
                         <span
                           className={cn(
                             "rounded-full px-2 py-0.5 text-[9px] font-medium ring-1",
@@ -547,10 +558,28 @@ export default function AgentConsole({
                       </p>
                     </div>
                   </div>
+                  {a.incident && (
+                    <div className="mb-3 space-y-1.5 text-[11px]">
+                      <div className="flex flex-wrap items-center gap-1">
+                        {a.incident.stages.map((st, i) => (
+                          <span key={st.key} className="flex items-center gap-1">
+                            {i > 0 && <span className="text-slate-600">→</span>}
+                            <span className="rounded border border-red-500/40 bg-red-500/10 px-2 py-0.5 text-red-200">{st.label}</span>
+                          </span>
+                        ))}
+                      </div>
+                      <div className="flex flex-wrap gap-3 text-slate-400">
+                        {a.incident.users.length > 0 && <span>👤 {a.incident.users.join(", ")}</span>}
+                        {a.incident.ips.length > 0 && <span>🌐 {a.incident.ips.join(", ")}</span>}
+                        <span>📊 max risk {a.incident.max_risk}</span>
+                        <span>🧩 {a.incident.count} events{a.incident.span_minutes !== undefined ? ` in ${a.incident.span_minutes} min` : ""}</span>
+                      </div>
+                    </div>
+                  )}
                   <div className="space-y-1.5">
-                    {a.findings.map((f) => (
+                    {a.findings.map((f, i) => (
                       <div
-                        key={f.id}
+                        key={f.id || i}
                         className="rounded-lg border border-slate-700 bg-slate-900/60 px-3 py-2 text-[11px] text-slate-300"
                       >
                         <span className="font-medium text-slate-200">

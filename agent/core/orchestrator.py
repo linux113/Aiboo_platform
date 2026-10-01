@@ -8,9 +8,12 @@ import sys
 from .event_bus import EventBus
 from gates import Gate1Perimeter, Gate2Behavioural, Gate3Adaptive, GateResponseBridge
 from gates.gate3_adaptive import current_importance
+from gates.device_posture import configure_device_trust
 from gates.threat_intel_lookup import configure_threat_intel
 from gates.trigate_memory import TriGateMemory, configure_memory
 from gates.trigate_patterns import configure_settings
+from gates.threat_feeds import FeedManager, parse_feed_list
+from gates.compliance_checks import build_report as build_compliance_report
 from log_ingestion import WindowsEventIngestor
 from core.zero_trust_pdp import ZeroTrustPDP
 from core.zero_trust_pep import ZeroTrustPEP
@@ -26,7 +29,19 @@ from core.test_event_injector import make_test_event_handler
 REMOTE_ALLOWED_ACTIONS = {
     "terminate_process", "isolate_asset", "block_access", "quarantine_device",
     "force_logout", "revoke_identity", "pseudo_lock",
+    # dynamic access control (response/access_control.py)
+    "restrict_identity", "lift_restriction", "revoke_session", "step_up_auth",
+    "throttle_segment", "remove_throttle",
 }
+
+STATUS_REPORT_SECONDS = 300
+
+
+def _cfg_float(cfg: dict, key: str, default: float) -> float:
+    try:
+        return float(str(cfg.get(key, "")).strip() or default)
+    except (TypeError, ValueError):
+        return default
 
 
 def _cfg_bool(cfg: dict, key: str, default: bool) -> bool:
@@ -60,6 +75,7 @@ class Orchestrator:
             ConvergedSecurityEngine, ComplianceEngine, AnomalyDetectionEngine,
         )
         from response import RealResponseEngine
+        from engines.incident_correlator import IncidentCorrelator
 
         # ---- Tri-gate pipeline (Trust -> Intent -> Impact) ----
         self.trigate_memory = self._setup_trigate()
@@ -109,7 +125,18 @@ class Orchestrator:
 
         # ---- Layer 2 Detection & Intelligence engines ----
         self.ueba = UEBAEngine(bus)
-        self.threat_intel = ThreatIntelligenceEngine(bus)
+        # Old UEBA / Behavioral DNA learn only from alerts -> their "anomalies"
+        # repeat existing cards. Quiet unless legacy_behaviour_alerts = true.
+        legacy = _cfg_bool(self.config, 'legacy_behaviour_alerts', False)
+        self.ueba.publish_alerts = legacy
+        self.behavioral_dna.publish_alerts = legacy
+        # Real threat intel: live connections vs blocklist + public feeds
+        self.threat_intel = ThreatIntelligenceEngine(
+            bus, interval=_cfg_float(self.config, 'intel_scan_seconds', 30),
+            enabled=_cfg_bool(self.config, 'intel_connection_scan', True))
+        # Incident correlation over TriGate decisions (attack chains)
+        self.incident_correlator = IncidentCorrelator(
+            bus, window_minutes=_cfg_float(self.config, 'correlation_window_minutes', 60))
         self.physical_security = PhysicalSecurityEngine(bus)
         self.insider_threat = InsiderThreatEngine(bus)
         self.meta_risk_arbiter = MetaRiskArbiter(bus)
@@ -176,6 +203,8 @@ class Orchestrator:
             importance     = normal      # low / normal / high / critical
             business_hours = 8-20        # working hours, local time
             abuseipdb_key  =             # free key from abuseipdb.com (optional)
+            device_trust   = true        # Gate 1 checks this PC's antivirus / firewall / updates
+            device_check_minutes = 15
         """
         base = self.config.get('_config_dir')
         if not base:
@@ -184,12 +213,77 @@ class Orchestrator:
         path = os.path.abspath(os.path.join(base, 'trigate_memory.json'))
         mem = configure_memory(path)
         settings = configure_settings(self.config.get('business_hours'), self.config.get('importance'))
-        configure_threat_intel(abuseipdb_key=self.config.get('abuseipdb_key', ''))
+        from engines.behaviour_analytics import configure_behaviour_analytics
+        from response.access_control import configure_access_control
+        feed_keys = parse_feed_list(self.config.get('threat_feeds'))
+        self.threat_feeds = FeedManager(os.path.join(os.path.abspath(base), 'threat_feeds'), feed_keys,
+                                        refresh_hours=_cfg_float(self.config, 'threat_feed_hours', 24))
+        configure_threat_intel(abuseipdb_key=self.config.get('abuseipdb_key', ''), feeds=self.threat_feeds)
+        dev = configure_device_trust(self.config.get('device_trust', 'true'),
+                                     self.config.get('device_check_minutes', 15))
+        self.behaviour = configure_behaviour_analytics(
+            self.config.get('behaviour_analytics', 'true'), self.config.get('behaviour_min_logons', 20),
+            self.config.get('behaviour_min_days', 3), memory=mem)
+        self.access_control = configure_access_control(
+            os.path.abspath(os.path.join(base, 'access_control_state.json')),
+            protected_ips=self._backend_ips(), start=False)
+        log.info("Intelligence: threat feeds %s, behaviour analytics %s, incident correlation ON",
+                 ", ".join(feed_keys) or "OFF",
+                 f"ON (learns after {self.behaviour.min_logons} logons / {self.behaviour.min_days} days)"
+                 if self.behaviour else "OFF")
         imp, where = current_importance()
         log.info("TriGate: importance %s (%s), working hours %d:00-%d:00, threat intel: blocklist%s, "
-                 "memory %s", imp.upper(), where, settings.business_hours[0], settings.business_hours[1],
-                 " + AbuseIPDB" if self.config.get('abuseipdb_key') else "", path)
+                 "device trust %s, memory %s", imp.upper(), where, settings.business_hours[0],
+                 settings.business_hours[1], " + AbuseIPDB" if self.config.get('abuseipdb_key') else "",
+                 f"ON (every {dev.minutes:g} min)" if dev.enabled else "OFF", path)
         return mem
+
+    def _backend_ips(self) -> list:
+        """IPs of the dashboard backend - never throttled (agent would lose its link)."""
+        import socket
+        from urllib.parse import urlparse
+        host = urlparse(self.config.get('remote_url') or '').hostname
+        if not host:
+            return []
+        try:
+            return sorted({ai[4][0] for ai in socket.getaddrinfo(host, None)})
+        except OSError:
+            return [host]
+
+    def _status_payload(self) -> dict:
+        """Live status of the intelligence features for the dashboard."""
+        out = {
+            "threat_intel": self.threat_intel.status(),
+            "behaviour": self.behaviour.stats() if self.behaviour else {"enabled": False},
+            "correlation": self.incident_correlator.stats(),
+            "access_control": self.access_control.snapshot(),
+            "auto_response": self.auto_response,
+        }
+        return out
+
+    async def _status_loop(self) -> None:
+        await asyncio.sleep(20)
+        while True:
+            try:
+                await self.dashboard_bridge.send("agent-status", self._status_payload())
+            except Exception as exc:
+                log.debug("status report failed: %s", exc)
+            await asyncio.sleep(STATUS_REPORT_SECONDS)
+
+    def _on_posture(self, posture) -> None:
+        """Posture thread -> build the compliance report and queue it."""
+        loop = getattr(self, "_loop", None)
+        if loop is None:
+            return
+        try:
+            report = build_compliance_report(posture, self.trigate_memory,
+                                             endpoint=self.dashboard_bridge._endpoint_id)
+        except Exception as exc:
+            log.debug("compliance report failed: %s", exc)
+            return
+        asyncio.run_coroutine_threadsafe(self.dashboard_bridge.send("compliance", report), loop)
+        log.info("Compliance report: score %s/100 (%d pass, %d fail, %d warn)", report["score"],
+                 report["counts"]["pass"], report["counts"]["fail"], report["counts"]["warn"])
 
     async def _cmd_set_importance(self, target: str, params: dict) -> dict:
         """Dashboard Endpoints page: set this PC's importance (saved on disk)."""
@@ -290,7 +384,10 @@ class Orchestrator:
 
         # ---- Start Layer 2 Detection & Intelligence engines ----
         self.ueba.start()
+        self.threat_feeds.start()
         self.threat_intel.start()
+        self.incident_correlator.start()
+        self.access_control.start()
         self.physical_security.start()
         self.insider_threat.start()
         self.meta_risk_arbiter.start()
@@ -306,6 +403,13 @@ class Orchestrator:
 
         # ---- Start MERN dashboard bridge ----
         self.dashboard_bridge.start()
+        self._loop = asyncio.get_running_loop()
+        self._status_task = asyncio.create_task(self._status_loop())
+        from gates.device_posture import get_posture_monitor
+        monitor = get_posture_monitor()
+        monitor.add_listener(self._on_posture)
+        if monitor.get() is not None:        # first check finished before we listened
+            self._on_posture(monitor.get())
         log.info("DashboardBridge started – using WebSocket endpoint ws://localhost:8000/ws/alerts")
 
         # ---- Start offline queue ----
@@ -357,6 +461,11 @@ class Orchestrator:
     async def shutdown(self) -> None:
         log.info("Shutting down AiBoO...")
 
+        # ---- Stop the agent-status reporter ----
+        task = getattr(self, "_status_task", None)
+        if task and not task.done():
+            task.cancel()
+
         # ---- Stop remote command channel ----
         if self.command_channel:
             await self.command_channel.stop()
@@ -391,6 +500,8 @@ class Orchestrator:
         # ---- Stop Layer 2 engines ----
         self.ueba.stop()
         self.threat_intel.stop()
+        self.threat_feeds.stop()
+        self.access_control.stop()
         self.physical_security.stop()
         self.insider_threat.stop()
         self.meta_risk_arbiter.stop()

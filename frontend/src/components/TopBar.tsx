@@ -6,6 +6,9 @@ import type { Notification, NavId, SearchResult } from "../types";
 
 const NAV: { id: NavId; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "⌘" },
+  { id: "executive", label: "Executive", icon: "📈" },
+  { id: "alerts", label: "Alerts", icon: "🚨" },
+  { id: "reports", label: "Reports", icon: "📄" },
   { id: "surveillance", label: "Surveillance", icon: "👁" },
   { id: "intelligence", label: "Intelligence", icon: "🧠" },
   { id: "agent", label: "Agent Console", icon: "🤖" },
@@ -22,6 +25,7 @@ export default function TopBar({
   userName,
   searchState,
   onSearchNav,
+  openAlerts = 0,
 }: {
   active: NavId;
   setActive: (n: NavId) => void;
@@ -36,6 +40,7 @@ export default function TopBar({
     results: SearchResult[];
   };
   onSearchNav: (nav: NavId) => void;
+  openAlerts?: number;
 }) {
   const [menu, setMenu] = useState(false);
   const [logoFallback, setLogoFallback] = useState(false);
@@ -93,13 +98,16 @@ export default function TopBar({
             key={n.id}
             onClick={() => setActive(n.id)}
             className={cn(
-              "px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all",
+              "relative px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all",
               active === n.id
                 ? "bg-cyan-500/12 text-cyan-200 ring-1 ring-cyan-500/35"
                 : "text-slate-400 hover:text-slate-200 hover:bg-slate-800/50"
             )}
           >
             {n.label}
+            {n.id === "alerts" && openAlerts > 0 && (
+              <span className="ml-1 rounded-full bg-red-500/80 px-1.5 text-[9px] font-bold text-white">{openAlerts > 99 ? "99+" : openAlerts}</span>
+            )}
           </button>
         ))}
       </nav>
@@ -245,6 +253,7 @@ export default function TopBar({
               )}
             >
               {n.label}
+              {n.id === "alerts" && openAlerts > 0 && <span className="ml-2 rounded-full bg-red-500/80 px-1.5 text-[10px] text-white">{openAlerts}</span>}
             </button>
           ))}
         </div>

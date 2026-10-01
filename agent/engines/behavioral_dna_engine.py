@@ -642,6 +642,11 @@ class BehavioralDNAEngine:
     
     async def _publish_anomaly(self, anomaly: BehavioralAnomaly, event: ThreatEvent) -> None:
         """Publish anomaly as a ThreatEvent"""
+        if not getattr(self, "publish_alerts", True):
+            # Off by default (config legacy_behaviour_alerts) - replaced by
+            # BehaviourAnalytics; the anomaly is still logged below.
+            log.info("Behavioral DNA anomaly (not published): %s", anomaly.description)
+            return
         # Create a ThreatEvent for the anomaly
         anomaly_event = ThreatEvent(
             source="BehavioralDNAEngine",

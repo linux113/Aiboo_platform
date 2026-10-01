@@ -400,6 +400,9 @@ class WindowsEventIngestor:
                     continue
                 threat_event = self._apply_brute_force(threat_event)
                 self._remember_context(threat_event)
+                behaviour_event = self._check_behaviour(threat_event)
+                if behaviour_event is not None:
+                    await self.bus.publish(behaviour_event)
                 if threat_event.severity.weight >= self.min_severity.weight:
                     self._baseline.update(threat_event.threat_type.value, threat_event.timestamp)
                     self._stats["published"] += 1
@@ -425,9 +428,33 @@ class WindowsEventIngestor:
             ts = threat_event.timestamp if isinstance(threat_event.timestamp, datetime) else None
             if ts is not None and ts.tzinfo is None:
                 ts = ts.astimezone()          # naive Windows time is local time
-            get_memory().record_logon(p.get("user_id"), p.get("src_ip"), p.get("logon_type"), ts)
+            get_memory().record_logon(p.get("user_id"), p.get("src_ip"), p.get("logon_type"), ts,
+                                      workstation=p.get("workstation"))
         except Exception as exc:              # memory must never break ingestion
             log.debug("TriGate context not recorded: %s", exc)
+
+    @staticmethod
+    def _check_behaviour(threat_event: ThreatEvent):
+        """Behaviour analytics: learn this user's logon habits from every
+        SUCCESSFUL logon (4624) and return a BEHAVIORAL_ANOMALY event when the
+        logon does not fit (new account in use, unusual hour, first RDP...)."""
+        p = threat_event.payload
+        if p.get("event_id_raw") != 4624:
+            return None
+        try:
+            from engines.behaviour_analytics import get_behaviour_analytics
+            engine = get_behaviour_analytics()
+            if engine is None:
+                return None
+            ts = threat_event.timestamp if isinstance(threat_event.timestamp, datetime) else None
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.astimezone()
+            return engine.observe_logon(p.get("user_id"), p.get("logon_type"), p.get("src_ip"),
+                                        workstation=p.get("workstation"), when=ts,
+                                        computer=p.get("computer_name"))
+        except Exception as exc:              # analytics must never break ingestion
+            log.debug("Behaviour analytics skipped: %s", exc)
+            return None
 
     def _apply_brute_force(self, threat_event: ThreatEvent) -> ThreatEvent:
         """Escalate repeated failed logons (same user or IP) to one HIGH alert."""

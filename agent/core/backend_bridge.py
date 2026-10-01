@@ -40,6 +40,13 @@ ACTION_LABELS = {
     "lock_zone": "Zone Locked",
     "force_logout": "Session Forced Logout",
     "quarantine_file": "File Quarantined",
+    "restrict_identity": "Account Restricted (temporary)",
+    "lift_restriction": "Account Restriction Lifted",
+    "throttle_segment": "Network Segment Throttled",
+    "remove_throttle": "Throttle Removed",
+    "revoke_session": "Sessions Logged Off",
+    "step_up_auth": "Screen Locked (re-authenticate)",
+    "challenge_mfa": "Screen Locked (re-authenticate)",
 }
 
 # Actions that put the endpoint into a contained state.
@@ -203,6 +210,14 @@ class DashboardBridge:
             except Exception as e:
                 log.warning("Heartbeat error: %s", e)
 
+    async def send(self, endpoint: str, payload: dict) -> None:
+        """Queue any JSON report (agent-status, compliance, ...) for
+        POST /api/agent/<endpoint>."""
+        payload = dict(payload or {})
+        payload["source"] = self._endpoint_id
+        payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        await self._queue.add_to_endpoint(endpoint, json.loads(json.dumps(payload, default=str)))
+
     # ---- Event handlers ----
 
     async def _on_finding(self, event: AgentFinding) -> None:
@@ -261,6 +276,16 @@ class DashboardBridge:
         if isinstance(payload.get("severity"), str):
             payload["severity"] = payload["severity"].lower()
         payload["description"] = payload.get("description") or payload.get("summary", "")
+        payload["source"] = self._endpoint_id
+        incident = getattr(event, "incident", None)
+        if isinstance(incident, dict):
+            payload["incident"] = incident
+        # the dashboard keys linked items by `id` (AgentFinding has event_id)
+        for f in payload.get("findings") or []:
+            if isinstance(f, dict):
+                f.setdefault("id", f.get("event_id", ""))
+                if isinstance(f.get("timestamp"), datetime):
+                    f["timestamp"] = f["timestamp"].isoformat()
         await self._queue.add_to_endpoint("correlated", payload)
 
     async def _on_gate_decision(self, event: GateDecision) -> None:

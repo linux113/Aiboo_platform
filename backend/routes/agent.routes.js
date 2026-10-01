@@ -3,6 +3,10 @@ import { getIO } from '../config/socket.js';
 import { protect, authorize } from '../middleware/auth.js';
 import logger from '../utils/logger.js';
 import { IMPORTANCE_LEVELS } from '../sockets/agentChannel.js';
+import {
+  ingest as ingestAlert, fromFinding, fromGateDecision, fromCorrelated,
+  saveCompliance, latestCompliance, setAlertEmitter,
+} from '../services/alertStore.js';
 
 const router = express.Router();
 
@@ -19,7 +23,12 @@ const store = {
   endpoints: {},     // keyed by source, stores last heartbeat
   actions: [],       // NEW: response actions for the "Isolation & Termination" tab
   importance: {},    // TriGate: endpoint -> low|normal|high|critical (last known)
+  agentStatus: {},   // endpoint -> latest agent-status report (threat intel, behaviour, ...)
+  compliance: {},    // endpoint -> latest compliance report
 };
+
+// Read-only view used by analytics / reports
+export const getAgentStore = () => store;
 
 const MAX = 200;
 const ACTIONS_MAX = 500; // Response actions accumulate faster than findings
@@ -40,6 +49,8 @@ const emit = (ev, data) => {
     logger.error(`Socket emit error (${ev}): ${err.message}`);
   }
 };
+// Alert management pushes alert:new / alert:updated to every dashboard
+setAlertEmitter(emit);
 
 // ---- Helpers ----
 const getSource = (req) => {
@@ -64,6 +75,13 @@ const ACTION_LABELS = {
   lock_zone: 'Zone Locked',
   force_logout: 'Session Forced Logout',
   quarantine_file: 'File Quarantined',
+  restrict_identity: 'Account Restricted (temporary)',
+  lift_restriction: 'Account Restriction Lifted',
+  throttle_segment: 'Network Segment Throttled',
+  remove_throttle: 'Throttle Removed',
+  revoke_session: 'Sessions Logged Off',
+  step_up_auth: 'Screen Locked (re-authenticate)',
+  challenge_mfa: 'Screen Locked (re-authenticate)',
 };
 
 const CONTAINMENT_ACTIONS = new Set([
@@ -184,6 +202,7 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
     push(store.findings, finding);
     emit('agent:finding', finding);
     logger.info(`Agent finding from ${source}: ${threat_type} (${severity})`);
+    ingestAlert(fromFinding(finding)); // high/critical -> Alert Management
 
     res.status(201).json(finding);
   } catch (error) {
@@ -529,12 +548,18 @@ router.post('/finding', validateAgentOrJWT, (req, res) => {
   updateEndpointHeartbeat(finding.source);
   push(store.findings, finding);
   emit('agent:finding', finding);
+  if (finding.id) ingestAlert(fromFinding(finding));
   res.json({ ok: true });
 });
 
 router.post('/correlated', validateAgentOrJWT, (req, res) => {
-  push(store.correlated, req.body);
-  emit('agent:correlated', req.body);
+  const incident = { ...req.body, source: req.body?.source || getSource(req) };
+  // the same incident is re-sent when it grows: keep one row, newest first
+  const idx = store.correlated.findIndex((c) => c.alert_id && c.alert_id === incident.alert_id);
+  if (idx !== -1) store.correlated.splice(idx, 1);
+  push(store.correlated, incident);
+  emit('agent:correlated', incident);
+  if (incident.alert_id) ingestAlert(fromCorrelated(incident));
   if (['critical', 'high'].includes(req.body.severity))
     emit('alert:critical', { ...req.body, message: req.body.description });
   res.json({ ok: true });
@@ -547,7 +572,88 @@ router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
   if (IMPORTANCE_LEVELS.has(String(imp || ''))) store.importance[decision.source] = String(imp);
   push(store.gateDecisions, decision);
   emit('agent:gate', decision);
+  if (decision.event_id) ingestAlert(fromGateDecision(decision)); // HOLD/BLOCK only
   res.json({ ok: true });
+});
+
+// ---- Playbooks that talk to outside systems ----
+// Freeze Badge: AiBoO cannot reach a door / badge controller itself. If the
+// company's access-control system (or an automation tool such as n8n / Zapier /
+// Power Automate in front of it) gives a webhook URL, put it in backend/.env:
+//   BADGE_WEBHOOK_URL=https://...      BADGE_WEBHOOK_TOKEN=optional-secret
+// and this playbook POSTs {action:'freeze_badge', badge_id, user, reason, ...}.
+router.get('/playbooks/status', protect, (req, res) => {
+  res.json({ badge: { configured: Boolean(process.env.BADGE_WEBHOOK_URL) } });
+});
+
+router.post('/playbooks/freeze-badge', protect, authorize('admin', 'analyst'), async (req, res) => {
+  const url = process.env.BADGE_WEBHOOK_URL;
+  const badgeId = String(req.body?.badge_id || '').trim().slice(0, 120);
+  const reason = String(req.body?.reason || '').trim().slice(0, 300);
+  if (!badgeId) return res.status(400).json({ ok: false, error: 'badge_id (badge number or employee ID) is required' });
+  if (!url) {
+    return res.status(501).json({
+      ok: false,
+      error: 'No badge system connected. Add BADGE_WEBHOOK_URL (and optional BADGE_WEBHOOK_TOKEN) to backend/.env and restart the backend.',
+    });
+  }
+  const by = req.user?.email || req.user?.name || 'analyst';
+  const body = { action: 'freeze_badge', badge_id: badgeId, reason, requested_by: by, requested_at: new Date().toISOString() };
+  const record = {
+    id: `badge_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    action: 'freeze_badge', action_label: 'Badge Frozen', target: badgeId, source: 'badge-system',
+    agent: 'Playbook', reason: reason || 'Freeze Badge playbook', timestamp: body.requested_at,
+  };
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (process.env.BADGE_WEBHOOK_TOKEN) headers.Authorization = `Bearer ${process.env.BADGE_WEBHOOK_TOKEN}`;
+    const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) });
+    const text = (await resp.text()).slice(0, 300);
+    const ok = resp.ok;
+    pushAction({ ...record, status: ok ? 'success' : 'failed', error: ok ? '' : `Badge system answered HTTP ${resp.status}` });
+    emit('agent:action', store.actions[0]);
+    logger.info(`Freeze badge ${badgeId} by ${by}: HTTP ${resp.status}`);
+    if (!ok) return res.status(502).json({ ok: false, error: `Badge system answered HTTP ${resp.status}`, detail: text });
+    return res.json({ ok: true, message: `Badge ${badgeId} freeze request accepted by the badge system`, detail: text });
+  } catch (err) {
+    pushAction({ ...record, status: 'failed', error: err.message });
+    emit('agent:action', store.actions[0]);
+    logger.warn(`Freeze badge ${badgeId} failed: ${err.message}`);
+    return res.status(502).json({ ok: false, error: `Could not reach the badge system: ${err.name === 'TimeoutError' ? 'no answer in 8 seconds' : err.message}` });
+  }
+});
+
+// POST /api/agent/compliance - agent sends its ISO 27001 / NIST CSF check
+router.post('/compliance', validateAgentOrJWT, async (req, res) => {
+  const source = getSource(req);
+  updateEndpointHeartbeat(source);
+  const body = req.body || {};
+  if (!Array.isArray(body.checks)) return res.status(400).json({ ok: false, error: 'checks[] is required' });
+  const report = { ...body, endpoint: source, received_at: new Date().toISOString() };
+  store.compliance[source] = report;
+  await saveCompliance(source, body);
+  emit('agent:compliance', { endpoint: source, score: body.score, counts: body.counts, checked_at: body.checked_at });
+  res.json({ ok: true });
+});
+
+// POST /api/agent/agent-status - agent reports which engines are running
+router.post('/agent-status', validateAgentOrJWT, (req, res) => {
+  const source = getSource(req);
+  updateEndpointHeartbeat(source);
+  store.agentStatus[source] = { ...(req.body || {}), endpoint: source, received_at: new Date().toISOString() };
+  emit('agent:status', store.agentStatus[source]);
+  res.json({ ok: true });
+});
+
+router.get('/agent-status', protect, (req, res) => res.json(Object.values(store.agentStatus)));
+
+router.get('/compliance', protect, async (req, res) => {
+  // memory copy has the full detail for live agents; DB keeps history
+  let rows = Object.values(store.compliance);
+  if (!rows.length) {
+    try { rows = await latestCompliance(); } catch { rows = []; }
+  }
+  res.json(rows);
 });
 
 // POST /api/agent/gate-decisions/:eventId/feedback  { feedback: false_alarm|confirmed }

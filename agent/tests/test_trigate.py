@@ -299,7 +299,8 @@ class TestPipeline:
         assert t["trust"]["score"] < 40 and t["intent"]["score"] >= 70
         assert t["risk"]["level"] in ("high", "critical")
         assert finals[0].severity in (Severity.HIGH, Severity.CRITICAL)
-        assert ResponseAction.REVOKE_IDENTITY in finals[0].actions
+        # password guessing -> TEMPORARY restriction (auto re-enabled), not a permanent lock
+        assert ResponseAction.RESTRICT_IDENTITY in finals[0].actions
         assert finals[0].metadata["payload"]["user_id"] == "aibootest"
 
     @pytest.mark.asyncio

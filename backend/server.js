@@ -26,6 +26,9 @@ import aiRoutes from './routes/ai.routes.js';
 import dashboardRoutes from './routes/dashboard.routes.js';
 import agentRoutes from './routes/agent.routes.js';
 import { seedDemoAgentData } from './routes/agent.routes.js';
+import alertRoutes from './routes/alert.routes.js';
+import analyticsRoutes from './routes/analytics.routes.js';
+import reportRoutes from './routes/report.routes.js';
 
 // ❌ Outbound WebSocket import removed – agents push via HTTP.
 // ✅ Inbound agent command channel added – dashboard → agent dispatch.
@@ -81,6 +84,9 @@ app.use('/api/identities', apiLimiter, identityRoutes);
 app.use('/api/respond', apiLimiter, responseRoutes);
 app.use('/api/ai', apiLimiter, aiRoutes);
 app.use('/api/dashboard', apiLimiter, dashboardRoutes);
+app.use('/api/alerts', apiLimiter, alertRoutes);          // Alert management (ack / assign / close)
+app.use('/api/analytics', apiLimiter, analyticsRoutes);  // Executive dashboard, charts, trends
+app.use('/api/reports', apiLimiter, reportRoutes);       // Risk / compliance / executive (PDF, CSV)
 
 // ✅ Agent routes now use agentLimiter (more permissive)
 app.use('/api/agent', agentLimiter, agentRoutes);

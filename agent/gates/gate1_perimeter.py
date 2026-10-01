@@ -9,7 +9,10 @@ Every ThreatEvent goes through Gate 1. It produces a Trust score 0-100
   * internet IP vs LAN IP                                 -> internet = down
   * user / IP seen before in successful logons (memory)  -> known = up, new = down
   * user name that does not exist, account lockout       -> down
-  * logon attempt from another computer (workstation)    -> down
+  * DEVICE TRUST:
+      - health of this PC (antivirus, firewall, updates,
+        disk encryption, UAC - gates/device_posture.py)  -> healthy = up, weak = down
+      - other computer seen before in successful logons  -> known = up, new = down
   * account created only hours ago, gave rights to self  -> down
   * analyst said "False alarm" for this before           -> up
 
@@ -26,6 +29,7 @@ from typing import Any
 
 from core.event_bus import EventBus
 from core.events import GateDecision, GateLevel, GateVerdict, Severity, ThreatEvent
+from gates.device_posture import get_posture_monitor, posture_factors
 from gates.trigate_memory import get_memory
 from gates.trigate_patterns import (
     clean, classify, ip_kind, local_account, local_time, logon_kind,
@@ -79,6 +83,8 @@ def build_context(event: ThreatEvent) -> dict:
     else:
         entity = actor                                   # admin change: who did it
     pc_full = {clean(p.get("computer_name")).lower(), clean(p.get("device_id")).lower()} - {""}
+    comp = clean(p.get("computer_name")).split(".")[0].lower()
+    on_this_pc = (not comp) or comp in this_pc_names()   # remote-log-sender events = other PCs
     if entity and (entity.lower() in pcs or entity.lower() in pc_full):
         entity = ""        # the ingestor fell back to the PC name: no real user known
     subject = target or user or entity                   # who / what it was done to
@@ -118,12 +124,21 @@ def build_context(event: ThreatEvent) -> dict:
         "failed_attempts": attempts,
         "workstation": clean(p.get("workstation")),
         "computer": clean(p.get("computer_name")),
+        "on_this_pc": on_this_pc,
         "group": clean(p.get("group")),
         "privileged_group": bool(p.get("privileged_group")),
         "service_name": clean(p.get("service_name")),
         "task_name": clean(p.get("task_name")),
         "command": command[:300],
         "anomaly_score": anomaly,
+        # Behaviour analytics: [{"points": n, "text": "..."}] explained on the card
+        "behaviour_reasons": [
+            {"points": int(r.get("points") or 0), "text": str(r.get("text") or "")[:200]}
+            for r in (p.get("behaviour_reasons") or []) if isinstance(r, dict)
+        ][:5],
+        "threat_feed": clean(p.get("threat_feed")),
+        "pid": p.get("pid"),
+        "process_name": clean(p.get("process_name")),
         "test_event": bool(p.get("test_event")),
         "test_intent": test_event_intent(event),
         "local_time": when.strftime("%Y-%m-%d %H:%M"),
@@ -173,9 +188,9 @@ def score_trust(ctx: dict, memory=None) -> tuple[int, list[dict]]:
         f.append(_factor(-20, f"Came from an internet address ({ip})"))
     elif kind == "private":
         f.append(_factor(-5, f"Came from another PC on the network ({ip})"))
-    ws, me = ctx["workstation"].lower(), ctx["computer"].lower().split(".")[0]
-    if ws and me and ws != me and kind not in ("public", "private"):
-        f.append(_factor(-10, f"Logon attempt came from another computer '{ctx['workstation']}'"))
+
+    # --- device trust ---------------------------------------------------
+    f.extend(device_factors(ctx, mem))
 
     # --- memory: is this user / IP known? ------------------------------
     if entity:
@@ -206,6 +221,25 @@ def score_trust(ctx: dict, memory=None) -> tuple[int, list[dict]]:
 
     score = _clamp(TRUST_START + sum(x["points"] for x in f))
     return score, f
+
+
+def device_factors(ctx: dict, memory=None, monitor=None) -> list[dict]:
+    """Device trust: (1) the other computer a logon came from, (2) this PC's health."""
+    mem = memory or get_memory()
+    out: list[dict] = []
+    ws = ctx.get("workstation") or ""
+    me = (ctx.get("computer") or "").lower().split(".")[0]
+    ws_short = ws.lower().lstrip("\\").split(".")[0]
+    if ws_short and ws_short not in ("-", "localhost") and ws_short != me \
+            and ws_short not in this_pc_names():
+        if mem.device_known(ws):
+            out.append(_factor(+5, f"Device '{ws}' has logged in here successfully before"))
+        else:
+            out.append(_factor(-10, f"Device '{ws}' has never logged in here before (unknown computer)"))
+    if ctx.get("on_this_pc", True):
+        posture = (monitor or get_posture_monitor()).get()
+        out.extend(_factor(pts, txt) for pts, txt in posture_factors(posture))
+    return out
 
 
 def _ago(hours: float) -> str:

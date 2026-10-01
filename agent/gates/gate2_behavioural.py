@@ -63,6 +63,12 @@ async def score_intent(ctx: dict, memory=None, intel=None, settings=None) -> tup
         mitre = f" - MITRE {pat.mitre_id} {pat.mitre_name}" if pat.mitre_id else ""
         f.append(_factor(pat.base_intent, f"{pat.label}{mitre}"))
 
+    # Behaviour analytics: each reason it found (new account in use, unusual hour,
+    # first remote logon, ...) is shown with its own points.
+    for r in (ctx.get("behaviour_reasons") or [])[:5]:
+        if r.get("text"):
+            f.append(_factor(max(-20, min(25, int(r.get("points") or 0))), r["text"]))
+
     if ctx["pattern"] == "brute_force" and ctx["failed_attempts"] >= 20:
         f.append(_factor(+10, f"Very many attempts ({ctx['failed_attempts']})"))
 

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react";
 import { io, Socket } from "socket.io-client";
 import { cn } from "./utils/cn";
 import api, { authH, setToken as storeToken, getToken, clearToken, API, SOCKET_URL, waitForCommand, apiErrorMessage } from "./utils/api";
@@ -12,6 +12,10 @@ import AgentConsole from "./components/AgentConsole";
 import SettingsModule from "./components/SettingsModule";
 import AIPanel from "./components/AIPanel";
 import EndpointsList from "./components/EndpointsList";
+// charts library is big: load the Executive screen only when it is opened
+const ExecutiveModule = lazy(() => import("./components/ExecutiveModule"));
+import AlertsModule from "./components/AlertsModule";
+import ReportsModule from "./components/ReportsModule";
 import type { Camera, Detection, Threat, AgentFinding, CorrelatedAlert, GateDecision, PseudoLock, Notification, NavId, SearchResult, ActionRecord } from "./types";
 
 // ---- Endpoint type (with active flag) ----
@@ -26,6 +30,9 @@ const MAX_ACTIONS_IN_MEMORY = 2000;
 
 const NAV: { id: NavId; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "⌘" },
+  { id: "executive", label: "Executive", icon: "📈" },
+  { id: "alerts", label: "Alerts", icon: "🚨" },
+  { id: "reports", label: "Reports", icon: "📄" },
   { id: "surveillance", label: "Surveillance", icon: "👁" },
   { id: "intelligence", label: "Intelligence", icon: "🧠" },
   { id: "agent", label: "Agent Console", icon: "🤖" },
@@ -110,6 +117,18 @@ export default function App() {
   // ---- NEW: response actions for the "Isolation & Termination" tab ----
   const [actions, setActions] = useState<ActionRecord[]>([]);
   const [actionsLoading, setActionsLoading] = useState(false);
+  // bumps on every alert:new / alert:updated so Alerts / Executive reload
+  const [alertTick, setAlertTick] = useState(0);
+  const [openAlertCount, setOpenAlertCount] = useState(0);
+  // a burst of alerts (e.g. 30 wrong passwords) causes ONE reload, not 30
+  const alertTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bumpAlerts = useCallback(() => {
+    if (alertTimerRef.current) return;
+    alertTimerRef.current = setTimeout(() => {
+      alertTimerRef.current = null;
+      setAlertTick(t => t + 1);
+    }, 3000);
+  }, []);
 
   const addNotif = (type: "critical" | "warning" | "info", title: string, body: string) => {
     const n: Notification = { id: Date.now().toString(), type, title, body, timestamp: new Date().toISOString(), read: false };
@@ -325,10 +344,21 @@ export default function App() {
     });
 
     socket.on("agent:correlated", (a: CorrelatedAlert) => {
-      setCorrelated(p => [a, ...p.slice(0, 99)]);
-      addNotif("critical", "Correlated Attack Detected", a.description.replace("[CORRELATED] ", "").substring(0, 80));
+      // a growing incident is re-sent with the same alert_id: replace, don't duplicate
+      setCorrelated(p => [a, ...p.filter(x => x.alert_id !== a.alert_id).slice(0, 99)]);
+      addNotif(a.severity === "critical" ? "critical" : "warning", "Attack chain detected", (a.description || "").replace("[CORRELATED] ", "").substring(0, 80));
     });
     socket.on("agent:gate", (g: GateDecision) => setGateDecisions(p => [g, ...p.slice(0, 199)]));
+    // ---- Alert management (backend/services/alertStore.js) ----
+    socket.on("alert:new", (a: { title?: string; severity?: string; source?: string }) => {
+      bumpAlerts();
+      setOpenAlertCount(c => c + 1);
+      if (a.severity === "critical" || a.severity === "high") {
+        addNotif(a.severity === "critical" ? "critical" : "warning", `New ${a.severity} alert`, `${a.title || "Alert"}${a.source ? ` · ${a.source}` : ""}`);
+      }
+    });
+    socket.on("alert:updated", bumpAlerts);
+    socket.on("agent:compliance", bumpAlerts);
     socket.on("agent:pseudo-lock", (l: PseudoLock) => {
       const isNew = !seenLocksRef.current.has(l.lock_id);
       seenLocksRef.current.add(l.lock_id);
@@ -393,6 +423,19 @@ export default function App() {
     const iv = setInterval(refresh, 30000);
     return () => clearInterval(iv);
   }, [token]);
+
+  // ---- Alerts that still need action (badge on the Alerts tab) ----
+  useEffect(() => {
+    if (!token) return;
+    let stop = false;
+    const t = setTimeout(async () => {
+      try {
+        const r = await api.get(`${API}/alerts`, { params: { status: "open,acknowledged", limit: 1, days: 365 } });
+        if (!stop) setOpenAlertCount(Number(r.data?.total) || 0);
+      } catch { /* backend without alert routes - keep 0 */ }
+    }, 800);
+    return () => { stop = true; clearTimeout(t); };
+  }, [token, alertTick]);
 
   // ---- NEW: fallback poll for actions every 5s when socket is offline ----
   useEffect(() => {
@@ -464,6 +507,8 @@ export default function App() {
   };
 
   const activeLocks = pseudoLocks.filter(l => l.active).length;
+  // viewers can look but not change alerts (backend enforces the same rule)
+  const canEdit = ["admin", "analyst"].includes(String(userRole || "").toLowerCase());
   const unreadNotifs = notifications.filter(n => !n.read).length;
   const searchState = useSearch(threats, detections, cameras, findings);
 
@@ -497,6 +542,7 @@ export default function App() {
         userName={userName}
         searchState={searchState}
         onSearchNav={(nav) => setActive(nav)}
+        openAlerts={openAlertCount}
       />
       <main className="relative flex-1 overflow-hidden bg-gradient-to-br from-[#020617] via-slate-950 to-slate-950/90" style={{ height: "calc(100vh - 56px)" }}>
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.08),transparent_60%),radial-gradient(circle_at_bottom,_rgba(15,118,110,0.15),transparent_60%)] opacity-80" />
@@ -515,7 +561,7 @@ export default function App() {
           <div className="flex items-center justify-between px-5 pt-3 pb-2 text-[11px] flex-shrink-0">
             <div className="flex items-center gap-2">
               <span className="rounded-full border border-slate-700/80 bg-slate-900/80 px-2.5 py-0.5 text-[10px] uppercase tracking-[0.16em] text-slate-400">
-                {active === "dashboard" ? "Command & Control" : active === "surveillance" ? "Surveillance Intelligence" : active === "intelligence" ? "Intelligence & Identity" : active === "agent" ? "Agent Console · Tri-Gate" : active === "endpoints" ? "Endpoints · Distributed Agents" : "Platform Settings"}
+                {active === "dashboard" ? "Command & Control" : active === "executive" ? "Executive Dashboard · Trends" : active === "alerts" ? "Alert Management" : active === "reports" ? "Reports · Compliance" : active === "surveillance" ? "Surveillance Intelligence" : active === "intelligence" ? "Intelligence & Identity" : active === "agent" ? "Agent Console · Tri-Gate" : active === "endpoints" ? "Endpoints · Distributed Agents" : "Platform Settings"}
               </span>
               <span className="hidden text-[10px] text-slate-500 md:inline">Live · Tri-Gate · YOLOv8 · JARVIS</span>
             </div>
@@ -542,7 +588,14 @@ export default function App() {
               </div>
             ) : (
               <>
-                {active === "dashboard" && <DashboardModule threats={threats} detections={detections} cameras={cameras} findings={findings} correlated={correlated} activeLocks={activeLocks} sources={sources} onNotify={addNotif} />}
+                {active === "dashboard" && <DashboardModule threats={threats} detections={detections} cameras={cameras} findings={findings} correlated={correlated} gateDecisions={gateDecisions} activeLocks={activeLocks} sources={sources} onNotify={addNotif} />}
+                {active === "executive" && (
+                  <Suspense fallback={<div className="py-10 text-center text-sm text-slate-500">Loading charts…</div>}>
+                    <ExecutiveModule refreshTick={alertTick} onNavigate={setActive} onNotify={addNotif} />
+                  </Suspense>
+                )}
+                {active === "alerts" && <AlertsModule canEdit={canEdit} userName={userName} refreshTick={alertTick} onNotify={addNotif} />}
+                {active === "reports" && <ReportsModule refreshTick={alertTick} onNotify={addNotif} />}
                 {active === "surveillance" && <SurveillanceModule cameras={cameras} detections={detections} onCamsChange={setCameras} />}
                 {active === "intelligence" && <IntelligenceModule detections={detections} cameras={cameras} findings={findings} />}
                 {active === "agent" && (

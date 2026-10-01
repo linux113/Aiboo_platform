@@ -7,10 +7,14 @@ What it remembers (saved as JSON next to config.ini, file trigate_memory.json):
                   (who, which attack pattern, risk) -> "history" in Gate 2
 * logons        - for each user: IPs and logon types seen in SUCCESSFUL
                   logons (Windows event 4624)          -> "known PC/IP" in Gate 1
+* devices       - other computers (workstation names) seen in SUCCESSFUL
+                  logons                                -> device trust in Gate 1
 * feedback      - "False alarm" / "Confirmed threat" clicks from the dashboard
                   per (pattern, user)                  -> learning in Gate 2
 * decisions     - short map event_id -> (pattern, user) so a dashboard click
                   on a decision can find what it is about
+* behaviour     - per-user logon habits learned from SUCCESSFUL logons
+                  (hours, logon kinds, IPs, active days)  -> Behaviour analytics
 * importance    - this PC's importance (low/normal/high/critical) when set from
                   the dashboard Endpoints page          -> Gate 3
 
@@ -35,6 +39,7 @@ MAX_EVENTS = 5000
 MAX_DECISIONS = 1000
 MAX_USERS = 2000
 MAX_IPS_PER_USER = 50
+MAX_DEVICES = 500
 SAVE_EVERY_SECONDS = 60
 
 IMPORTANCE_LEVELS = ("low", "normal", "high", "critical")
@@ -66,6 +71,12 @@ def _norm_user(user: Any) -> str:
     return "" if u in ("", "-", "unknown", "none") else u
 
 
+def _norm_device(name: Any) -> str:
+    d = str(name or "").strip().lower().lstrip("\\")
+    d = d.split(".")[0]                 # PC.corp.local -> pc
+    return "" if d in ("", "-", "unknown", "none", "localhost", "127.0.0.1", "::1") else d
+
+
 def feedback_key(pattern: str, entity: str) -> str:
     return f"{pattern}|{_norm_user(entity) or '*'}"
 
@@ -92,7 +103,7 @@ class TriGateMemory:
     @staticmethod
     def _empty() -> dict:
         return {"version": 1, "importance": None, "events": [], "logons": {},
-                "feedback": {}, "decisions": {}}
+                "devices": {}, "feedback": {}, "decisions": {}, "behaviour": {}}
 
     def _load(self) -> None:
         if not self.path or not os.path.exists(self.path):
@@ -102,7 +113,7 @@ class TriGateMemory:
                 raw = json.load(fh)
             if isinstance(raw, dict):
                 data = self._empty()
-                for k in ("events", "logons", "feedback", "decisions"):
+                for k in ("events", "logons", "devices", "feedback", "decisions", "behaviour"):
                     if isinstance(raw.get(k), type(data[k])):
                         data[k] = raw[k]
                 data["importance"] = normalize_importance(raw.get("importance"))
@@ -154,6 +165,14 @@ class TriGateMemory:
         if len(dec) > MAX_DECISIONS:
             for k in list(dec)[: len(dec) - MAX_DECISIONS]:
                 dec.pop(k, None)
+        devs = self.data["devices"]
+        if len(devs) > MAX_DEVICES:
+            for d in sorted(devs, key=lambda k: devs[k].get("last_seen", ""))[: len(devs) - MAX_DEVICES]:
+                devs.pop(d, None)
+        beh = self.data.setdefault("behaviour", {})
+        if len(beh) > MAX_USERS:
+            for u in sorted(beh, key=lambda k: beh[k].get("last", ""))[: len(beh) - MAX_USERS]:
+                beh.pop(u, None)
         users = self.data["logons"]
         if len(users) > MAX_USERS:
             oldest = sorted(users, key=lambda u: users[u].get("last_seen", ""))
@@ -162,13 +181,19 @@ class TriGateMemory:
 
     # ------------------------------------------------------- logon context
     def record_logon(self, user: Any, src_ip: Any = None, logon_type: Any = None,
-                     when: Optional[datetime] = None) -> None:
-        """Remember a SUCCESSFUL logon (event 4624): user + IP + logon type."""
+                     when: Optional[datetime] = None, workstation: Any = None) -> None:
+        """Remember a SUCCESSFUL logon (event 4624): user + IP + logon type + device."""
         u = _norm_user(user)
         if not u or u.endswith("$"):          # skip computer accounts (PC$)
             return
         ts = _iso(when or _now())
         with self._lock:
+            dev = _norm_device(workstation)
+            if dev:
+                d = self.data["devices"].setdefault(dev, {"first_seen": ts, "users": []})
+                d["last_seen"] = ts
+                if u not in d["users"]:
+                    d["users"] = (d["users"] + [u])[-20:]
             entry = self.data["logons"].setdefault(u, {"first_seen": ts, "ips": {}, "logon_types": {}})
             entry["last_seen"] = ts
             ip = str(src_ip or "").strip()
@@ -184,6 +209,10 @@ class TriGateMemory:
 
     def user_known(self, user: Any) -> bool:
         return _norm_user(user) in self.data["logons"]
+
+    def device_known(self, workstation: Any) -> bool:
+        """Has this computer been used for a SUCCESSFUL logon here before?"""
+        return _norm_device(workstation) in self.data["devices"]
 
     def ip_known_for_user(self, user: Any, ip: Any) -> bool:
         entry = self.data["logons"].get(_norm_user(user))
@@ -285,7 +314,8 @@ class TriGateMemory:
 
     def stats(self) -> dict:
         return {"events": len(self.data["events"]), "users": len(self.data["logons"]),
-                "feedback": len(self.data["feedback"]), "path": self.path}
+                "devices": len(self.data["devices"]), "feedback": len(self.data["feedback"]),
+                "path": self.path}
 
 
 _memory: Optional[TriGateMemory] = None

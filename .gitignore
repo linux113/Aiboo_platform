@@ -19,3 +19,7 @@ env/
 trigate_memory.json
 trigate_memory.json.tmp
 trigate_memory.json.bad
+# Task 29 runtime files (downloaded feeds, temporary account restrictions)
+threat_feeds/
+access_control_state.json
+access_control_state.json.tmp

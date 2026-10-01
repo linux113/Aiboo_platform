@@ -112,11 +112,30 @@ def recommend(ctx: dict, level: str) -> list[dict]:
             recs.append({"action": "block_access", "target": ip,
                          "text": f"Block IP {ip} in Windows Firewall"})
         if subject and exists and pat != "network_intrusion":
-            recs.append({"action": "revoke_identity", "target": subject,
-                         "text": f"Lock account '{subject}' until the owner confirms (not your own account!)"})
+            recs.append({"action": "restrict_identity", "target": subject,
+                         "text": f"Disable account '{subject}' for 30 min and log off its sessions "
+                                 f"(re-enabled automatically; never your own account)"})
     if pat in ("admin_group_add", "account_created") and subject:
         recs.append({"action": "revoke_identity", "target": subject,
                      "text": f"Disable account '{subject}' until someone confirms it is legitimate"})
+    if pat in ("behavioral_anomaly", "anomalous_behavior") and subject:
+        recs.append({"action": "force_logout", "target": subject,
+                     "text": f"Log off '{subject}' now (ask them to confirm it was really them)"})
+        if level in ("high", "critical"):
+            recs.append({"action": "restrict_identity", "target": subject,
+                         "text": f"Disable '{subject}' for 30 min (re-enabled automatically)"})
+    if pat == "threat_intel_alert":
+        if ip and ctx["ip_kind"] == "public":
+            recs.append({"action": "block_access", "target": ip,
+                         "text": f"Block IP {ip} in Windows Firewall"})
+        pid = str(ctx.get("pid") or "").strip()
+        if pid.isdigit():
+            name = ctx.get("process_name") or "the program"
+            recs.append({"action": "terminate_process", "target": pid,
+                         "text": f"Stop {name} (PID {pid}) - it talked to a known-bad IP"})
+        if ip and ctx["ip_kind"] == "public":
+            recs.append({"action": "throttle_segment", "target": ip,
+                         "text": f"Or only slow down traffic to {ip} (256 kbit/s for 30 min)"})
     if pat in ("log_cleared", "audit_policy_changed"):
         recs.append({"action": "manual", "target": ctx["entity"],
                      "text": f"Ask '{ctx['entity'] or 'the user'}' why logs / audit settings were changed"})
@@ -134,7 +153,10 @@ def recommend(ctx: dict, level: str) -> list[dict]:
     return recs
 
 
+# Actions that may run AUTOMATICALLY on BLOCK (only when auto_response = true).
+# Log off / kill process / throttle stay one-click (a person decides).
 _EXECUTABLE = {"block_access": ResponseAction.BLOCK_ACCESS, "revoke_identity": ResponseAction.REVOKE_IDENTITY,
+               "restrict_identity": ResponseAction.RESTRICT_IDENTITY,
                "isolate_asset": ResponseAction.ISOLATE_ASSET, "notify_security": ResponseAction.NOTIFY_SECURITY}
 
 

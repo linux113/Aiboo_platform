@@ -177,7 +177,8 @@ def extract_fields(event_id: int, strings: list) -> dict:
         user = _get(s, 5)
         ip = _clean_ip(_get(s, 18, ""))
         logon_type = LOGON_TYPES.get(_get(s, 8, ""), f"type {_get(s, 8, '?')}")
-        f.update(user_id=user, domain=_get(s, 6, ""), src_ip=ip, logon_type=logon_type)
+        f.update(user_id=user, domain=_get(s, 6, ""), src_ip=ip, logon_type=logon_type,
+                 workstation=_get(s, 11, ""))
         where = f" from {ip}" if ip != "unknown" else ""
         f["description"] = f"Successful logon for '{user}' ({logon_type}){where}"
 

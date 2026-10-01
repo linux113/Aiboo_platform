@@ -5,7 +5,11 @@ import { sevCls, verdictCls } from "../utils/helpers";
 import type { GateDecision, TriGateFactor, TriGateScore } from "../types";
 
 // Remote actions that can be run with one click from a recommendation
-const RUNNABLE = new Set(["block_access", "revoke_identity", "isolate_asset"]);
+const RUNNABLE = new Set([
+  "block_access", "revoke_identity", "isolate_asset",
+  // dynamic access control (agent/response/access_control.py)
+  "restrict_identity", "force_logout", "terminate_process", "throttle_segment",
+]);
 
 const GATES: {
   key: "trust" | "intent" | "impact";

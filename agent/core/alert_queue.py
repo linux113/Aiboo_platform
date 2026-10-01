@@ -18,7 +18,7 @@ log = logging.getLogger("AlertQueue")
 
 # Endpoints that should be delivered right away instead of waiting for the
 # next 30s retry cycle (dashboard users are watching these in real time).
-URGENT_ENDPOINTS = {"actions", "pseudo-lock", "pseudo-lock-restore", "gate-decision"}
+URGENT_ENDPOINTS = {"actions", "pseudo-lock", "pseudo-lock-restore", "gate-decision", "correlated", "compliance", "agent-status"}
 
 # Path to the SQLite database file (saved in the agent's root directory)
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alerts_queue.db")

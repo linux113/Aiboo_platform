@@ -7,7 +7,10 @@ Two sources, both optional:
    One IP or CIDR range per line (# for comments). Re-read when it changes.
    Works offline - good for testing and for a company's own bad-IP list.
 
-2. AbuseIPDB (free API, 1000 checks/day) - only if config.ini has
+2. Real public feeds (gates/threat_feeds.py): abuse.ch Feodo Tracker,
+   Spamhaus DROP, Emerging Threats - downloaded daily, cached on disk.
+
+3. AbuseIPDB (free API, 1000 checks/day) - only if config.ini has
        abuseipdb_key = <your key>
    Only PUBLIC IPs are sent; answers are cached for 6 hours; 3-second timeout
    so a slow internet never blocks the gates.
@@ -35,15 +38,16 @@ TIMEOUT_SECONDS = 3.0
 @dataclass
 class IntelResult:
     malicious: bool
-    source: str = ""          # "blocklist" / "abuseipdb"
+    source: str = ""          # "blocklist" / "feed:<key>" / "abuseipdb"
     score: int = 0            # 0-100 (blocklist hit = 100)
     detail: str = ""
 
 
 class ThreatIntelLookup:
     def __init__(self, blocklist_path: Optional[str] = DEFAULT_BLOCKLIST,
-                 abuseipdb_key: str = ""):
+                 abuseipdb_key: str = "", feeds=None):
         self.blocklist_path = blocklist_path
+        self.feeds = feeds                     # FeedManager or None
         self.abuseipdb_key = (abuseipdb_key or "").strip()
         self._networks: list = []
         self._mtime: Optional[float] = None
@@ -82,6 +86,20 @@ class ThreatIntelLookup:
                 return IntelResult(True, "blocklist", 100, f"{ip} is on your blocklist ({net})")
         return None
 
+    def check_feeds(self, ip: str) -> Optional[IntelResult]:
+        if self.feeds is None:
+            return None
+        hit = self.feeds.lookup(ip)
+        if not hit:
+            return None
+        key, name, net = hit
+        where = f" (range {net})" if "/" in net and not net.endswith(("/32", "/128")) else ""
+        return IntelResult(True, f"feed:{key}", 90, f"{ip} is listed by {name}{where}")
+
+    def check_local(self, ip: str) -> Optional[IntelResult]:
+        """Instant checks only (blocklist + downloaded feeds) - no network."""
+        return self.check_blocklist(ip) or self.check_feeds(ip)
+
     # ----------------------------------------------------------- abuseipdb
     async def _check_abuseipdb(self, ip: str) -> Optional[IntelResult]:
         if not self.abuseipdb_key:
@@ -116,10 +134,10 @@ class ThreatIntelLookup:
         return result
 
     async def check(self, ip: str) -> Optional[IntelResult]:
-        """Blocklist first (instant), then AbuseIPDB. None = nothing known."""
+        """Blocklist + feeds first (instant), then AbuseIPDB. None = nothing known."""
         if not ip:
             return None
-        hit = self.check_blocklist(ip)
+        hit = self.check_local(ip)
         if hit:
             return hit
         try:
@@ -139,7 +157,7 @@ def get_threat_intel() -> ThreatIntelLookup:
 
 
 def configure_threat_intel(blocklist_path: Optional[str] = DEFAULT_BLOCKLIST,
-                           abuseipdb_key: str = "") -> ThreatIntelLookup:
+                           abuseipdb_key: str = "", feeds=None) -> ThreatIntelLookup:
     global _lookup
-    _lookup = ThreatIntelLookup(blocklist_path, abuseipdb_key)
+    _lookup = ThreatIntelLookup(blocklist_path, abuseipdb_key, feeds=feeds)
     return _lookup

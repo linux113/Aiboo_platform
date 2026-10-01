@@ -4,7 +4,7 @@ import { sevCls, detIcon, threatIcon } from "../utils/helpers";
 import api, { authH, API, waitForCommand, apiErrorMessage } from "../utils/api";
 import { logger } from "../utils/logger";
 import KPI from "./KPI";
-import type { Threat, Detection, Camera, AgentFinding, CorrelatedAlert } from "../types";
+import type { Threat, Detection, Camera, AgentFinding, CorrelatedAlert, GateDecision } from "../types";
 
 // ---- Endpoint type ----
 export interface EndpointInfo {
@@ -21,8 +21,10 @@ type Playbook = {
   id: string;
   label: string;
   critical?: boolean;
-  kind: "dispatch" | "war_room" | "unavailable";
+  kind: "dispatch" | "war_room" | "badge" | "unavailable";
   action?: string;
+  // extra number fields sent as params (e.g. minutes, kbps)
+  extras?: { key: string; label: string; def: number; min: number; max: number }[];
   targetLabel?: string;
   placeholder?: string;
   optionalTarget?: boolean;
@@ -46,12 +48,24 @@ const PLAYBOOKS: Playbook[] = [
     explain: "Disables this local Windows account on the selected PC (net user <name> /active:no). The account the agent runs as is refused.",
   },
   {
-    id: "badge", label: "Freeze Badge", kind: "unavailable",
-    explain: "Needs a badge / door-access system. None is connected yet, so this playbook cannot run.",
+    id: "restrict", label: "Restrict Account", kind: "dispatch", action: "restrict_identity",
+    targetLabel: "Windows user name", placeholder: "e.g. guest",
+    extras: [{ key: "minutes", label: "Minutes", def: 30, min: 1, max: 1440 }],
+    explain: "Temporarily disables this Windows account and logs off its sessions. The agent turns it back on automatically when the time is up (or use Agent Console -> Lift restriction).",
   },
   {
-    id: "throttle", label: "Throttle Segment", kind: "unavailable",
-    explain: "Needs a network switch or firewall integration. None is connected yet, so this playbook cannot run.",
+    id: "throttle", label: "Throttle Segment", kind: "dispatch", action: "throttle_segment",
+    targetLabel: "IP address or range", placeholder: "e.g. 45.95.147.3 or 192.168.1.0/24",
+    extras: [
+      { key: "kbps", label: "Speed limit (kbit/s)", def: 256, min: 64, max: 100000 },
+      { key: "minutes", label: "Minutes", def: 30, min: 1, max: 1440 },
+    ],
+    explain: "Limits the speed of traffic the selected PC sends to this IP / range (uploads, downloads it asks for, malware call-backs) with a Windows QoS policy - no extra hardware needed. Removed automatically when the time is up.",
+  },
+  {
+    id: "badge", label: "Freeze Badge", kind: "badge",
+    targetLabel: "Badge number / employee ID", placeholder: "e.g. EMP-1042",
+    explain: "Asks your door / badge access system to block this badge. Works when BADGE_WEBHOOK_URL is set in backend/.env (your badge system, or an automation tool such as Power Automate / n8n in front of it).",
   },
   {
     id: "warroom", label: "Open War Room", kind: "war_room",
@@ -77,6 +91,7 @@ export default function DashboardModule({
   cameras,
   findings,
   correlated,
+  gateDecisions = [],
   activeLocks,
   sources,
   onNotify,
@@ -86,6 +101,7 @@ export default function DashboardModule({
   cameras: Camera[];
   findings: AgentFinding[];
   correlated: CorrelatedAlert[];
+  gateDecisions?: GateDecision[];
   activeLocks: number;
   sources: EndpointInfo[];
   onNotify?: (type: "critical" | "warning" | "info", title: string, body: string) => void;
@@ -98,6 +114,14 @@ export default function DashboardModule({
   const [pbTarget, setPbTarget] = useState("");
   const [pbRunning, setPbRunning] = useState(false);
   const [pbResult, setPbResult] = useState<{ ok: boolean | null; text: string } | null>(null);
+  const [pbExtras, setPbExtras] = useState<Record<string, number>>({});
+  const [badgeReady, setBadgeReady] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    api.get("/agent/playbooks/status")
+      .then((r) => setBadgeReady(!!r.data?.badge?.configured))
+      .catch(() => setBadgeReady(null));
+  }, []);
 
   // Load connected agents while a dispatch playbook is open
   useEffect(() => {
@@ -158,6 +182,7 @@ export default function DashboardModule({
     setOpenPlaybook((cur) => (cur?.id === pb.id ? null : pb));
     setPbTarget("");
     setPbResult(null);
+    setPbExtras(Object.fromEntries((pb.extras || []).map((x) => [x.key, x.def])));
   };
 
   const runPlaybook = async () => {
@@ -176,6 +201,12 @@ export default function DashboardModule({
         setPbResult({ ok: true, text: "War room opened - every open dashboard was alerted." });
         return;
       }
+      if (pb.kind === "badge") {
+        const r = await api.post("/agent/playbooks/freeze-badge", { badge_id: target, reason: "Freeze Badge playbook (dashboard)" });
+        setPbResult({ ok: true, text: r.data?.message || "Badge system accepted the request." });
+        onNotify?.("info", "Freeze Badge sent", target);
+        return;
+      }
       if (!pbEndpoint) {
         setPbResult({ ok: false, text: "No agent connected - start the agent first." });
         return;
@@ -185,7 +216,7 @@ export default function DashboardModule({
         endpoint_id: endpoint,
         action: pb.action,
         target,
-        params: {},
+        params: { ...pbExtras },
       });
       setPbResult({ ok: null, text: `Sent to ${endpoint} - waiting for the agent...` });
       const outcome = await waitForCommand(res.data?.cmd_id || "");
@@ -203,6 +234,11 @@ export default function DashboardModule({
       setPbRunning(false);
     }
   };
+
+  // TriGate decisions worth a look (PASS = normal activity, not shown)
+  const feedGates = (Array.isArray(gateDecisions) ? gateDecisions : [])
+    .filter((g) => g.verdict === "hold" || g.verdict === "block")
+    .slice(0, 6);
 
   // Compute online/offline counts
   const activeCount = sources.filter((s) => s.active).length;
@@ -290,7 +326,7 @@ export default function DashboardModule({
                   Live Threat Feed
                 </div>
                 <div className="text-[11px] text-slate-500">
-                  Tri-Gate correlated events
+                  Attack chains + TriGate HOLD / BLOCK
                 </div>
               </div>
               <span className="flex items-center gap-1 text-[10px] text-slate-500">
@@ -299,7 +335,7 @@ export default function DashboardModule({
               </span>
             </div>
             <div className="flex-1 space-y-2 overflow-auto pr-1">
-              {threats.length === 0 && findings.length === 0 && (
+              {threats.length === 0 && findings.length === 0 && feedGates.length === 0 && correlated.length === 0 && (
                 <p className="py-6 text-center text-[11px] text-slate-600">
                   No findings yet - start the agent (python main.py) or use Agent Console → Send Event
                 </p>
@@ -333,6 +369,31 @@ export default function DashboardModule({
                   </div>
                 </div>
               ))}
+              {feedGates.map((g) => {
+                const tri = g.metadata?.trigate;
+                const ctx = (tri?.context || {}) as Record<string, any>;
+                const block = g.verdict === "block";
+                return (
+                  <div key={g.event_id}
+                    className={cn("rounded-lg border px-2.5 py-2 text-xs", block ? "border-red-500/40 bg-red-500/5" : "border-amber-500/40 bg-amber-500/5")}>
+                    <div className="mb-1 flex items-center gap-2">
+                      <span className={cn("text-[10px] font-bold", block ? "text-red-400" : "text-amber-300")}>
+                        {block ? "⛔ BLOCK" : "✋ HOLD"}
+                      </span>
+                      <span className={cn("rounded-full px-2 py-0.5 text-[9px] font-medium ring-1", sevCls(tri?.risk?.level || g.severity))}>
+                        risk {tri?.risk?.score ?? "?"}
+                      </span>
+                      <span className="ml-auto text-[10px] text-slate-500">{new Date(g.timestamp).toLocaleTimeString()}</span>
+                    </div>
+                    <div className="text-[12px] font-medium text-slate-100">
+                      {ctx.pattern_label || g.threat_type}{ctx.entity ? ` - ${ctx.entity}` : ""}
+                    </div>
+                    <div className="mt-0.5 truncate text-[10px] text-slate-400">
+                      {[g.source, ctx.src_ip, ctx.description].filter(Boolean).join(" · ")}
+                    </div>
+                  </div>
+                );
+              })}
               {threats.slice(0, 4).map((t) => (
                 <div
                   key={t._id}
@@ -518,6 +579,9 @@ export default function DashboardModule({
                 {pb.kind === "unavailable" && (
                   <span className="text-[9px] text-slate-600">not connected</span>
                 )}
+                {pb.kind === "badge" && badgeReady === false && (
+                  <span className="text-[9px] text-amber-500/80">needs setup</span>
+                )}
               </button>
             ))}
           </div>
@@ -567,6 +631,26 @@ export default function DashboardModule({
                       className="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none"
                     />
                   </div>
+                  {(openPlaybook.extras || []).length > 0 && (
+                    <div className="grid grid-cols-2 gap-2">
+                      {(openPlaybook.extras || []).map((x) => (
+                        <div key={x.key}>
+                          <label className="mb-1 block text-[10px] uppercase tracking-[0.15em] text-slate-500">{x.label}</label>
+                          <input
+                            type="number" min={x.min} max={x.max}
+                            value={pbExtras[x.key] ?? x.def}
+                            onChange={(e) => setPbExtras((p) => ({ ...p, [x.key]: Math.min(x.max, Math.max(x.min, Number(e.target.value) || x.def)) }))}
+                            className="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-slate-100 focus:outline-none"
+                          />
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {openPlaybook.kind === "badge" && badgeReady === false && (
+                    <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-amber-200">
+                      No badge system connected yet. Add <code>BADGE_WEBHOOK_URL=...</code> to backend/.env and restart the backend.
+                    </div>
+                  )}
                   <button
                     onClick={runPlaybook}
                     disabled={pbRunning || (openPlaybook.kind === "dispatch" && !pbEndpoint)}

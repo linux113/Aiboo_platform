@@ -505,8 +505,12 @@ class UEBAEngine:
             peer_score = self._compute_peer_anomaly(profile)
             overall_score = min(1.0, overall_score + peer_score * 0.3)  # blend
 
-        # If overall score exceeds threshold, publish anomaly
-        if overall_score > 0.4:  # configurable
+        # If overall score exceeds threshold, publish anomaly.
+        # publish_alerts is False by default (config legacy_behaviour_alerts):
+        # this engine only sees ALERTS, so its "anomalies" repeat cards that are
+        # already on the dashboard. BehaviourAnalytics (real logon baselines)
+        # replaces it; profiles are still built for get_profile() etc.
+        if overall_score > 0.4 and getattr(self, "publish_alerts", True):
             severity = self._score_to_severity(overall_score)
             payload = {
                 "entity_id": profile.entity_id,
@@ -514,6 +518,9 @@ class UEBAEngine:
                 "overall_anomaly_score": overall_score,
                 "anomaly_signals": anomaly_scores,
                 "reasons": reasons,
+                "user_id": profile.entity_id if profile.entity_type == "user" else "",
+                "description": (f"UEBA: {profile.entity_type} '{profile.entity_id}' behaves unusually "
+                                f"(score {overall_score:.2f}): " + "; ".join(str(r) for r in reasons[:3]))[:300],
                 "peer_deviation": peer_score,
                 "original_event": {
                     "event_id": event.event_id,
