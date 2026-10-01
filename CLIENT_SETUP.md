@@ -74,17 +74,29 @@ Seed the database:
 npm run seed
 ```
 
-Expected output:
+> ⚠️ `npm run seed` **wipes the database**. Run it only once, on a fresh install.
+> Passwords come from `SEED_ADMIN_PASSWORD` / `SEED_ANALYST_PASSWORD` in `backend/.env`.
+> If those are empty, random passwords are generated and printed **once** — write them down.
+
+Expected output (your passwords will be different):
 ```
 ✅ MongoDB Connected
 🧹 Dropping database...
-✅ Users: admin@example.com/admin123 · analyst@example.com/analyst123
 ✅ Users only — no demo cameras, detections, or threats
 
-🎉 SEEDING COMPLETE
-   admin@example.com  / admin123
-   analyst@example.com / analyst123
+🎉 SEEDING COMPLETE — login details (save them now, they are not shown again):
+   admin@example.com   / Kq7m-P2xd-9RtB-w4Nz   (randomly generated)
+   analyst@example.com / Xn4c-T8wp-Hy2L-b6Qe   (randomly generated)
+
+   Change a password later with:  npm run set-password -- <email> <new-password>
 ```
+
+Forgot a password, or still using the old `admin123`? Change it without losing data:
+```bash
+npm run set-password -- admin@example.com MyNewPassw0rd
+```
+You can also change it in the dashboard: **Settings → Security → Change Password**.
+Rules: at least 8 characters, a letter and a number, and not a common default such as `admin123`.
 
 Start backend:
 ```bash
@@ -95,12 +107,12 @@ Expected output:
 ```
 [INFO] MongoDB connected: mongodb://localhost:27017/aiboo
 [INFO] Server running on port 4000
-[INFO] Demo agent data seeded
+[INFO] Demo data off - dashboard shows only real agent data
 ```
 
 Verify:
 ```bash
-curl http://localhost:4000/api/auth/login -Method POST -ContentType "application/json" -Body '{"email":"admin@example.com","password":"admin123"}'
+curl http://localhost:4000/api/auth/login -Method POST -ContentType "application/json" -Body '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}'
 ```
 ```json
 {"token":"eyJhbGciOiJIUzI1NiIs...", "user":{...}}
@@ -222,7 +234,7 @@ From a **new terminal**, run:
 
 ```bash
 # Login to get token
-$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"admin123"}').token
+$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}').token
 $authH = @{Authorization="Bearer $token"}
 
 # 1. Backend health
@@ -374,7 +386,7 @@ On the client PC:
 
 ## Step 9 — Client Demo Walkthrough
 
-Open `http://localhost:3000` → Login with `admin@example.com` / `admin123`
+Open `http://localhost:3000` → Login with `admin@example.com` and the admin password printed by `npm run seed`
 
 ### What you'll see:
 
@@ -408,7 +420,7 @@ Run these **one at a time** in PowerShell while the client watches the browser:
 
 ### Attack 1: SSH Brute Force
 ```powershell
-$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"admin123"}').token
+$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}').token
 $ts = (Get-Date -Format "yyyy-MM-ddTHH:mm:ssZ")
 $body = @{
   id = "live_attack_1"
@@ -428,7 +440,7 @@ Invoke-RestMethod -Uri "http://localhost:4000/api/agent/finding" -Method Post -H
 
 ### Attack 2: Create a Threat + Auto-Respond
 ```powershell
-$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"admin123"}').token
+$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}').token
 $authH = @{Authorization="Bearer $token"}
 
 # 2a. Create a real threat in MongoDB (returns ObjectId)
@@ -443,14 +455,14 @@ Invoke-RestMethod -Uri "http://localhost:4000/api/respond/auto" -Method Post -He
 
 ### Attack 3: Isolate a Device
 ```powershell
-$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"admin123"}').token
+$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}').token
 Invoke-RestMethod -Uri "http://localhost:4000/api/respond/isolate" -Method Post -Headers @{Authorization="Bearer $token"} -ContentType "application/json" -Body '{"ip":"10.0.0.99"}'
 ```
 → **Browser:** New pseudo-lock appears in Agent Console
 
 ### Attack 4: Check Response Log
 ```powershell
-$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"admin123"}').token
+$token = (Invoke-RestMethod -Uri "http://localhost:4000/api/auth/login" -Method Post -ContentType "application/json" -Body '{"email":"admin@example.com","password":"YOUR_ADMIN_PASSWORD"}').token
 Invoke-RestMethod -Uri "http://localhost:4000/api/agent/response-log" -Headers @{Authorization="Bearer $token"} | ConvertTo-Json
 ```
 ```json

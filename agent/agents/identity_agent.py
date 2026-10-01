@@ -148,6 +148,16 @@ class IdentityVerificationAgent(BaseAgent):
         if confidence > 0.9:
             severity = Severity.CRITICAL
 
+        # All checks passed -> this is an "all clear", not an alert. Without
+        # this the finding inherited the incoming event's severity, so a test
+        # event marked "critical" produced a CRITICAL "biometric=PASS" finding.
+        all_clear = (not biometric_fail and not location_mismatch
+                     and geo_risk <= 0.1 and device_fingerprint_match
+                     and device_risk <= 0.3 and confidence <= 0.6)
+        if all_clear:
+            severity = Severity.LOW
+            actions = [ResponseAction.LOG]
+
         # Clean and deduplicate actions
         actions = list(dict.fromkeys(actions))
 
@@ -162,6 +172,8 @@ class IdentityVerificationAgent(BaseAgent):
         if device_info:
             summary_parts.append(f"device={'trusted' if device_fingerprint_match else 'UNTRUSTED'} (risk={device_risk:.2f})")
         summary_parts.append(f"overall risk={confidence:.2f} ({risk_level.value})")
+        if all_clear:
+            summary_parts.insert(1, "no identity problems found")
 
         summary = " — ".join(summary_parts)
 

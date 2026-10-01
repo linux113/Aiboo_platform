@@ -2,6 +2,7 @@ import { useState, useMemo, useEffect } from "react";
 import { cn } from "../utils/cn";
 import api, { waitForCommand, apiErrorMessage } from "../utils/api";
 import { sevCls, threatIcon, verdictCls } from "../utils/helpers";
+import TriGateCard from "./TriGateCard";
 import type {
   ActionRecord,
   AgentFinding,
@@ -121,6 +122,7 @@ export default function AgentConsole({
   onSendTestEvent,
   onRefreshActions,
   onRetryAction,
+  actionsLoading = false,
 }: {
   findings: AgentFinding[];
   correlated: CorrelatedAlert[];
@@ -130,6 +132,7 @@ export default function AgentConsole({
   onRestoreLock: (id: string) => void;
   onSendTestEvent: (evt: unknown) => void;
   onRefreshActions?: () => void | Promise<void>;
+  actionsLoading?: boolean;
   onRetryAction?: (record: ActionRecord) => void | Promise<void>;
 }) {
   const [tab, setTab] = useState<
@@ -143,6 +146,7 @@ export default function AgentConsole({
     src_ip: "10.0.0.1",
     dst_port: "443",
     user_id: "",
+    signature: "",
   });
   const [sending, setSending] = useState(false);
   const [sendResult, setSendResult] = useState("");
@@ -256,6 +260,7 @@ export default function AgentConsole({
       if (form.src_ip.trim()) payload.src_ip = form.src_ip.trim();
       if (form.dst_port.trim()) payload.dst_port = parseInt(form.dst_port, 10) || form.dst_port.trim();
       if (form.user_id.trim()) payload.user_id = form.user_id.trim();
+      if (form.signature) payload.signature = form.signature;
       const res = await api.post("/agent/test-event", {
         endpoint_id: endpoint,
         event: {
@@ -398,7 +403,7 @@ export default function AgentConsole({
   const tabs = [
     { k: "findings" as const, label: `Findings (${findings.length})` },
     { k: "correlated" as const, label: `Correlated (${correlated.length})` },
-    { k: "gates" as const, label: `Gates (${gateDecisions.length})` },
+    { k: "gates" as const, label: `TriGate (${gateDecisions.length})` },
     {
       k: "locks" as const,
       label: `Locks (${pseudoLocks.filter((l) => l.active).length} active)`,
@@ -577,7 +582,16 @@ export default function AgentConsole({
                   <p className="text-slate-500 text-sm">No gate decisions yet</p>
                 </div>
               )}
-              {gateDecisions.map((d, i) => (
+              {gateDecisions.length > 0 && (
+                <p className="text-[11px] text-slate-500">
+                  Every Windows event goes through all three gates: Trust (who?), Intent (attack?),
+                  Impact (how bad?). Click 👍 False alarm to teach the agent - it remembers across restarts.
+                </p>
+              )}
+              {gateDecisions.map((d, i) =>
+                d.metadata?.trigate?.risk ? (
+                  <TriGateCard key={`${d.event_id}-${i}`} decision={d} />
+                ) : (
                 <div
                   key={i}
                   className="rounded-lg border border-slate-800 bg-slate-900/60 p-3"
@@ -621,7 +635,8 @@ export default function AgentConsole({
                     ))}
                   </div>
                 </div>
-              ))}
+                )
+              )}
             </div>
           )}
 
@@ -832,9 +847,10 @@ export default function AgentConsole({
                 {onRefreshActions && (
                   <button
                     onClick={() => onRefreshActions()}
+                    disabled={actionsLoading}
                     className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs text-slate-300 hover:text-slate-100 hover:border-slate-600 transition"
                   >
-                    Refresh
+                    {actionsLoading ? "Refreshing..." : "Refresh"}
                   </button>
                 )}
               </div>
@@ -1168,6 +1184,23 @@ export default function AgentConsole({
                     ))}
                   </select>
                 </div>
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold uppercase tracking-[0.15em] text-slate-400 mb-1.5">
+                  Attack Signature (optional)
+                </label>
+                <select
+                  value={form.signature}
+                  onChange={(e) => setForm((p) => ({ ...p, signature: e.target.value }))}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-100 focus:outline-none"
+                >
+                  <option value="">None - generic event</option>
+                  <option value="RANSOMWARE_C2">RANSOMWARE_C2 - known malicious (opens a real decoy lock)</option>
+                  <option value="RCE_EXPLOIT">RCE_EXPLOIT - known malicious (opens a real decoy lock)</option>
+                  <option value="SQL_INJECTION">SQL_INJECTION - known malicious (opens a real decoy lock)</option>
+                  <option value="SSH_BRUTE_FORCE">SSH_BRUTE_FORCE - brute force (opens a real decoy lock)</option>
+                  <option value="PORT_SCAN">PORT_SCAN - suspicious only (no lock)</option>
+                </select>
               </div>
               <button
                 onClick={sendEvent}

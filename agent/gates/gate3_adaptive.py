@@ -1,195 +1,208 @@
 """
-gates/gate3_adaptive.py — Gate 3: Adaptive Response
- 
-The final gate. Receives GateDecisions where:
-  - Gate 1 issued BLOCK or ESCALATE
-  - Gate 2 issued BLOCK or ESCALATE
- 
-Gate 3 does NOT re-analyse the threat — that work is done.
-Its job is to:
-  1. Choose the *optimal* response strategy based on all available context
-  2. Apply Pseudo-Lock with precision (right endpoint, right decoy type)
-  3. Adapt its own response thresholds based on the attack pattern seen so far
-  4. Issue the final GateDecision with full action set
-  5. Feed the threat fingerprint back into a live adaptation registry so
-     future Gate 1 / Gate 2 evaluations are sharper
- 
-This is the "learning" gate — it makes AiBoO's tri-gate structure
-self-improving rather than static.
+gates/gate3_adaptive.py - TriGate Gate 3: IMPACT + the FINAL combined decision.
+
+Gate 3 receives every Gate 2 decision and answers "how bad would it be?":
+
+  Impact score 0-100 from
+    * this PC's importance (Endpoints page in the dashboard, or config.ini
+      `importance = low|normal|high|critical`; Server = high, Laptop = normal)
+    * administrator rights affected (new admin, admin logon)
+    * evidence destroyed / monitoring blinded (log cleared, audit policy)
+    * persistence (new service / scheduled task survives a reboot)
+    * a real, existing account targeted / locked out / deleted
+    * working hours (people are using the PC right now)
+
+  Final risk 0-100 = 30% (100 - Trust) + 40% Intent + 30% Impact
+    >= 75 CRITICAL, >= 55 HIGH  -> verdict BLOCK  (actions run automatically
+                                    ONLY if auto_response = true)
+    >= 35 MEDIUM                -> verdict HOLD   (analyst should review)
+    <  35 LOW                   -> verdict PASS   (logged only)
+
+The final decision carries all three gate results + reasons + recommended
+actions in metadata["trigate"]; the dashboard shows it as 3 bars.
+It is also written to the TriGate memory (history for Gate 2, feedback).
 """
- 
+
 from __future__ import annotations
- 
-import asyncio
+
 import logging
-import random
-import string
-from collections import defaultdict
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from cachetools import TTLCache
- 
+
 from core.event_bus import EventBus
-from core.config import config
-from core.events import (
-    GateDecision, GateLevel, GateVerdict,
-    ResponseAction, Severity, ThreatType,
-)
- 
-log = logging.getLogger("Gate3.Adaptive")
- 
- 
-@dataclass
-class ThreatFingerprint:
-    """
-    Compact record of a confirmed threat. Gate 3 builds this registry
-    and shares it back to Gate 1 so known patterns are caught faster
-    on the next encounter.
-    """
-    threat_type: ThreatType
-    severity:    Severity
-    entity:      str
-    actions:     list[ResponseAction]
-    gate_path:   str                   # e.g. "G1:BLOCK" or "G1:HOLD→G2:ESCALATE"
-    seen_at:     datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    occurrences: int = 1
- 
- 
-def _decoy_endpoint(entity: str) -> str:
-    token = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
-    port  = random.randint(32768, 60999)
-    return f"decoy-{token}.aiboo.internal:{port}"
- 
- 
-class Gate3Adaptive:
+from core.events import GateDecision, GateLevel, GateVerdict, ResponseAction, Severity
+from gates.trigate_memory import get_memory
+from gates.trigate_patterns import PATTERNS, get_settings
+
+log = logging.getLogger("Gate3.Impact")
+
+IMPORTANCE_POINTS = {"low": 10, "normal": 35, "high": 60, "critical": 80}
+WEIGHTS = {"trust": 0.30, "intent": 0.40, "impact": 0.30}
+
+
+def _factor(points: int, text: str) -> dict:
+    return {"points": int(points), "text": text}
+
+
+def _clamp(v: float) -> int:
+    return int(max(0, min(100, round(v))))
+
+
+def impact_level(score: int) -> str:
+    return "severe" if score >= 70 else "moderate" if score >= 40 else "limited"
+
+
+def risk_level(score: int) -> str:
+    return "critical" if score >= 75 else "high" if score >= 55 else "medium" if score >= 35 else "low"
+
+
+def current_importance(memory=None, settings=None) -> tuple[str, str]:
+    """(importance, where it came from)."""
+    mem = memory or get_memory()
+    imp = mem.get_importance()
+    if imp:
+        return imp, "set on the dashboard Endpoints page"
+    return (settings or get_settings()).default_importance, "config.ini default"
+
+
+def score_impact(ctx: dict, memory=None, settings=None) -> tuple[int, list[dict], str]:
+    settings = settings or get_settings()
+    f: list[dict] = []
+    pat = PATTERNS.get(ctx["pattern"], PATTERNS["generic"])
+    imp, where = current_importance(memory, settings)
+    f.append(_factor(IMPORTANCE_POINTS[imp], f"This PC's importance is {imp.upper()} ({where})"))
+
+    if pat.admin_rights:
+        f.append(_factor(+15, "Affects administrator rights"))
+    if pat.evidence:
+        f.append(_factor(+15, "Removes evidence / blinds security monitoring"))
+    if pat.persistence:
+        f.append(_factor(+10, "Can survive a reboot (persistence)"))
+
+    reason = ctx.get("failure_reason", "").lower()
+    if ctx["pattern"] in ("brute_force", "failed_logon"):
+        if "does not exist" in reason:
+            f.append(_factor(-5, "The account does not exist (nothing to take over)"))
+        elif ctx["subject"]:
+            f.append(_factor(+10, f"A real account is being targeted ('{ctx['subject']}')"))
+    if ctx["pattern"] == "account_lockout":
+        f.append(_factor(+10, f"'{ctx['subject']}' is locked out and cannot work"))
+    if ctx["pattern"] == "account_deleted":
+        f.append(_factor(+10, f"Account '{ctx['subject']}' was removed"))
+    if (ctx["subject"] or "").lower() in ("administrator", "admin"):
+        f.append(_factor(+10, "The built-in Administrator account is involved"))
+
+    start, end = settings.business_hours
+    if start <= int(ctx.get("local_hour", 12)) < end:
+        f.append(_factor(+5, "During working hours (people are using this PC)"))
+
+    return _clamp(sum(x["points"] for x in f)), f, imp
+
+
+def recommend(ctx: dict, level: str) -> list[dict]:
+    """Recommended actions. `action` is a dashboard remote action when it can
+    be run with one click, otherwise 'manual'. Never targets the admin who
+    made a change - only the account / IP that is the problem."""
+    if level == "low":
+        return [{"action": "log", "target": "", "text": "No action needed - logged for history"}]
+    recs: list[dict] = []
+    pat, ip, subject = ctx["pattern"], ctx["src_ip"], ctx["subject"]
+    exists = "does not exist" not in ctx.get("failure_reason", "").lower()
+
+    if pat in ("brute_force", "failed_logon", "account_lockout", "network_intrusion"):
+        if ip and ctx["ip_kind"] in ("public", "private"):
+            recs.append({"action": "block_access", "target": ip,
+                         "text": f"Block IP {ip} in Windows Firewall"})
+        if subject and exists and pat != "network_intrusion":
+            recs.append({"action": "revoke_identity", "target": subject,
+                         "text": f"Lock account '{subject}' until the owner confirms (not your own account!)"})
+    if pat in ("admin_group_add", "account_created") and subject:
+        recs.append({"action": "revoke_identity", "target": subject,
+                     "text": f"Disable account '{subject}' until someone confirms it is legitimate"})
+    if pat in ("log_cleared", "audit_policy_changed"):
+        recs.append({"action": "manual", "target": ctx["entity"],
+                     "text": f"Ask '{ctx['entity'] or 'the user'}' why logs / audit settings were changed"})
+    if pat == "service_installed":
+        recs.append({"action": "manual", "target": ctx["service_name"],
+                     "text": f"Check service '{ctx['service_name'] or '?'}' (services.msc) and remove it if unknown"})
+    if pat == "scheduled_task":
+        recs.append({"action": "manual", "target": ctx["task_name"],
+                     "text": f"Check scheduled task '{ctx['task_name'] or '?'}' (taskschd.msc) and delete it if unknown"})
+    if level == "critical" and pat in ("log_cleared", "audit_policy_changed", "service_installed",
+                                       "scheduled_task", "admin_group_add", "malware"):
+        recs.append({"action": "isolate_asset", "target": ctx["computer"] or "this PC",
+                     "text": "Isolate this PC from the network while you investigate"})
+    recs.append({"action": "notify_security", "target": "", "text": "Tell the security team / PC owner"})
+    return recs
+
+
+_EXECUTABLE = {"block_access": ResponseAction.BLOCK_ACCESS, "revoke_identity": ResponseAction.REVOKE_IDENTITY,
+               "isolate_asset": ResponseAction.ISOLATE_ASSET, "notify_security": ResponseAction.NOTIFY_SECURITY}
+
+
+class Gate3Impact:
     def __init__(self, bus: EventBus) -> None:
         self.bus = bus
-        # Threat fingerprint registry — TTLCache bounded
-        self._registry: TTLCache = TTLCache(maxsize=config.max_dict_size, ttl=86400 * 7)
-        # Adaptation counters — if same entity hits Gate 3 repeatedly,
-        # automatically elevate their baseline threat level
-        self._repeat_hits: dict[str, int] = defaultdict(int)
- 
+
     def start(self) -> None:
         self.bus.subscribe(GateDecision, self._evaluate)
-        log.info("Gate 3 — Adaptive Response — ACTIVE")
- 
+        log.info("Gate 3 (Impact) online - importance %s, final TriGate decision",
+                 current_importance()[0].upper())
+
     async def _evaluate(self, decision: GateDecision) -> None:
-        # Gate 3 only activates on BLOCK or ESCALATE from Gate 1 or 2
-        if decision.verdict not in (GateVerdict.BLOCK, GateVerdict.ESCALATE):
+        if decision.gate != GateLevel.GATE_2:
             return
-        if decision.gate not in (GateLevel.GATE_1, GateLevel.GATE_2):
+        meta = dict(decision.metadata or {})
+        tri = dict(meta.get("trigate") or {})
+        ctx, trust, intent = tri.get("context"), tri.get("trust"), tri.get("intent")
+        if not (ctx and trust and intent):
             return
- 
-        await asyncio.sleep(0.02)
- 
-        entity    = self._extract_entity(decision)
-        gate_path = self._gate_path_label(decision)
-        self._repeat_hits[entity] += 1
-        repeat    = self._repeat_hits[entity]
- 
-        # Build optimal action set
-        actions = list(dict.fromkeys(decision.actions))   # preserve order, dedupe
- 
-        # Always include Pseudo-Lock at Gate 3
-        if ResponseAction.PSEUDO_LOCK not in actions:
-            actions.append(ResponseAction.PSEUDO_LOCK)
- 
-        # Repeat offender — escalate harder
-        if repeat >= 3:
-            for a in [ResponseAction.ESCALATE_SOC, ResponseAction.NOTIFY_SECURITY,
-                      ResponseAction.ISOLATE_ASSET]:
-                if a not in actions:
-                    actions.append(a)
- 
-        severity = decision.severity
-        if repeat >= 3 and severity != Severity.CRITICAL:
-            severity = Severity.CRITICAL
-            log.warning(
-                "Entity %r has triggered Gate 3 %d times — severity elevated to CRITICAL",
-                entity, repeat,
-            )
- 
-        # Pseudo-Lock detail
-        decoy  = _decoy_endpoint(entity)
-        reason = (
-            f"Gate 3 adaptive response for {entity!r} "
-            f"(path={gate_path}, repeat={repeat}). "
-            f"Pseudo-Lock → {decoy}. "
-            f"{decision.reason}"
+
+        impact, factors, importance = score_impact(ctx)
+        risk = _clamp(WEIGHTS["trust"] * (100 - trust["score"])
+                      + WEIGHTS["intent"] * intent["score"]
+                      + WEIGHTS["impact"] * impact)
+        level = risk_level(risk)
+        verdict = GateVerdict.BLOCK if level in ("critical", "high") else \
+            GateVerdict.HOLD if level == "medium" else GateVerdict.PASS
+        recs = recommend(ctx, level)
+        actions = [_EXECUTABLE[r["action"]] for r in recs if r["action"] in _EXECUTABLE]
+
+        tri["impact"] = {"score": impact, "level": impact_level(impact), "factors": factors,
+                         "importance": importance}
+        tri["risk"] = {"score": risk, "level": level, "weights": WEIGHTS}
+        tri["recommended"] = recs
+        tri["pattern"] = ctx["pattern"]
+        tri["entity"] = ctx["entity"]
+        tri["subject"] = ctx["subject"]
+        meta["trigate"] = tri
+
+        explanation = (
+            f"Risk {risk}/100 ({level.upper()}) - {ctx['pattern_label']}"
+            f"{' by ' + repr(ctx['entity']) if ctx['entity'] else ''}. "
+            f"Trust {trust['score']} ({trust['level']}), Intent {intent['score']} ({intent['level']}), "
+            f"Impact {impact} ({impact_level(impact)})."
         )
- 
-        final = GateDecision(
-            gate        = GateLevel.GATE_3,
-            event_id    = decision.event_id,
-            threat_type = decision.threat_type,
-            severity    = severity,
-            verdict     = GateVerdict.BLOCK,
-            confidence  = min(decision.confidence + 0.05, 1.0),
-            reason      = reason,
-            actions     = actions,
-            metadata    = {
-                **decision.metadata,
-                "entity":     entity,
-                "decoy":      decoy,
-                "gate_path":  gate_path,
-                "repeat":     repeat,
-            },
-        )
- 
-        log.critical(
-            "Gate 3 [%s] FINAL — entity=%r path=%s repeat=%d sev=%s conf=%.2f",
-            decision.event_id, entity, gate_path, repeat,
-            severity.value, final.confidence,
-        )
- 
-        # Update fingerprint registry — feeds back to Gate 1 learning
-        self._fingerprint(decision, entity, gate_path, actions, severity)
- 
-        await self.bus.publish(final)
- 
-    # ── Helpers ───────────────────────────────────────────────────
- 
-    def _extract_entity(self, d: GateDecision) -> str:
-        p = d.metadata.get("payload", {})
-        return (
-            p.get("user_id")
-            or p.get("src_ip")
-            or d.metadata.get("source", "unknown")
-        )
- 
-    def _gate_path_label(self, d: GateDecision) -> str:
-        return f"G{d.gate.value}:{d.verdict.value.upper()}"
- 
-    def _fingerprint(
-        self,
-        d: GateDecision,
-        entity: str,
-        gate_path: str,
-        actions: list[ResponseAction],
-        severity: Severity,
-    ) -> None:
-        key = f"{d.threat_type.value}:{entity}"
-        if key in self._registry:
-            self._registry[key].occurrences += 1
-            self._registry[key].severity = severity
-            log.info(
-                "Fingerprint updated — %s occurrences=%d",
-                key, self._registry[key].occurrences,
-            )
+
+        get_memory().record_event(decision.event_id, ctx["entity"], ctx["pattern"], risk,
+                                  subject=ctx["subject"])
+        get_memory().maybe_save()
+
+        if verdict == GateVerdict.PASS:
+            log.info("TriGate PASS: %s", explanation)
         else:
-            self._registry[key] = ThreatFingerprint(
-                threat_type = d.threat_type,
-                severity    = severity,
-                entity      = entity,
-                actions     = actions,
-                gate_path   = gate_path,
-            )
-            log.info("New fingerprint registered — %s", key)
- 
-    def known_entities(self) -> list[ThreatFingerprint]:
-        """Expose the registry for Gate 1 to query during startup."""
-        return list(self._registry.values())
- 
-    def repeat_count(self, entity: str) -> int:
-        return self._repeat_hits.get(entity, 0)
+            log.warning("TriGate %s: %s", verdict.value.upper(), explanation)
+        await self.bus.publish(GateDecision(
+            gate=GateLevel.GATE_3,
+            event_id=decision.event_id,
+            threat_type=decision.threat_type,
+            severity=Severity(level),
+            verdict=verdict,
+            confidence=round(min(0.95, 0.5 + 0.03 * (len(trust["factors"]) + len(intent["factors"])
+                                                   + len(factors))), 2),
+            reason=explanation,
+            actions=actions,
+            metadata=meta,
+        ))
+
+
+# Backwards-compatible name
+Gate3Adaptive = Gate3Impact

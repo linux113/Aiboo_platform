@@ -2,6 +2,7 @@ import express from 'express';
 import { getIO } from '../config/socket.js';
 import { protect, authorize } from '../middleware/auth.js';
 import logger from '../utils/logger.js';
+import { IMPORTANCE_LEVELS } from '../sockets/agentChannel.js';
 
 const router = express.Router();
 
@@ -17,6 +18,7 @@ const store = {
   responseLog: [],
   endpoints: {},     // keyed by source, stores last heartbeat
   actions: [],       // NEW: response actions for the "Isolation & Termination" tab
+  importance: {},    // TriGate: endpoint -> low|normal|high|critical (last known)
 };
 
 const MAX = 200;
@@ -218,13 +220,52 @@ router.get('/findings', (req, res) => {
 });
 
 // GET /api/agent/endpoints – Detailed endpoint status
+// Includes agents connected over the command channel (even before their
+// first finding) and the TriGate importance of each PC.
 router.get('/endpoints', (req, res) => {
-  const list = Object.values(store.endpoints).map((ep) => ({
+  const byId = {};
+  for (const ep of Object.values(store.endpoints)) {
+    byId[ep.source] = { ...ep, active: isActive(ep.lastSeen) };
+  }
+  const channel = req.app.get('agentChannel');
+  const online = channel ? channel.listAgents() : [];
+  for (const a of online) {
+    const prev = byId[a.endpointId] || { source: a.endpointId, lastSeen: a.lastSeen };
+    byId[a.endpointId] = {
+      ...prev,
+      hostname: a.hostname,
+      connected: true,
+      active: true,
+      lastSeen: new Date(a.lastSeen) > new Date(prev.lastSeen || 0) ? a.lastSeen : prev.lastSeen,
+      importance: a.importance || store.importance[a.endpointId] || null,
+      trigate: a.trigate || null,
+    };
+  }
+  const list = Object.values(byId).map((ep) => ({
     ...ep,
-    active: isActive(ep.lastSeen),
+    connected: Boolean(ep.connected),
+    importance: ep.importance || store.importance[ep.source] || null,
   }));
   list.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
   res.json(list);
+});
+
+// POST /api/agent/endpoints/:id/importance  { importance: low|normal|high|critical }
+// TriGate Gate 3 (Impact): how important is this PC? Sent to the agent,
+// which saves it on disk (trigate_memory.json) and uses it for Impact.
+router.post('/endpoints/:id/importance', protect, authorize('admin', 'analyst'), (req, res) => {
+  const endpointId = String(req.params.id);
+  const importance = String(req.body?.importance || '').toLowerCase().trim();
+  if (!IMPORTANCE_LEVELS.has(importance)) {
+    return res.status(400).json({ ok: false, error: 'importance must be low, normal, high or critical' });
+  }
+  const channel = req.app.get('agentChannel');
+  if (!channel) return res.status(503).json({ ok: false, error: 'Agent channel not initialized' });
+  const result = channel.dispatch(endpointId, 'set_importance', importance, { importance });
+  if (!result.ok) return res.status(404).json(result);
+  store.importance[endpointId] = importance;
+  logger.info(`TriGate importance of ${endpointId} -> ${importance} (${result.cmd_id})`);
+  res.status(202).json({ ...result, importance });
 });
 
 // ============================================================
@@ -500,9 +541,48 @@ router.post('/correlated', validateAgentOrJWT, (req, res) => {
 });
 
 router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
-  push(store.gateDecisions, req.body);
-  emit('agent:gate', req.body);
+  const decision = { ...req.body, source: getSource(req) };
+  updateEndpointHeartbeat(decision.source);
+  const imp = decision.metadata?.trigate?.impact?.importance;
+  if (IMPORTANCE_LEVELS.has(String(imp || ''))) store.importance[decision.source] = String(imp);
+  push(store.gateDecisions, decision);
+  emit('agent:gate', decision);
   res.json({ ok: true });
+});
+
+// POST /api/agent/gate-decisions/:eventId/feedback  { feedback: false_alarm|confirmed }
+// TriGate learning: the agent stores the feedback on disk; future events of
+// the same kind for the same user score lower (false alarm) / higher (confirmed).
+router.post('/gate-decisions/:eventId/feedback', protect, authorize('admin', 'analyst'), (req, res) => {
+  const feedback = String(req.body?.feedback || '').toLowerCase().trim();
+  if (!['false_alarm', 'confirmed'].includes(feedback)) {
+    return res.status(400).json({ ok: false, error: "feedback must be 'false_alarm' or 'confirmed'" });
+  }
+  const decision = store.gateDecisions.find((d) => d.event_id === req.params.eventId);
+  if (!decision) return res.status(404).json({ ok: false, error: 'Decision not found' });
+  const endpointId = decision.source;
+  if (!endpointId || endpointId === 'unknown') {
+    return res.status(400).json({ ok: false, error: 'This decision has no endpoint (old agent version)' });
+  }
+  const channel = req.app.get('agentChannel');
+  if (!channel) return res.status(503).json({ ok: false, error: 'Agent channel not initialized' });
+  const tri = decision.metadata?.trigate || {};
+  const result = channel.dispatch(endpointId, 'trigate_feedback', decision.event_id, {
+    feedback,
+    event_id: decision.event_id,
+    pattern: tri.pattern || tri.context?.pattern || null,
+    entity: tri.entity ?? tri.context?.entity ?? null,
+  });
+  if (!result.ok) return res.status(404).json(result);
+  decision.feedback = {
+    kind: feedback,
+    cmd_id: result.cmd_id,
+    by: req.user?.email || req.user?.name || 'analyst',
+    at: new Date().toISOString(),
+  };
+  logger.info(`TriGate feedback ${feedback} for ${decision.event_id} on ${endpointId} (${result.cmd_id})`);
+  emit('agent:gate-feedback', { event_id: decision.event_id, feedback: decision.feedback });
+  res.status(202).json({ ok: true, ...result, feedback: decision.feedback });
 });
 
 router.post('/pseudo-lock', validateAgentOrJWT, (req, res) => {
@@ -532,7 +612,18 @@ router.post('/pseudo-lock-restore', validateAgentOrJWT, (req, res) => {
 
 // ---- Internal GET endpoints ----
 router.get('/correlated', protect, (req, res) => res.json(store.correlated.slice(0, 20)));
-router.get('/gate-decisions', protect, (req, res) => res.json(store.gateDecisions.slice(0, 50)));
+router.get('/gate-decisions', protect, (req, res) => {
+  const channel = req.app.get('agentChannel');
+  const { source } = req.query;
+  const list = (source ? store.gateDecisions.filter((d) => d.source === source) : store.gateDecisions)
+    .slice(0, 50)
+    .map((d) => {
+      if (!d.feedback?.cmd_id || !channel?.getCommand) return d;
+      const cmd = channel.getCommand(d.feedback.cmd_id);
+      return cmd ? { ...d, feedback: { ...d.feedback, status: cmd.status, error: cmd.error } } : d;
+    });
+  res.json(list);
+});
 router.get('/pseudo-locks', protect, (req, res) => res.json(Object.values(store.pseudoLocks)));
 router.get('/response-log', protect, (req, res) => res.json(store.responseLog.slice(0, 50)));
 
@@ -583,9 +674,10 @@ router.post('/pseudo-locks/:lockId/restore', protect, authorize('admin', 'analys
   lock.active = false;
   lock.restoring = false;
   lock.restored_at = new Date().toISOString();
-  lock.restore_message =
-    `Agent '${endpoint || 'unknown'}' is not connected - cleared on the dashboard only. ` +
-    'Decoy ports close automatically when the agent stops.';
+  lock.restore_message = (!endpoint || lock.demo)
+    ? 'Demo/sample lock with no real agent behind it - cleared on the dashboard.'
+    : `Agent '${endpoint}' is not connected - cleared on the dashboard only. ` +
+      'Decoy ports close automatically when the agent stops.';
   emit('agent:pseudo-lock-restore', {
     lock_id: lockId,
     restored_at: lock.restored_at,
@@ -802,6 +894,22 @@ export function seedDemoAgentData() {
     },
   ];
 
+  // Label every sample row so it can never be mistaken for a real alert:
+  // "[DEMO]" prefix on the visible text, demo:true flag, and everything
+  // belongs to the "demo" endpoint (never a real PC name like "gorilla").
+  const tag = (text) => (text && !String(text).startsWith('[DEMO]') ? `[DEMO] ${text}` : text);
+  demoFindings.forEach(f => { f.summary = tag(f.summary); f.demo = true; f.source = 'demo'; });
+  demGates.forEach(g => { g.reason = tag(g.reason); g.demo = true; g.source = 'demo'; });
+  demCorrelated.forEach(c => { c.description = tag(c.description); c.demo = true; c.source = 'demo'; });
+  Object.assign(demLock, { summary: tag(demLock.summary), demo: true, source: 'demo' });
+  demoActions.forEach(a => {
+    a.details = tag(a.details) || '[DEMO] sample action';
+    if (a.error) a.error = tag(a.error);
+    a.endpoint = 'demo';
+    a.source = 'demo';
+    a.metadata = { ...(a.metadata || {}), demo: true };
+  });
+
   demoFindings.forEach(f => push(store.findings, f));
   demGates.forEach(g => push(store.gateDecisions, g));
   demCorrelated.forEach(c => push(store.correlated, c));
@@ -810,10 +918,10 @@ export function seedDemoAgentData() {
   // Normalise and store demo actions
   demoActions.forEach(a => pushAction(normaliseAction(a, a.source)));
 
-  // Demo endpoint with a fresh heartbeat
-  store.endpoints['demo'] = { source: 'demo', lastSeen: new Date().toISOString() };
+  // Demo endpoint (sample data only - no real agent behind it)
+  store.endpoints['demo'] = { source: 'demo', demo: true, lastSeen: new Date().toISOString() };
 
-  logger.info('Demo agent data seeded (with source="demo")');
+  logger.warn('DEMO DATA LOADED (SEED_DEMO_DATA=true) - every sample row is marked [DEMO]');
 }
 
 export default router;

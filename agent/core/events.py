@@ -119,12 +119,12 @@ class ActionStatus(str, Enum):
 # ── Tri-gate types ────────────────────────────────────────────────────────────
 
 class GateLevel(int, Enum):
-    GATE_1 = 1   # Perimeter intelligence
-    GATE_2 = 2   # Behavioural intelligence
-    GATE_3 = 3   # Adaptive response
+    GATE_1 = 1   # Trust  - who is it, can we trust them?
+    GATE_2 = 2   # Intent - is it an attack?
+    GATE_3 = 3   # Impact - how bad would it be? (+ final TriGate decision)
 
     def label(self) -> str:
-        return {1: "Perimeter", 2: "Behavioural", 3: "Adaptive Response"}[self.value]
+        return {1: "Trust", 2: "Intent", 3: "Impact"}[self.value]
 
 
 class GateVerdict(str, Enum):

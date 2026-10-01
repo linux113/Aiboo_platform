@@ -21,12 +21,45 @@ export default function SettingsModule({
   userName,
   userEmail,
   userRole,
+  mustChangePassword = false,
+  onPasswordChanged,
 }: {
   userName: string;
   userEmail: string;
   userRole: string;
+  mustChangePassword?: boolean;
+  onPasswordChanged?: () => void;
 }) {
-  const [section, setSection] = useState<"profile" | "alerts" | "voice" | "system" | "security">("profile");
+  const [section, setSection] = useState<"profile" | "alerts" | "voice" | "system" | "security">(
+    mustChangePassword ? "security" : "profile"
+  );
+  const [pwOpen, setPwOpen] = useState(mustChangePassword);
+  const [pw, setPw] = useState({ current: "", next: "", confirm: "" });
+  const [pwMsg, setPwMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [pwBusy, setPwBusy] = useState(false);
+
+  const submitPassword = async () => {
+    setPwMsg(null);
+    if (!pw.current || !pw.next) return setPwMsg({ ok: false, text: "Fill in all fields." });
+    if (pw.next !== pw.confirm) return setPwMsg({ ok: false, text: "New passwords do not match." });
+    if (pw.next.length < 8) return setPwMsg({ ok: false, text: "New password must be at least 8 characters." });
+    setPwBusy(true);
+    try {
+      await api.post(
+        `${API}/auth/change-password`,
+        { currentPassword: pw.current, newPassword: pw.next },
+        authH()
+      );
+      setPw({ current: "", next: "", confirm: "" });
+      setPwMsg({ ok: true, text: "Password changed. Use the new password next time you log in." });
+      onPasswordChanged?.();
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { message?: string } } };
+      setPwMsg({ ok: false, text: e.response?.data?.message || "Could not change password." });
+    } finally {
+      setPwBusy(false);
+    }
+  };
   const [profile, setProfile] = useState({
     name: userName || "",
     email: userEmail || "",
@@ -375,7 +408,7 @@ export default function SettingsModule({
               ].map(({ label, icon, color }) => (
                 <button
                   key={label}
-                  onClick={() => showComingSoon(label)}
+                  onClick={() => (label === "Change Password" ? setPwOpen((o) => !o) : showComingSoon(label))}
                   className={cn(
                     "flex items-center gap-3 rounded-xl border px-4 py-3 text-sm font-medium transition active:scale-95",
                     color
@@ -386,6 +419,42 @@ export default function SettingsModule({
                 </button>
               ))}
             </div>
+            {pwOpen && (
+              <div className="rounded-xl border border-cyan-500/30 bg-slate-900/60 p-4 space-y-3">
+                <div className="text-xs font-semibold text-cyan-300">Change Password</div>
+                {mustChangePassword && (
+                  <p className="text-[11px] text-red-300">
+                    You are using a default password. Set your own password now.
+                  </p>
+                )}
+                {([
+                  ["current", "Current password"],
+                  ["next", "New password (min 8 characters, letters + numbers)"],
+                  ["confirm", "Repeat new password"],
+                ] as const).map(([k, label]) => (
+                  <label key={k} className="block text-[11px] text-slate-400">
+                    {label}
+                    <input
+                      type="password"
+                      autoComplete={k === "current" ? "current-password" : "new-password"}
+                      value={pw[k]}
+                      onChange={(e) => setPw((p) => ({ ...p, [k]: e.target.value }))}
+                      className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-500/60"
+                    />
+                  </label>
+                ))}
+                {pwMsg && (
+                  <p className={cn("text-[11px]", pwMsg.ok ? "text-emerald-300" : "text-red-300")}>{pwMsg.text}</p>
+                )}
+                <button
+                  onClick={submitPassword}
+                  disabled={pwBusy}
+                  className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-50"
+                >
+                  {pwBusy ? "Saving..." : "Save new password"}
+                </button>
+              </div>
+            )}
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 p-4">
               <div className="text-xs text-slate-400 font-semibold mb-3">
                 Recent Activity

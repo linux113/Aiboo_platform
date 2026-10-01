@@ -249,7 +249,16 @@ class TestPseudoLockAgent:
         await agent._handle_finding(finding)
         locks = agent.active_locks()
         assert len(locks) > 0
-        assert "decoy" in locks[0].decoy_endpoint
+        # The decoy is now a real local listener ("0.0.0.0:<port>"), not a
+        # fake "decoy-xxx" hostname.
+        lock = locks[0]
+        assert lock.original_endpoint == "10.0.0.1:443"
+        assert lock.decoy_port > 0
+        assert lock.decoy_endpoint.endswith(f":{lock.decoy_port}")
+        # close the real listener(s) so the test leaves no open port behind
+        for lock_id in list(agent._lock_registry):
+            await agent.restore(lock_id)
+        assert agent.active_locks() == []
 
     @pytest.mark.asyncio
     async def test_pseudo_lock_not_triggered_without_action(self, agent, make_finding):

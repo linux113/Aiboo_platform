@@ -26,7 +26,7 @@ logging.basicConfig(
 )
 
 logging.getLogger("WindowsIngestor").setLevel(logging.WARNING)
-logging.getLogger("Gate1.Perimeter").setLevel(logging.INFO)
+logging.getLogger("Gate1.Trust").setLevel(logging.INFO)
 logging.getLogger("CyberThreatAgent").setLevel(logging.INFO)
 
 log = logging.getLogger("runner")

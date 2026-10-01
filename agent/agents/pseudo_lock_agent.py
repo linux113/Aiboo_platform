@@ -197,8 +197,9 @@ class PseudoLockAgent(BaseAgent):
             agent=str(getattr(event, "agent_name", "") or self.name),
             severity=severity.value if hasattr(severity, "value") else str(severity),
             summary=(
-                f"Decoy listening on 0.0.0.0:{decoy_port}. "
-                f"Original endpoint {orig_ep} tracked for restore."
+                f"Decoy listening on 0.0.0.0:{decoy_port} for "
+                f"{orig_ep[:-8] if str(orig_ep).endswith(':unknown') else orig_ep}. "
+                f"Restore closes it."
             ),
             decoy_port=decoy_port,
             decoy_endpoint=decoy_ep,

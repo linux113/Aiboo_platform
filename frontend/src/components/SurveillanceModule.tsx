@@ -328,10 +328,10 @@ export default function SurveillanceModule({
               <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3 space-y-1.5 text-xs text-slate-400">
                 {[
                   ["Status", cfgCam.status],
-                  ["Type", cfgCam.type.toUpperCase()],
+                  ["Type", (cfgCam.type || "ip").toUpperCase()],
                   ["Zone", cfgCam.zone],
                   ["Enabled", cfgCam.enabled ? "Yes" : "No"],
-                  ["URL", cfgCam.streamUrl],
+                  ["URL", cfgCam.streamUrl || cfgCam.stream_url || "-"],
                 ].map(([k, v]) => (
                   <div key={k} className="flex justify-between gap-2">
                     <span>{k}</span>
@@ -407,7 +407,7 @@ export default function SurveillanceModule({
                 alt={fullCam.name}
                 className="w-full h-full object-contain"
                 onError={(e) => {
-                  (e.target as HTMLImageElement).src = fullCam.streamUrl;
+                  if (fullCam.streamUrl) (e.target as HTMLImageElement).src = fullCam.streamUrl;
                 }}
               />
             ) : (

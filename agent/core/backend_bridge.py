@@ -264,17 +264,20 @@ class DashboardBridge:
         await self._queue.add_to_endpoint("correlated", payload)
 
     async def _on_gate_decision(self, event: GateDecision) -> None:
+        # Only the FINAL TriGate decision (Gate 3) goes to the dashboard: it
+        # already carries all three gate results (Trust / Intent / Impact)
+        # in metadata["trigate"]. Gate 1/2 decisions are intermediate steps.
+        if int(getattr(event.gate, "value", event.gate)) != 3:
+            return
         payload = _serialize(event)
-        payload["gate"] = int(payload.get("gate", 0))
-        payload["gate_label"] = {
-            1: "Perimeter",
-            2: "Behavioural",
-            3: "Adaptive Response",
-        }.get(payload["gate"], "Unknown")
+        payload["gate"] = 3
+        payload["gate_label"] = "TriGate"
         payload["timestamp"] = _as_iso(event.timestamp)
         payload["confidence"] = float(payload.get("confidence", 0))
         if isinstance(payload.get("severity"), str):
             payload["severity"] = payload["severity"].lower()
+        payload["source"] = self._endpoint_id
+        payload["endpoint"] = self._endpoint_id
         await self._queue.add_to_endpoint("gate-decision", payload)
 
     # ------------------------------------------------------------------

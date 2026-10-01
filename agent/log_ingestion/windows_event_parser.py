@@ -82,6 +82,35 @@ _SUSPICIOUS_TASK_MARKERS = (
 )
 
 
+# Groups whose membership really matters. Adding a user to "Users" or the
+# workstation default group "None" happens automatically on every
+# "net user X /add", so those are not alerts.
+_PRIVILEGED_GROUPS = {
+    "administrators", "domain admins", "enterprise admins", "schema admins",
+    "remote desktop users", "remote management users", "backup operators",
+    "account operators", "server operators", "print operators",
+    "hyper-v administrators", "dnsadmins", "group policy creator owners",
+    "network configuration operators",
+}
+
+
+def is_privileged_group(group: Optional[str]) -> bool:
+    return str(group or "").split("\\")[-1].strip().lower() in _PRIVILEGED_GROUPS
+
+
+def _resolve_sid(sid: str) -> str:
+    """Turn 'S-1-5-21-...-1005' into 'PC\\name' when running on Windows."""
+    if not str(sid).upper().startswith("S-1-"):
+        return sid
+    try:
+        import win32security  # type: ignore
+        name, domain, _ = win32security.LookupAccountSid(
+            None, win32security.ConvertStringSidToSid(sid))
+        return f"{domain}\\{name}" if domain else name
+    except Exception:
+        return sid
+
+
 def _get(strings: list, idx: int, default: str = "unknown") -> str:
     try:
         val = strings[idx]
@@ -191,9 +220,11 @@ def extract_fields(event_id: int, strings: list) -> dict:
             member = _get(s, 1)  # local groups often log only the member SID
         if member.upper().startswith("CN="):
             member = member.split(",")[0][3:]
+        member = _resolve_sid(member)
         group = _get(s, 2)
         actor = _get(s, 6)
-        f.update(user_id=actor, actor=actor, target_user=member, group=group)
+        f.update(user_id=actor, actor=actor, target_user=member, group=group,
+                 privileged_group=is_privileged_group(group))
         f["description"] = f"'{member}' was added to group '{group}' by '{actor}'"
 
     elif event_id == 1102:  # Audit log cleared

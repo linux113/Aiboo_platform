@@ -48,8 +48,11 @@ class CommandChannel:
         endpoint_id: Optional[str] = None,
         allowed_actions: Optional[set] = None,
         local_handlers: Optional[Dict[str, Callable[[str, dict], Awaitable[Optional[dict]]]]] = None,
+        register_info: Optional[Callable[[], dict]] = None,
     ) -> None:
         self._engine = engine
+        # Extra fields sent with agent:register (e.g. TriGate importance)
+        self._register_info = register_info
         # Commands handled by agent components directly instead of the
         # response engine, e.g. "restore_pseudo_lock" -> PseudoLockAgent,
         # "inject_test_event" -> publish a test ThreatEvent on the bus.
@@ -83,11 +86,14 @@ class CommandChannel:
                 "- remote actions from the dashboard are now enabled",
                 self._backend_url, NAMESPACE, self._endpoint_id,
             )
-            await self._sio.emit(
-                "agent:register",
-                {"endpoint_id": self._endpoint_id, "hostname": socket.gethostname()},
-                namespace=NAMESPACE,
-            )
+            info = {"endpoint_id": self._endpoint_id, "hostname": socket.gethostname()}
+            if self._register_info:
+                try:
+                    info.update({k: v for k, v in (self._register_info() or {}).items()
+                                 if k not in ("endpoint_id", "hostname")})
+                except Exception as exc:
+                    log.debug("register_info failed: %s", exc)
+            await self._sio.emit("agent:register", info, namespace=NAMESPACE)
 
         async def on_disconnect(*_args):
             if not self._stopping:

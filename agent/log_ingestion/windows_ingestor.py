@@ -231,11 +231,50 @@ class WindowsEventIngestor:
             len(self.rules), RULES_SOURCE,
         )
 
+    @staticmethod
+    def logon_failure_auditing(auditpol_output: str) -> Optional[bool]:
+        """
+        Parse `auditpol /get /subcategory:{Logon GUID}` output.
+        True/False when we can tell, None when the output is unreadable
+        (e.g. non-English Windows).
+        """
+        for line in (auditpol_output or "").splitlines():
+            low = line.strip().lower()
+            if not low.startswith("logon") or low.startswith("logoff"):
+                continue
+            if "failure" in low:
+                return True
+            if "success" in low or "no auditing" in low:
+                return False
+        return None
+
+    def _check_logon_auditing(self) -> None:
+        """Warn when Windows is not recording failed logons (event 4625)."""
+        import subprocess
+        try:
+            out = subprocess.run(
+                ["auditpol", "/get", "/subcategory:{0CCE9215-69AE-11D9-BED3-505054503030}"],
+                capture_output=True, text=True, timeout=10,
+            ).stdout
+        except Exception as e:
+            log.debug("auditpol check skipped: %s", e)
+            return
+        state = self.logon_failure_auditing(out)
+        if state is False:
+            log.warning(
+                "Windows is NOT recording failed logons (Audit Logon: Failure is off), "
+                "so wrong-password / brute-force alerts cannot work. Fix (Administrator): "
+                'auditpol /set /subcategory:"Logon" /success:enable /failure:enable'
+            )
+        elif state is True:
+            log.info("Failed-logon auditing is ON (event 4625 will be recorded)")
+
     async def start(self, tail_only: bool = True):
         if not WINDOWS_AVAILABLE:
             log.warning("Windows Event Log ingestion skipped (not running on Windows / no pywin32).")
             return
         log.info(f"Starting Windows Event Log ingestion from: {self.log_names}")
+        self._check_logon_auditing()
         self._running = True
 
         poll_thread = threading.Thread(
@@ -360,6 +399,7 @@ class WindowsEventIngestor:
                 if threat_event is None:
                     continue
                 threat_event = self._apply_brute_force(threat_event)
+                self._remember_context(threat_event)
                 if threat_event.severity.weight >= self.min_severity.weight:
                     self._baseline.update(threat_event.threat_type.value, threat_event.timestamp)
                     self._stats["published"] += 1
@@ -370,6 +410,24 @@ class WindowsEventIngestor:
                     await self.bus.publish(threat_event)
             except Exception as e:
                 log.error(f"Error processing event: {e}")
+
+    @staticmethod
+    def _remember_context(threat_event: ThreatEvent) -> None:
+        """TriGate Gate 1 context: remember SUCCESSFUL logons (4624) - which
+        user logged in from which IP / logon type - so later events can be
+        judged against "known" behaviour. 4624 is LOW severity and never
+        published, so this must happen before the severity filter."""
+        p = threat_event.payload
+        if p.get("event_id_raw") != 4624:
+            return
+        try:
+            from gates.trigate_memory import get_memory
+            ts = threat_event.timestamp if isinstance(threat_event.timestamp, datetime) else None
+            if ts is not None and ts.tzinfo is None:
+                ts = ts.astimezone()          # naive Windows time is local time
+            get_memory().record_logon(p.get("user_id"), p.get("src_ip"), p.get("logon_type"), ts)
+        except Exception as exc:              # memory must never break ingestion
+            log.debug("TriGate context not recorded: %s", exc)
 
     def _apply_brute_force(self, threat_event: ThreatEvent) -> ThreatEvent:
         """Escalate repeated failed logons (same user or IP) to one HIGH alert."""
@@ -416,6 +474,11 @@ class WindowsEventIngestor:
             # script-like; updaters register harmless tasks all the time.
             if event_id == 4698 and not task_is_suspicious(fields.get("task_command", "")):
                 severity = Severity.MEDIUM
+
+            # "added to group Users / None" is a routine side effect of creating
+            # an account; only privileged groups (Administrators, RDP, ...) matter.
+            if event_id in (4728, 4732, 4756) and not fields.get("privileged_group"):
+                severity = Severity.LOW
 
             ts = event.TimeGenerated
             payload = {

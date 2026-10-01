@@ -96,7 +96,34 @@ def run_api_server(event_bus):
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
 
 
+def disable_console_quick_edit():
+    """
+    Windows only: clicking inside a Command Prompt / PowerShell window with
+    QuickEdit on puts it in "Select" mode, which PAUSES the program until
+    Esc/Enter is pressed. For a security agent that means silently missing
+    events, so switch QuickEdit off for this window.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return                                   # not a console (service, redirected)
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        if kernel32.SetConsoleMode(handle, new_mode):
+            logging.getLogger("main").info(
+                "Console QuickEdit disabled - clicking this window will no longer pause the agent")
+    except Exception:
+        pass
+
+
 async def main():
+    disable_console_quick_edit()
     # Ensure endpoint name is configured before anything else
     ensure_endpoint_config()
 

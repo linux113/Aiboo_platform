@@ -1,0 +1,9 @@
+# AiBoO TriGate - your own list of known-bad IP addresses.
+#
+# Gate 2 (Intent) raises the score when an event comes from one of these.
+# One IP address or CIDR range per line. Lines starting with # are ignored.
+# The agent re-reads this file automatically when you save it (no restart).
+#
+# Examples (remove the # to activate):
+# 185.220.101.1
+# 45.95.147.0/24

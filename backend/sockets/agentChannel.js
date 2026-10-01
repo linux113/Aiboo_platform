@@ -44,6 +44,8 @@ function trimCommandHistory() {
 // ---------------------------------------------------------------------------
 // Public entry point — called once from server bootstrap
 // ---------------------------------------------------------------------------
+export const IMPORTANCE_LEVELS = new Set(['low', 'normal', 'high', 'critical']);
+
 export function registerAgentChannel(io) {
   const nsp = io.of('/agent-channel');
 
@@ -97,6 +99,11 @@ export function registerAgentChannel(io) {
       if (entry) {
         entry.hostname = data?.hostname || entry.hostname;
         entry.lastSeen = new Date().toISOString();
+        // TriGate: the agent reports this PC's importance (low/normal/high/critical)
+        if (IMPORTANCE_LEVELS.has(String(data?.importance || ''))) {
+          entry.importance = String(data.importance);
+        }
+        if (data?.trigate) entry.trigate = data.trigate;
       }
       logger.info(
         `Agent registered: ${endpointId} (${data?.hostname || 'unknown'})`
@@ -120,6 +127,12 @@ export function registerAgentChannel(io) {
         cmd.completedAt = new Date().toISOString();
         cmd.error = data.error || null;
         if (data.result && typeof data.result === 'object') cmd.result = data.result;
+        // Importance confirmed by the agent -> remember + tell dashboards
+        if (cmd.action === 'set_importance' && data.status === 'executed' && entry &&
+            IMPORTANCE_LEVELS.has(String(data.result?.importance || ''))) {
+          entry.importance = String(data.result.importance);
+          io.emit('agent:importance', { endpointId, importance: entry.importance });
+        }
       }
       io.emit('command:ack', data);
       logger.info(
@@ -195,7 +208,14 @@ export function registerAgentChannel(io) {
         endpointId: a.endpointId,
         hostname: a.hostname,
         lastSeen: a.lastSeen,
+        importance: a.importance || null,
+        trigate: a.trigate || null,
       }));
+    },
+
+    /** One recent command by id (or undefined). */
+    getCommand(cmdId) {
+      return pendingCommands.get(cmdId);
     },
 
     /** Recent commands (newest first). */

@@ -14,3 +14,8 @@ logs/
 venv/
 env/
 .vscode/
+
+# TriGate memory (per-PC history, feedback, importance) - never commit
+trigate_memory.json
+trigate_memory.json.tmp
+trigate_memory.json.bad

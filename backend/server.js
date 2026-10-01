@@ -13,6 +13,8 @@ import { errorHandler } from './middleware/error.js';
 // ✅ Import all limiters (auth, api, agent)
 import { authLimiter, apiLimiter, agentLimiter } from './middleware/rateLimiter.js';
 import logger from './utils/logger.js';
+import User from './models/User.js';
+import { warnAboutDefaultPasswords } from './utils/passwords.js';
 
 import authRoutes from './routes/auth.routes.js';
 import threatRoutes from './routes/threat.routes.js';
@@ -110,8 +112,14 @@ const PORT = process.env.PORT || 4000;
 const startServer = async () => {
   try {
     await connectDB();
-    if (process.env.NODE_ENV !== 'production' || process.env.SEED_DEMO_DATA === 'true') {
+    // Warn (in this log) about accounts that still use admin123 / analyst123.
+    warnAboutDefaultPasswords(User, logger);
+    // Sample findings/locks/actions are OFF unless explicitly requested, so a
+    // fresh install only ever shows what real agents report.
+    if (process.env.SEED_DEMO_DATA === 'true') {
       seedDemoAgentData();
+    } else {
+      logger.info('Demo data off - dashboard shows only real agent data (set SEED_DEMO_DATA=true for samples)');
     }
     server.listen(PORT, () => {
       logger.info(`AiBoO Backend running on port ${PORT}`);

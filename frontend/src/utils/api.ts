@@ -1,6 +1,6 @@
 import axios, { AxiosRequestConfig } from "axios";
 import { logger } from "./logger";
-import type { ActionRecord, ActionStats } from "./types";
+import type { ActionRecord, ActionStats } from "../types";
 
 export const API = import.meta.env.VITE_API_URL || "http://localhost:4000/api";
 export const SOCKET_URL =
@@ -122,7 +122,7 @@ export async function getActions(
   params?: ActionQueryParams
 ): Promise<ActionRecord[]> {
   try {
-    const res = await api.get(`/agent/actions${toQuery(params)}`);
+    const res = await api.get(`/agent/actions${toQuery(params as Record<string, unknown> | undefined)}`);
     const data = res.data;
     if (Array.isArray(data)) return data as ActionRecord[];
     if (Array.isArray(data?.actions)) return data.actions as ActionRecord[];

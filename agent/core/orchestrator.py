@@ -7,6 +7,10 @@ import os
 import sys
 from .event_bus import EventBus
 from gates import Gate1Perimeter, Gate2Behavioural, Gate3Adaptive, GateResponseBridge
+from gates.gate3_adaptive import current_importance
+from gates.threat_intel_lookup import configure_threat_intel
+from gates.trigate_memory import TriGateMemory, configure_memory
+from gates.trigate_patterns import configure_settings
 from log_ingestion import WindowsEventIngestor
 from core.zero_trust_pdp import ZeroTrustPDP
 from core.zero_trust_pep import ZeroTrustPEP
@@ -57,7 +61,8 @@ class Orchestrator:
         )
         from response import RealResponseEngine
 
-        # ---- Tri-gate pipeline ----
+        # ---- Tri-gate pipeline (Trust -> Intent -> Impact) ----
+        self.trigate_memory = self._setup_trigate()
         self.gate1 = Gate1Perimeter(bus)
         self.gate2 = Gate2Behavioural(bus)
         self.gate3 = Gate3Adaptive(bus)
@@ -142,6 +147,7 @@ class Orchestrator:
                 endpoint_id=self.dashboard_bridge._endpoint_id,
                 allowed_actions=REMOTE_ALLOWED_ACTIONS,
                 local_handlers=self._local_command_handlers(),
+                register_info=lambda: {"importance": current_importance()[0], "trigate": 2},
             )
 
         # ---- Process killer (demo: kills notepad.exe / calc.exe every 3s) ----
@@ -153,11 +159,69 @@ class Orchestrator:
 
     def _local_command_handlers(self) -> dict:
         """Dashboard commands handled by agent components directly."""
-        handlers = {"inject_test_event": make_test_event_handler(self.bus)}
+        handlers = {
+            "inject_test_event": make_test_event_handler(self.bus),
+            # TriGate: Endpoints page importance dropdown / Gates tab feedback
+            "set_importance": self._cmd_set_importance,
+            "trigate_feedback": self._cmd_trigate_feedback,
+        }
         if self.pseudo_lock_agent is not None:
             # Restore button on the Locks tab -> close the real decoy port
             handlers["restore_pseudo_lock"] = self.pseudo_lock_agent.remote_restore
         return handlers
+
+    def _setup_trigate(self) -> TriGateMemory:
+        """Disk memory + settings for the TriGate (all config.ini keys optional):
+
+            importance     = normal      # low / normal / high / critical
+            business_hours = 8-20        # working hours, local time
+            abuseipdb_key  =             # free key from abuseipdb.com (optional)
+        """
+        base = self.config.get('_config_dir')
+        if not base:
+            base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+                else os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
+        path = os.path.abspath(os.path.join(base, 'trigate_memory.json'))
+        mem = configure_memory(path)
+        settings = configure_settings(self.config.get('business_hours'), self.config.get('importance'))
+        configure_threat_intel(abuseipdb_key=self.config.get('abuseipdb_key', ''))
+        imp, where = current_importance()
+        log.info("TriGate: importance %s (%s), working hours %d:00-%d:00, threat intel: blocklist%s, "
+                 "memory %s", imp.upper(), where, settings.business_hours[0], settings.business_hours[1],
+                 " + AbuseIPDB" if self.config.get('abuseipdb_key') else "", path)
+        return mem
+
+    async def _cmd_set_importance(self, target: str, params: dict) -> dict:
+        """Dashboard Endpoints page: set this PC's importance (saved on disk)."""
+        value = (params or {}).get("importance") or target
+        try:
+            imp = self.trigate_memory.set_importance(value)
+        except ValueError as exc:
+            raise RuntimeError(str(exc))
+        log.warning("TriGate importance of this PC set to %s from the dashboard", imp.upper())
+        return {"importance": imp}
+
+    async def _cmd_trigate_feedback(self, target: str, params: dict) -> dict:
+        """Gates tab: 'False alarm' / 'Confirmed threat' for a decision."""
+        params = params or {}
+        kind = str(params.get("feedback") or "").strip().lower()
+        try:
+            result = self.trigate_memory.add_feedback(
+                kind, event_id=str(params.get("event_id") or target or "") or None,
+                pattern=params.get("pattern") or None, entity=params.get("entity"))
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError(str(exc).strip("'\""))
+        log.warning("TriGate feedback '%s' for %s - similar events will now score %s",
+                    kind, result["key"], "LOWER" if kind == "false_alarm" else "HIGHER")
+        return result
+
+    async def _trigate_autosave(self) -> None:
+        while True:
+            await asyncio.sleep(60)
+            try:
+                self.trigate_memory.maybe_save()
+            except Exception as exc:
+                log.debug("TriGate autosave failed: %s", exc)
 
     def _load_config(self) -> dict:
         """
@@ -181,6 +245,7 @@ class Orchestrator:
                 config.read(config_path)
                 if 'AIBOO' in config:
                     cfg = dict(config['AIBOO'])
+                    cfg['_config_dir'] = os.path.dirname(os.path.abspath(config_path))
                     cfg['remote_url'] = (cfg.get('remote_url') or '').strip().rstrip('/') \
                         or os.getenv('NODE_BACKEND', 'http://localhost:4000')
                     log.info("Loaded config from %s (backend=%s)",
@@ -203,6 +268,7 @@ class Orchestrator:
         self.gate2.start()
         self.gate3.start()
         self.bridge.start()
+        self._autosave_task = asyncio.create_task(self._trigate_autosave())
 
         # ---- Start core engines (disabled) ----
         self.correlation.start()
@@ -346,13 +412,11 @@ class Orchestrator:
         # self.response_eng.stop() if hasattr(self.response_eng, 'stop') else None
         self.correlation.stop()
 
-        # ---- Log confirmed threats from Gate 3 ----
-        fps = self.gate3.known_entities()
-        if fps:
-            log.info("Gate 3 fingerprint registry — %d confirmed threats:", len(fps))
-            for fp in fps:
-                log.info("  [%s] %s entity=%r occurrences=%d",
-                         fp.severity.value.upper(), fp.threat_type.value,
-                         fp.entity, fp.occurrences)
-        else:
-            log.info("No confirmed threats detected during this session")
+        # ---- Save TriGate memory (history, known logons, feedback) ----
+        task = getattr(self, "_autosave_task", None)
+        if task:
+            task.cancel()
+        self.trigate_memory.save(force=True)
+        st = self.trigate_memory.stats()
+        log.info("TriGate memory saved: %d events (7 days), %d known users, %d feedback entries -> %s",
+                 st["events"], st["users"], st["feedback"], st["path"])

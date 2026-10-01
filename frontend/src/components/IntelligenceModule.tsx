@@ -300,7 +300,7 @@ export default function IntelligenceModule({
             ))}
             {findings.length === 0 && (
               <p className="text-[11px] text-slate-600 py-2">
-                No agent findings yet. Send events to port 8001.
+                No agent findings yet - start the agent (python main.py) or use Agent Console → Send Event.
               </p>
             )}
           </div>

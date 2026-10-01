@@ -79,7 +79,9 @@ _MEMORY_SCAN_INTERVAL = 30
 # ---- NEW: Encrypted traffic analysis thresholds ----
 _ENCRYPTED_TRAFFIC = {
     "data_volume_threshold_gb": 10,          # >10GB in a session is suspicious
-    "suspicious_ports": {443, 993, 995, 22, 3389},  # ports often used for encrypted tunnels
+    # Remote-admin ports only. 443/993/995 (HTTPS / mail) are normal everyday
+    # traffic and were a constant source of false alarms.
+    "suspicious_ports": {22, 3389},
     "off_hours_threshold": 22,               # after 10 PM
     "early_hours_threshold": 6,              # before 6 AM
 }
@@ -308,7 +310,7 @@ class CyberThreatAgent(BaseAgent):
             result["actions"].append(ResponseAction.ISOLATE_ASSET)
 
         # Check time of day
-        now = datetime.now(timezone.utc)
+        now = datetime.now().astimezone()   # the PC's local time, not UTC
         hour = now.hour
         if hour >= _ENCRYPTED_TRAFFIC["off_hours_threshold"] or hour <= _ENCRYPTED_TRAFFIC["early_hours_threshold"]:
             # Off-hours encrypted traffic is more suspicious
@@ -322,7 +324,10 @@ class CyberThreatAgent(BaseAgent):
             result["actions"].append(ResponseAction.NOTIFY_SECURITY)
 
         # Check destination port for suspicious encrypted services
-        dst_port = p.get("dst_port")
+        try:
+            dst_port = int(p.get("dst_port") or 0)
+        except (TypeError, ValueError):
+            dst_port = 0
         if dst_port and dst_port in _ENCRYPTED_TRAFFIC["suspicious_ports"]:
             # e.g., SSH, RDP, database ports - high risk if unusual
             if result["is_anomalous"]:
@@ -493,10 +498,11 @@ class CyberThreatAgent(BaseAgent):
                 actions.append(ResponseAction.NOTIFY_SECURITY)
 
             # Build summary with new findings
-            summary_parts = [
-                f"Detected {sig or 'unknown'} from {p.get('src_ip', '?')} "
-                f"on port {p.get('dst_port', '?')} at {rate} pkt/s."
-            ]
+            head = (f"Detected {sig}" if sig else "Network event") + \
+                   f" from {p.get('src_ip', '?')} on port {p.get('dst_port', '?')}"
+            if rate:
+                head += f" at {rate} pkt/s"
+            summary_parts = [head + "."]
             if enc_result["is_anomalous"]:
                 summary_parts.append(f"Encrypted traffic anomaly: {enc_result['reason']}")
             if honeypot_result["is_honeypot"]:

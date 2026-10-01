@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { io, Socket } from "socket.io-client";
 import { cn } from "./utils/cn";
-import api, { authH, setToken as storeToken, getToken, clearToken, API, SOCKET_URL, CV_URL, AGENT_URL, waitForCommand, apiErrorMessage } from "./utils/api";
+import api, { authH, setToken as storeToken, getToken, clearToken, API, SOCKET_URL, waitForCommand, apiErrorMessage } from "./utils/api";
 import { logger } from "./utils/logger";
 import Login from "./Login";
 import TopBar from "./components/TopBar";
@@ -95,9 +95,11 @@ export default function App() {
   const [userName, setUserName] = useState("Akshay Upadhyay");
   const [userEmail, setUserEmail] = useState("admin@example.com");
   const [userRole, setUserRole] = useState("Admin");
+  const [mustChangePw, setMustChangePw] = useState(() => localStorage.getItem("aiboo_must_change_pw") === "1");
   const socketRef = useRef<Socket | null>(null);
   const [connected, setConnected] = useState(false);
   const [agentOnline, setAgentOnline] = useState<boolean | null>(null);
+  const [agentNames, setAgentNames] = useState<string[]>([]);
   const [cvOnline, setCvOnline] = useState<boolean | null>(null);
   const [initialLoad, setInitialLoad] = useState(true);
   const [selectedEndpoint, setSelectedEndpoint] = useState<string | null>(null);
@@ -404,8 +406,20 @@ export default function App() {
     if (!token) return;
     const check = async () => {
       try { await api.get(`${API}/agent/findings`); } catch { return; }
-      try { await api.get(`${AGENT_URL}/health`, { timeout: 2000 }); setAgentOnline(true); } catch { setAgentOnline(false); }
-      try { await api.get(`${CV_URL}/health`, { timeout: 2000 }); setCvOnline(true); } catch { setCvOnline(false); }
+      // Ask the backend which agents are connected on the command channel.
+      // (The old check called localhost:8001 from the browser, which is the
+      // wrong port and never works when the agent is on another PC.)
+      try {
+        const r = await api.get(`${API}/agent/agents-online`, { timeout: 4000 });
+        const list: { endpointId?: string }[] = Array.isArray(r.data?.agents) ? r.data.agents : [];
+        setAgentNames(list.map(a => a.endpointId || "?"));
+        setAgentOnline(list.length > 0);
+      } catch { setAgentNames([]); setAgentOnline(false); }
+      // Camera service is optional; the backend checks it for us.
+      try {
+        const r = await api.get(`${API}/dashboard/services`, { timeout: 5000 });
+        setCvOnline(!!r.data?.cv?.online);
+      } catch { setCvOnline(false); }
     };
     check();
     const hiv = setInterval(check, 30000);
@@ -457,11 +471,14 @@ export default function App() {
     if (t && t !== "undefined") {
       storeToken(t);
       setTokenState(t);
+      setMustChangePw(localStorage.getItem("aiboo_must_change_pw") === "1");
     }
   };
 
   const handleLogout = () => {
     clearToken();
+    localStorage.removeItem("aiboo_must_change_pw");
+    setMustChangePw(false);
     socketRef.current?.disconnect();
     setTokenState(null);
   };
@@ -484,6 +501,17 @@ export default function App() {
       <main className="relative flex-1 overflow-hidden bg-gradient-to-br from-[#020617] via-slate-950 to-slate-950/90" style={{ height: "calc(100vh - 56px)" }}>
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.08),transparent_60%),radial-gradient(circle_at_bottom,_rgba(15,118,110,0.15),transparent_60%)] opacity-80" />
         <div className="relative z-10 flex h-full flex-col">
+          {mustChangePw && (
+            <div className="mx-5 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs text-red-200 flex-shrink-0">
+              <span>⚠️ You are logged in with a <b>default password</b>. Anyone who knows it can log in. Please change it now.</span>
+              <button
+                onClick={() => setActive("settings")}
+                className="rounded-lg border border-red-400/50 bg-red-500/20 px-3 py-1 font-semibold text-red-100 hover:bg-red-500/30"
+              >
+                Change password
+              </button>
+            </div>
+          )}
           <div className="flex items-center justify-between px-5 pt-3 pb-2 text-[11px] flex-shrink-0">
             <div className="flex items-center gap-2">
               <span className="rounded-full border border-slate-700/80 bg-slate-900/80 px-2.5 py-0.5 text-[10px] uppercase tracking-[0.16em] text-slate-400">
@@ -497,8 +525,8 @@ export default function App() {
               <span title="Socket" className={cn("flex items-center gap-1 rounded-full border px-1.5 py-0.5", connected ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300" : "border-red-500/40 bg-red-500/10 text-red-300")}>
                 <span className={cn("h-1.5 w-1.5 rounded-full", connected ? "bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.9)]" : "bg-red-400")} />{connected ? "Live" : "Off"}
               </span>
-              {agentOnline !== null && <span title="Agent Service" className={cn("rounded-full border px-1.5 py-0.5", agentOnline ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-amber-500/30 bg-amber-500/10 text-amber-300")}>Agent {agentOnline ? "✓" : "?"}</span>}
-              {cvOnline !== null && <span title="CV Service" className={cn("rounded-full border px-1.5 py-0.5", cvOnline ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-amber-500/30 bg-amber-500/10 text-amber-300")}>CV {cvOnline ? "✓" : "?"}</span>}
+              {agentOnline !== null && <span title={agentOnline ? `Connected agents: ${agentNames.join(", ")}` : "No agent connected to the backend"} className={cn("rounded-full border px-1.5 py-0.5", agentOnline ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-amber-500/30 bg-amber-500/10 text-amber-300")}>{agentOnline ? `Agent${agentNames.length > 1 ? `s ${agentNames.length}` : ""} ✓` : "Agent ✗"}</span>}
+              {cvOnline !== null && <span title={cvOnline ? "Camera (CV) service running" : "Camera (CV) service not running - optional, only needed for cameras"} className={cn("rounded-full border px-1.5 py-0.5", cvOnline ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300" : "border-slate-600/40 bg-slate-800/40 text-slate-400")}>{cvOnline ? "CV ✓" : "CV off"}</span>}
             </div>
           </div>
           <div className="flex-1 overflow-auto px-5 pb-4 pt-1 min-h-0">
@@ -537,7 +565,18 @@ export default function App() {
                     selectedEndpoint={selectedEndpoint}
                   />
                 )}
-                {active === "settings" && <SettingsModule userName={userName} userEmail={userEmail} userRole={userRole} />}
+                {active === "settings" && (
+                  <SettingsModule
+                    userName={userName}
+                    userEmail={userEmail}
+                    userRole={userRole}
+                    mustChangePassword={mustChangePw}
+                    onPasswordChanged={() => {
+                      localStorage.removeItem("aiboo_must_change_pw");
+                      setMustChangePw(false);
+                    }}
+                  />
+                )}
               </>
             )}
           </div>

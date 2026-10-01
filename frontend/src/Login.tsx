@@ -61,6 +61,9 @@ export default function Login({
       if (!token) return setError("No token received.");
       if (token === "undefined")
         return setError("Invalid token received from server.");
+      // Backend says this account still uses a default password (e.g. admin123)
+      if (res.data?.mustChangePassword) localStorage.setItem("aiboo_must_change_pw", "1");
+      else localStorage.removeItem("aiboo_must_change_pw");
       onLogin(token);
     } catch (err: unknown) {
       const e = err as {

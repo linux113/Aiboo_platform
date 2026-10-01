@@ -33,7 +33,7 @@ const PLAYBOOKS: Playbook[] = [
   {
     id: "isolate", label: "Isolate Host", critical: true, kind: "dispatch", action: "isolate_asset",
     targetLabel: "IP address to cut off", placeholder: "e.g. 203.0.113.50",
-    explain: "Adds a Windows Firewall rule on the selected PC that blocks all traffic to and from this IP. (Remove the rule in Windows Firewall to undo.)",
+    explain: "Adds a Windows Firewall rule on the selected PC that blocks incoming traffic from this IP. (Remove the rule in Windows Firewall to undo.)",
   },
   {
     id: "lock", label: "Lock Perimeter", kind: "dispatch", action: "pseudo_lock",
@@ -122,8 +122,19 @@ export default function DashboardModule({
     };
   }, [openPlaybook]);
 
-  const open = (Array.isArray(threats) ? threats : []).filter((t: any) => t?.status === "open").length;
-  const crit = (Array.isArray(findings) ? findings : []).filter((f) => f.severity === "critical").length;
+  // "Open Threats" = open threat reports (database) + serious agent findings
+  // from the last 24h. The old card showed only the first (usually 0) with the
+  // all-time critical-finding count underneath, so the numbers never matched.
+  const openReports = (Array.isArray(threats) ? threats : []).filter((t) => t?.status === "open").length;
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const recentFindings = (Array.isArray(findings) ? findings : []).filter((f) => {
+    const ts = Date.parse(f.timestamp || "");
+    return Number.isNaN(ts) || ts >= dayAgo;
+  });
+  const crit = recentFindings.filter((f) => f.severity === "critical").length;
+  const high = recentFindings.filter((f) => f.severity === "high").length;
+  const open = openReports + crit + high;
+  const openSub = `${crit} critical · ${high} high (24h)` + (openReports ? ` · ${openReports} reports` : "");
   const online = (Array.isArray(cameras) ? cameras : []).filter((c) => c.status === "online").length;
   const weapons = (Array.isArray(detections) ? detections : []).filter((d) => d.type?.includes("weapon")).length;
 
@@ -202,7 +213,7 @@ export default function DashboardModule({
       <div className="flex flex-col gap-4">
         {/* KPI row */}
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          <KPI label="Open Threats" value={open} sub={`${crit} critical findings`} red={crit > 0} />
+          <KPI label="Open Threats" value={open} sub={openSub} red={crit > 0} />
           <KPI label="Cameras Online" value={`${online}/${cameras.length}`} sub="YOLOv8 active" cyan />
           <KPI label="Weapon Alerts" value={weapons} sub="Camera detections" red={weapons > 0} />
           <KPI label="Pseudo-Locks" value={activeLocks} sub="Active endpoint locks" amber={activeLocks > 0} />
@@ -290,7 +301,7 @@ export default function DashboardModule({
             <div className="flex-1 space-y-2 overflow-auto pr-1">
               {threats.length === 0 && findings.length === 0 && (
                 <p className="py-6 text-center text-[11px] text-slate-600">
-                  Send events to agent on port 8001
+                  No findings yet - start the agent (python main.py) or use Agent Console → Send Event
                 </p>
               )}
               {correlated.slice(0, 2).map((a) => (

@@ -11,7 +11,9 @@ class AgentConfig:
     internal_key: str = os.getenv("INTERNAL_API_KEY", "internal-dev-key")
     backend_url: str = os.getenv("NODE_BACKEND", "http://localhost:4000")
     backend_email: str = os.getenv("BACKEND_EMAIL", "admin@example.com")
-    backend_password: str = os.getenv("BACKEND_PASSWORD", "admin123")
+    # Not used for agent->backend auth (that uses AGENT_API_KEY). No built-in
+    # default password any more.
+    backend_password: str = os.getenv("BACKEND_PASSWORD", "")
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     db_type: str = os.getenv("DB_TYPE", "memory")
     db_url: str = os.getenv("DATABASE_URL", "")

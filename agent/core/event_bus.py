@@ -75,4 +75,18 @@ class EventBus:
             log.warning("No subscribers for event type %s", event_type.__name__)
             return
         log.debug("Publishing %s to %d subscribers", event_type.__name__, len(handlers))
-        await asyncio.gather(*(h(event) for h in handlers))
+        # One broken subscriber must not crash the publisher or hide the event
+        # from the other subscribers - log the error and carry on.
+        await asyncio.gather(*(self._call_safely(h, event) for h in handlers))
+
+    @staticmethod
+    async def _call_safely(handler: Handler, event: Any) -> None:
+        name = getattr(handler, "__qualname__", repr(handler))
+        try:
+            result = handler(event)
+            if asyncio.iscoroutine(result) or isinstance(result, asyncio.Future):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Subscriber %s failed on %s", name, type(event).__name__)

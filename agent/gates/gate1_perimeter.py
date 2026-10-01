@@ -1,414 +1,264 @@
 """
-gates/gate1_perimeter.py — Gate 1: Perimeter Intelligence (Zero Trust Edition)
+gates/gate1_perimeter.py - TriGate Gate 1: TRUST  ("who is this, and can we trust them?")
 
-The first and fastest gate. Now also performs Zero Trust checks:
-  - Device fingerprint verification
-  - Geo‑velocity detection
-  - Behavioural risk scoring (if available)
-  - Dynamic MFA and access decisions based on risk level
+Every ThreatEvent goes through Gate 1. It produces a Trust score 0-100
+(100 = fully trusted, 0 = not trusted at all) from REAL Windows data:
 
-Verdicts:
-  PASS     → threat score too low, event allowed through (still logged)
-  HOLD     → suspicious, insufficient confidence — forward to Gate 2
-  BLOCK    → known signature or clear violation — respond immediately
-  ESCALATE → critical severity + high confidence — skip Gate 2, go to Gate 3
+  * failed logons / password guessing (brute force)       -> trust down
+  * remote logon (RDP / network / clear-text) vs local    -> remote = down, local = up
+  * internet IP vs LAN IP                                 -> internet = down
+  * user / IP seen before in successful logons (memory)  -> known = up, new = down
+  * user name that does not exist, account lockout       -> down
+  * logon attempt from another computer (workstation)    -> down
+  * account created only hours ago, gave rights to self  -> down
+  * analyst said "False alarm" for this before           -> up
+
+Gate 1 never drops an event: it always forwards its decision to Gate 2.
+(The old 5-second de-duplication + burst filter is gone - it hid brute
+force. Only a true duplicate of the same Windows record is skipped.)
 """
 
 from __future__ import annotations
-from collections import defaultdict
-from datetime import datetime, timedelta
-import asyncio
+
 import logging
-from typing import Optional, Dict, Any
+from collections import OrderedDict
+from typing import Any
 
 from core.event_bus import EventBus
-from core.events import (
-    GateDecision, GateLevel, GateVerdict,
-    ResponseAction, Severity, ThreatEvent, ThreatType,
-    RiskLevel,
+from core.events import GateDecision, GateLevel, GateVerdict, Severity, ThreatEvent
+from gates.trigate_memory import get_memory
+from gates.trigate_patterns import (
+    clean, classify, ip_kind, local_time, logon_kind, test_event_intent,
 )
-from utils.device_fingerprint import get_device_fingerprinter
-from utils.geo_velocity import GeoVelocityDetector, GeoLocation
 
-log = logging.getLogger("Gate1.Perimeter")
+log = logging.getLogger("Gate1.Trust")
 
-# Known malicious signatures — immediate BLOCK
-_BLOCK_SIGNATURES = {
-    "RANSOMWARE_C2", "RCE_EXPLOIT", "SQL_INJECTION",
-    "DATA_EXFIL", "ZERO_DAY_EXPLOIT",
-}
-
-# Suspicious but not conclusive — HOLD for Gate 2
-_HOLD_SIGNATURES = {
-    "SSH_BRUTE_FORCE", "PORT_SCAN", "DNS_TUNNELING",
-    "UNUSUAL_OUTBOUND", "CREDENTIAL_SPRAY",
-}
-
-# Packet rate → severity uplift
-_RATE_MAP: list[tuple[int, Severity]] = [
-    (15_000, Severity.CRITICAL),
-    (8_000,  Severity.HIGH),
-    (3_000,  Severity.MEDIUM),
-]
-
-# Physical zones only accessible during business hours (06:00–22:00)
-_RESTRICTED_ZONES = {"server_room", "server_room_anteroom", "data_vault"}
+TRUST_START = 70          # neutral starting point
+_LOGON_PATTERNS = {"brute_force", "failed_logon", "account_lockout", "explicit_credentials"}
+_SEEN_MAX = 5000
 
 
-class Gate1Perimeter:
+def _factor(points: int, text: str) -> dict:
+    return {"points": int(points), "text": text}
+
+
+def _clamp(v: float) -> int:
+    return int(max(0, min(100, round(v))))
+
+
+def trust_level(score: int) -> str:
+    return "trusted" if score >= 70 else "uncertain" if score >= 40 else "untrusted"
+
+
+def build_context(event: ThreatEvent) -> dict:
+    """Everything the three gates need about one event (JSON-safe)."""
+    p = event.payload or {}
+    pat = classify(event)
+    user = clean(p.get("user_id"))
+    actor = clean(p.get("actor"))
+    target = clean(p.get("target_user"))
+
+    if pat.key in _LOGON_PATTERNS or not actor:
+        entity = user or actor or clean(p.get("entity_id"))
+    else:
+        entity = actor                                   # admin change: who did it
+    subject = target or user or entity                   # who / what it was done to
+
+    command = clean(p.get("image_path")) or clean(p.get("task_command")) or clean(p.get("command_line"))
+    try:
+        attempts = int(p.get("failed_attempts") or 0)
+    except (TypeError, ValueError):
+        attempts = 0
+    try:
+        anomaly = float(p.get("anomaly_score") or 0)
+    except (TypeError, ValueError):
+        anomaly = 0.0
+    src_ip = clean(p.get("src_ip"))
+    when = local_time(event.timestamp)
+    return {
+        "event_id": event.event_id,
+        "source": event.source,
+        "threat_type": getattr(event.threat_type, "value", str(event.threat_type)),
+        "severity_in": getattr(event.severity, "value", str(event.severity)),
+        "pattern": pat.key,
+        "pattern_label": pat.label,
+        "mitre_id": pat.mitre_id,
+        "mitre_name": pat.mitre_name,
+        "event_id_raw": p.get("event_id_raw"),
+        "description": str(p.get("description") or p.get("message") or pat.label)[:300],
+        "entity": entity,
+        "subject": subject,
+        "user_id": user,
+        "actor": actor,
+        "target_user": target,
+        "src_ip": src_ip,
+        "ip_kind": ip_kind(src_ip),
+        "logon_type": clean(p.get("logon_type")),
+        "logon_kind": logon_kind(p.get("logon_type")) or ("runas" if pat.key == "explicit_credentials" else ""),
+        "failure_reason": clean(p.get("failure_reason")),
+        "failed_attempts": attempts,
+        "workstation": clean(p.get("workstation")),
+        "computer": clean(p.get("computer_name")),
+        "group": clean(p.get("group")),
+        "privileged_group": bool(p.get("privileged_group")),
+        "service_name": clean(p.get("service_name")),
+        "task_name": clean(p.get("task_name")),
+        "command": command[:300],
+        "anomaly_score": anomaly,
+        "test_event": bool(p.get("test_event")),
+        "test_intent": test_event_intent(event),
+        "local_time": when.strftime("%Y-%m-%d %H:%M"),
+        "local_hour": when.hour,
+        "local_minute": when.minute,
+    }
+
+
+def score_trust(ctx: dict, memory=None) -> tuple[int, list[dict]]:
+    """Trust score 0-100 + the list of reasons (points can be + or -)."""
+    mem = memory or get_memory()
+    f: list[dict] = []
+    pat = ctx["pattern"]
+    entity, subject = ctx["entity"], ctx["subject"]
+
+    if not entity:
+        f.append(_factor(-15, "Could not tell which user did this"))
+
+    # --- authentication confidence -----------------------------------
+    if pat == "brute_force":
+        n = ctx["failed_attempts"] or 5
+        f.append(_factor(-35, f"{n} failed logons in a few minutes (password guessing)"))
+    elif pat == "failed_logon":
+        f.append(_factor(-10, f"Failed logon ({ctx['failure_reason'] or 'wrong password'})"))
+    if "does not exist" in ctx["failure_reason"].lower():
+        f.append(_factor(-10, "Tried a user name that does not exist (guessing names)"))
+    if pat == "account_lockout" or "locked out" in ctx["failure_reason"].lower():
+        f.append(_factor(-15, "The account got locked out"))
+
+    # --- how they logged on --------------------------------------------
+    lk = ctx["logon_kind"]
+    if lk == "clear_text":
+        f.append(_factor(-25, "Password sent in clear text over the network"))
+    elif lk == "remote":
+        f.append(_factor(-15, f"Remote logon ({ctx['logon_type']})"))
+    elif lk == "runas":
+        if ctx["actor"] and ctx["user_id"] and ctx["actor"].lower() != ctx["user_id"].lower():
+            f.append(_factor(-5, f"'{ctx['actor']}' used the password of '{ctx['user_id']}' (RunAs)"))
+        else:
+            f.append(_factor(-5, "Logon with different credentials (RunAs)"))
+    elif lk == "local":
+        f.append(_factor(+5, "Logon at this PC's own keyboard (local)"))
+
+    # --- where from -----------------------------------------------------
+    ip, kind = ctx["src_ip"], ctx["ip_kind"]
+    if kind == "public":
+        f.append(_factor(-20, f"Came from an internet address ({ip})"))
+    elif kind == "private":
+        f.append(_factor(-5, f"Came from another PC on the network ({ip})"))
+    ws, me = ctx["workstation"].lower(), ctx["computer"].lower().split(".")[0]
+    if ws and me and ws != me and kind not in ("public", "private"):
+        f.append(_factor(-10, f"Logon attempt came from another computer '{ctx['workstation']}'"))
+
+    # --- memory: is this user / IP known? ------------------------------
+    if entity:
+        known_user = mem.user_known(entity)
+        if known_user:
+            f.append(_factor(+10, f"'{entity}' normally logs in on this PC"))
+        elif pat in _LOGON_PATTERNS:
+            f.append(_factor(-10, f"'{entity}' has never logged in successfully on this PC"))
+        if kind in ("public", "private") and known_user:
+            if mem.ip_known_for_user(entity, ip):
+                f.append(_factor(+10, f"'{entity}' has logged in from {ip} before"))
+            else:
+                f.append(_factor(-10, f"First time '{entity}' is seen from {ip}"))
+
+    # --- the account that was changed ----------------------------------
+    if pat in ("admin_group_add", "group_add") and subject:
+        age = mem.hours_since(pattern="account_created", subject=subject)
+        if age is not None and age <= 24:
+            f.append(_factor(-20, f"'{subject}' was created only {_ago(age)} ago"))
+        if entity and subject.lower() == entity.lower():
+            f.append(_factor(-15, "The user gave rights to their own account"))
+
+    # --- learning from the analyst --------------------------------------
+    fb = mem.feedback_for(pat, entity)
+    if fb["false_alarm"]:
+        f.append(_factor(min(20, 10 * fb["false_alarm"]),
+                         f"You marked this as a false alarm before ({fb['false_alarm']}x)"))
+
+    score = _clamp(TRUST_START + sum(x["points"] for x in f))
+    return score, f
+
+
+def _ago(hours: float) -> str:
+    if hours < 1:
+        return f"{max(1, int(hours * 60))} min"
+    return f"{hours:.0f} h"
+
+
+class Gate1Trust:
     def __init__(self, bus: EventBus) -> None:
         self.bus = bus
-        # Noise filtering attributes
-        self._recent_events: dict[str, list[datetime]] = defaultdict(list)
-        self._duplicate_window_seconds = 5
-        self._burst_window_seconds = 10
-        self._max_events_per_burst = 3
-
-        # ---- Zero Trust utilities ----
-        self._fingerprinter = get_device_fingerprinter()
-        self._geo_detector = GeoVelocityDetector()
-        # Cache previous locations per user for geo‑velocity checks
-        self._prev_locations: Dict[str, Dict[str, Any]] = {}
-        # Cache trusted device fingerprints per user
-        self._trusted_device_hashes: Dict[str, str] = {}
+        self._seen: "OrderedDict[str, None]" = OrderedDict()
 
     def start(self) -> None:
         self.bus.subscribe(ThreatEvent, self._evaluate)
-        log.info("Gate 1 — Perimeter Intelligence (Zero Trust) — ACTIVE")
+        log.info("Gate 1 (Trust) online - every event is scored, nothing is dropped")
+
+    def _is_true_duplicate(self, event: ThreatEvent) -> bool:
+        """Same Windows record read twice (e.g. after a reconnect)."""
+        rec = (event.payload or {}).get("record_number")
+        if rec in (None, ""):
+            return False
+        key = f"{event.source}|{(event.payload or {}).get('log_name', '')}|{rec}"
+        if key in self._seen:
+            return True
+        self._seen[key] = None
+        if len(self._seen) > _SEEN_MAX:
+            self._seen.popitem(last=False)
+        return False
 
     async def _evaluate(self, event: ThreatEvent) -> None:
-        # 1. Deduplicate
-        if self._is_duplicate(event):
-            log.debug("Filtered duplicate event: %s", event.event_id)
+        if self._is_true_duplicate(event):
+            log.debug("Gate 1: skipped duplicate Windows record %s", event.payload.get("record_number"))
             return
-
-        # 2. Burst detection - don't flood pipeline
-        if self._is_burst(event):
-            log.debug("Filtered burst event: %s", event.event_id)
-            return
-
-        # 3. Track for future dedup
-        self._track_event(event)
-
-        # 4. Calculate data completeness (real-world data is often partial)
-        completeness = self._calculate_completeness(event)
-
-        await asyncio.sleep(0.01)   # fast — sub-10ms perimeter check
-
-        verdict, confidence, reason, actions, severity = self._score_with_noise(event, completeness)
-
+        ctx = build_context(event)
+        score, factors = score_trust(ctx)
+        level = trust_level(score)
+        verdict = GateVerdict.PASS if score >= 70 else GateVerdict.HOLD if score >= 40 else GateVerdict.BLOCK
+        top = "; ".join(x["text"] for x in sorted(factors, key=lambda x: x["points"])[:2]) or "nothing unusual"
         decision = GateDecision(
-            gate        = GateLevel.GATE_1,
-            event_id    = event.event_id,
-            threat_type = event.threat_type,
-            severity    = severity,
-            verdict     = verdict,
-            confidence  = round(confidence, 2),
-            reason      = reason,
-            actions     = actions,
-            metadata    = {
-                "source": event.source,
-                "payload": event.payload,
-                "data_completeness": completeness,
-                "zerotrust_checks": {
-                    "geo_risk": self._prev_locations.get(event.payload.get("user_id", ""), {}).get("risk", 0.0),
-                    "device_trusted": self._check_device_trust(event),
-                }
+            gate=GateLevel.GATE_1,
+            event_id=event.event_id,
+            threat_type=event.threat_type,
+            severity=event.severity,
+            verdict=verdict,
+            confidence=round(min(0.95, 0.55 + 0.05 * len(factors)), 2),
+            reason=f"Trust {score}/100 ({level}): {top}",
+            actions=[],
+            metadata={
+                "payload": _slim_payload(event.payload or {}, ctx),
+                "trigate": {
+                    "context": ctx,
+                    "trust": {"score": score, "level": level, "factors": factors},
+                },
             },
         )
-
-        log.info(
-            "Gate 1 [%s] → %s (conf=%.2f) — %s",
-            event.event_id, verdict.value, confidence, reason,
-        )
+        log.info("Gate 1 Trust %d (%s) for %s [%s]", score, level, ctx["entity"] or "?", ctx["pattern"])
         await self.bus.publish(decision)
 
-    def _score_with_noise(
-        self, event: ThreatEvent, completeness: float
-    ) -> tuple[GateVerdict, float, str, list[ResponseAction], Severity]:
-        p        = event.payload
-        severity = event.severity
-        actions  = [ResponseAction.LOG]
 
-        # Calculate confidence penalty for incomplete data
-        confidence_penalty = (1 - completeness) * 0.3
+def _slim_payload(p: dict, ctx: dict) -> dict:
+    """Small payload kept on the decision (used by the response engine).
 
-        # ── Network intrusion ─────────────────────────────────────
-        if event.threat_type == ThreatType.NETWORK_INTRUSION:
-            sig  = p.get("signature", "")
-            rate = p.get("packet_rate", 0)
-            anomaly_score = p.get("anomaly_score", 0)
+    user_id is set to the account an action should apply to: for "user X
+    was added to Administrators" that is X - NOT the admin who did it."""
+    out = {k: p.get(k) for k in ("event_id_raw", "record_number", "computer_name", "src_ip",
+                                 "device_id", "description", "pid", "process_name")
+           if p.get(k) not in (None, "")}
+    out["user_id"] = ctx["subject"] or ctx["entity"] or "unknown"
+    out["actor"] = ctx["actor"] or ctx["entity"]
+    return out
 
-            for threshold, sev in _RATE_MAP:
-                if rate >= threshold:
-                    severity = sev
-                    break
 
-            # Critical signatures - even with low completeness
-            if sig in _BLOCK_SIGNATURES:
-                confidence = 0.95 - confidence_penalty
-                actions += [ResponseAction.ISOLATE_ASSET, ResponseAction.PSEUDO_LOCK,
-                            ResponseAction.ALERT_DASHBOARD]
-                verdict = GateVerdict.ESCALATE if severity == Severity.CRITICAL \
-                          else GateVerdict.BLOCK
-                return verdict, confidence, f"Known malicious signature: {sig}", actions, severity
-
-            # High anomaly score from statistical baseline
-            if anomaly_score > 2.5:
-                confidence = 0.85 - confidence_penalty
-                actions += [ResponseAction.ISOLATE_ASSET, ResponseAction.ALERT_DASHBOARD]
-                return GateVerdict.BLOCK, confidence, f"Statistical anomaly (z={anomaly_score:.1f})", actions, Severity.HIGH
-
-            if sig in _HOLD_SIGNATURES:
-                actions.append(ResponseAction.ALERT_DASHBOARD)
-                return GateVerdict.HOLD, 0.60, \
-                       f"Suspicious signature {sig} — forwarding to Gate 2", actions, severity
-
-            if severity in (Severity.HIGH, Severity.CRITICAL):
-                actions.append(ResponseAction.ALERT_DASHBOARD)
-                return GateVerdict.HOLD, 0.50, \
-                       f"High packet rate ({rate}/s) — forwarding to Gate 2", actions, severity
-
-            return GateVerdict.PASS, 0.20, "Traffic within normal bounds", actions, severity
-
-        # ── Identity mismatch (with Zero Trust enhancements) ─────
-        if event.threat_type == ThreatType.IDENTITY_MISMATCH:
-            bio   = float(p.get("biometric_score", 1.0))
-            loc   = p.get("detected_location", "")
-            anomaly_score = p.get("anomaly_score", 0)
-            user_id = p.get("user_id", "unknown")
-
-            # ---- Zero Trust: Device fingerprint check ----
-            device_trusted = self._check_device_trust(event)
-            device_risk = 0.0 if device_trusted else 0.4
-
-            # ---- Zero Trust: Geo‑velocity check ----
-            geo_risk, geo_reason = self._check_geo_velocity(user_id, loc, event.timestamp)
-
-            # ---- Combine scores ----
-            confidence = 0.40  # base
-            if bio < 0.30:
-                confidence += 0.30
-            elif bio < 0.60:
-                confidence += 0.15
-
-            if loc and "unknown" in loc.lower():
-                confidence += 0.20
-
-            if anomaly_score > 2:
-                confidence += 0.15
-
-            # Add Zero Trust penalties
-            confidence += geo_risk * 0.4
-            confidence += device_risk * 0.3
-
-            # Apply confidence penalty for incomplete data
-            confidence -= confidence_penalty
-            confidence = max(0.0, min(confidence, 1.0))
-
-            # ---- Determine actions and verdict ----
-            if confidence >= 0.85:
-                verdict = GateVerdict.ESCALATE
-                severity = Severity.CRITICAL
-                actions += [ResponseAction.BLOCK_ACCESS, ResponseAction.FORCE_LOGOUT,
-                            ResponseAction.ESCALATE_SOC, ResponseAction.NOTIFY_SECURITY]
-                if not device_trusted:
-                    actions.append(ResponseAction.QUARANTINE_DEVICE)
-                reason = f"Critical identity failure: bio={bio:.2f}, loc={loc!r}, geo_risk={geo_risk:.2f}, device={'untrusted' if not device_trusted else 'trusted'}"
-            elif confidence >= 0.65:
-                verdict = GateVerdict.BLOCK
-                severity = Severity.HIGH
-                actions += [ResponseAction.REVOKE_IDENTITY, ResponseAction.STEP_UP_AUTH,
-                            ResponseAction.CHALLENGE_MFA, ResponseAction.NOTIFY_SECURITY]
-                reason = f"High identity risk: bio={bio:.2f}, geo_risk={geo_risk:.2f}"
-            elif confidence >= 0.40:
-                verdict = GateVerdict.HOLD
-                severity = Severity.MEDIUM
-                actions += [ResponseAction.ALERT_DASHBOARD, ResponseAction.STEP_UP_AUTH]
-                reason = f"Suspicious identity: bio={bio:.2f}, geo_risk={geo_risk:.2f} — forwarding to Gate 2"
-            else:
-                verdict = GateVerdict.PASS
-                reason = "Identity pre-screen passed"
-
-            actions = list(dict.fromkeys(actions))  # deduplicate
-            return verdict, confidence, reason, actions, severity
-
-        # ── Physical intrusion ────────────────────────────────────
-        if event.threat_type == ThreatType.PHYSICAL_INTRUSION:
-            zone  = p.get("zone", "")
-            badge = bool(p.get("badge_scan", True))
-            face  = bool(p.get("face_match", True))
-
-            if not badge and not face and zone in _RESTRICTED_ZONES:
-                actions += [ResponseAction.LOCK_ZONE, ResponseAction.ALERT_DASHBOARD,
-                            ResponseAction.NOTIFY_SECURITY]
-                return GateVerdict.ESCALATE, 0.92, \
-                       f"No auth in critical zone {zone!r}", actions, Severity.CRITICAL
-
-            if not badge or not face:
-                actions.append(ResponseAction.ALERT_DASHBOARD)
-                return GateVerdict.HOLD, 0.55, \
-                       "Partial auth failure — forwarding to Gate 2", actions, severity
-
-            return GateVerdict.PASS, 0.20, "Physical perimeter check passed", actions, severity
-
-        # ── Insider / anomalous ───────────────────────────────────
-        actions.append(ResponseAction.ALERT_DASHBOARD)
-        return GateVerdict.HOLD, 0.45, \
-               "Insider/anomalous event — Gate 2 behavioural analysis required", \
-               actions, severity
-
-    # ── Zero Trust helper methods ─────────────────────────────────────────
-
-    def _check_device_trust(self, event: ThreatEvent) -> bool:
-        """
-        Verify device fingerprint against stored trusted fingerprint.
-        Returns True if device is trusted, False otherwise.
-        """
-        p = event.payload
-        user_id = p.get("user_id")
-        device_info = p.get("device_info", {})
-        if not user_id or not device_info:
-            return True  # no info, assume trusted (or could return False for strict)
-
-        device_id = device_info.get("device_id")
-        if not device_id:
-            return True
-
-        # Generate current fingerprint
-        current_fp = self._fingerprinter.get_fingerprint(device_id)
-
-        # Check if we have a stored fingerprint for this user
-        stored_hash = self._trusted_device_hashes.get(user_id)
-        if not stored_hash:
-            # First time: trust this device (or could require approval)
-            self._trusted_device_hashes[user_id] = current_fp.fingerprint_hash
-            return True
-
-        # Compare stored hash with current
-        return stored_hash == current_fp.fingerprint_hash
-
-    def _check_geo_velocity(self, user_id: str, location_str: str, timestamp: datetime) -> tuple[float, str]:
-        """
-        Check if travel from previous location to current is plausible.
-        Returns (risk_score, reason).
-        """
-        if not user_id or not location_str:
-            return 0.0, "No location data"
-
-        # Simple mock geocoding: use deterministic hash to generate coordinates
-        def hash_to_coords(s: str):
-            import hashlib
-            h = hashlib.md5(s.encode()).hexdigest()
-            lat = (int(h[:8], 16) % 180) - 90
-            lon = (int(h[8:16], 16) % 360) - 180
-            return lat, lon
-
-        prev = self._prev_locations.get(user_id)
-        if not prev:
-            cur_lat, cur_lon = hash_to_coords(location_str)
-            self._prev_locations[user_id] = {
-                "location": location_str,
-                "timestamp": timestamp,
-                "lat": cur_lat,
-                "lon": cur_lon,
-                "risk": 0.0,
-            }
-            return 0.0, "First location recorded"
-
-        # If same location, no risk
-        if location_str == prev["location"]:
-            return 0.0, "Same location"
-
-        cur_lat, cur_lon = hash_to_coords(location_str)
-        prev_lat = prev.get("lat", 0.0)
-        prev_lon = prev.get("lon", 0.0)
-
-        loc1 = GeoLocation(
-            latitude=prev_lat,
-            longitude=prev_lon,
-            timestamp=prev["timestamp"],
-            location_name=prev["location"]
-        )
-        loc2 = GeoLocation(
-            latitude=cur_lat,
-            longitude=cur_lon,
-            timestamp=timestamp,
-            location_name=location_str
-        )
-
-        is_impossible, risk, reason = self._geo_detector.detect_impossible_travel(loc1, loc2)
-
-        # Store current for next check
-        self._prev_locations[user_id] = {
-            "location": location_str,
-            "timestamp": timestamp,
-            "lat": cur_lat,
-            "lon": cur_lon,
-            "risk": risk,
-        }
-
-        if is_impossible:
-            return risk, reason
-        else:
-            return risk * 0.5, reason  # scale down for lower risk
-
-    # ── Noise filtering helper methods (unchanged) ────────────────
-
-    def _is_duplicate(self, event: ThreatEvent) -> bool:
-        """Check if identical event occurred recently"""
-        fingerprint = self._fingerprint(event)
-        now = datetime.now()
-        cutoff = now - timedelta(seconds=self._duplicate_window_seconds)
-        self._recent_events[fingerprint] = [t for t in self._recent_events[fingerprint] if t > cutoff]
-        return len(self._recent_events[fingerprint]) > 0
-
-    def _fingerprint(self, event: ThreatEvent) -> str:
-        """Create event fingerprint for deduplication"""
-        p = event.payload
-        key_fields = [
-            event.threat_type.value,
-            p.get("src_ip", ""),
-            p.get("user_id", ""),
-            p.get("dst_port", ""),
-            p.get("zone", ""),
-        ]
-        return ":".join(str(f) for f in key_fields if f)
-
-    def _is_burst(self, event: ThreatEvent) -> bool:
-        """Detect and filter event bursts"""
-        fingerprint = self._fingerprint(event) + ":burst"
-        now = datetime.now()
-        cutoff = now - timedelta(seconds=self._burst_window_seconds)
-        self._recent_events[fingerprint] = [t for t in self._recent_events[fingerprint] if t > cutoff]
-        return len(self._recent_events[fingerprint]) >= self._max_events_per_burst
-
-    def _track_event(self, event: ThreatEvent):
-        """Track event for future dedup/burst detection"""
-        fingerprint = self._fingerprint(event)
-        self._recent_events[fingerprint].append(datetime.now())
-        burst_fingerprint = fingerprint + ":burst"
-        self._recent_events[burst_fingerprint].append(datetime.now())
-
-    def _calculate_completeness(self, event: ThreatEvent) -> float:
-        """Calculate how complete/trustworthy the event data is"""
-        p = event.payload
-
-        expected_fields = {
-            ThreatType.NETWORK_INTRUSION: ["src_ip", "dst_port", "signature"],
-            ThreatType.IDENTITY_MISMATCH: ["user_id", "biometric_score"],
-            ThreatType.PHYSICAL_INTRUSION: ["zone", "badge_scan"],
-            ThreatType.INSIDER_THREAT: ["user_id", "unusual_data_volume_gb"],
-        }.get(event.threat_type, [])
-
-        if not expected_fields:
-            return 0.5
-
-        present = sum(1 for f in expected_fields if p.get(f))
-        completeness = present / len(expected_fields)
-
-        # Windows events often have raw string data
-        if p.get("strings") and completeness < 0.5:
-            completeness = max(completeness, 0.3)
-
-        return completeness
+# Backwards-compatible name (orchestrator / imports use Gate1Perimeter)
+Gate1Perimeter = Gate1Trust

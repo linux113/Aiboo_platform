@@ -538,3 +538,117 @@ class TestTailing:
         fake.add("Security", 1102, ["S-1", "eve", "PC", "0x1"])
         recs, last = ingestor._read_new_records("Security", last)
         assert [r.EventID for r in recs] == [1102] and last == 1
+
+
+class TestHttpsIsNotSuspicious:
+    def test_port_443_is_normal(self):
+        from agents.cyber_threat_agent import _ENCRYPTED_TRAFFIC
+        assert 443 not in _ENCRYPTED_TRAFFIC["suspicious_ports"]
+        assert {22, 3389} <= _ENCRYPTED_TRAFFIC["suspicious_ports"]
+
+
+class TestRound3Fixes:
+    def test_routine_group_add_is_low(self):
+        import yaml, pathlib
+        data = yaml.safe_load((pathlib.Path(__file__).parent.parent / "config" / "event_rules.yaml").read_text())
+        rules, channels, settings = parse_rules(data)
+        ingestor = WindowsEventIngestor(EventBus(), log_names=channels, rules=rules, settings=settings)
+        # 4732: member added to local group 'Users' (automatic on net user /add)
+        s = ["-", "S-1-5-21-1-2-3-1005", "Users", "BUILTIN", "S-1-5-32-545",
+             "S-1-5-21-1-2-3-1001", "lalit", "PC", "0x1", "-"]
+        ev = ingestor._normalize_event("Security", _raw_event(4732, s))
+        assert ev is not None and ev.severity.value == "low"
+        s[2] = "Administrators"
+        ev = ingestor._normalize_event("Security", _raw_event(4732, s))
+        assert ev.severity.value == "high"
+        assert "Administrators" in ev.payload["description"]
+
+    @pytest.mark.asyncio
+    async def test_identity_all_clear_is_low(self):
+        from agents.identity_agent import IdentityVerificationAgent
+        from core.event_bus import EventBus
+        from core.events import ThreatEvent, ThreatType, Severity
+        agent = IdentityVerificationAgent(EventBus())
+        ev = ThreatEvent(source="test-sensor", threat_type=ThreatType.IDENTITY_MISMATCH,
+                         severity=Severity.CRITICAL, payload={"src_ip": "10.0.0.1"})
+        f = await agent.analyse(ev)
+        assert f.severity == Severity.LOW
+        assert "no identity problems found" in f.summary
+
+    @pytest.mark.asyncio
+    async def test_identity_real_problem_still_alerts(self):
+        from agents.identity_agent import IdentityVerificationAgent
+        from core.event_bus import EventBus
+        from core.events import ThreatEvent, ThreatType, Severity
+        agent = IdentityVerificationAgent(EventBus())
+        ev = ThreatEvent(source="badge", threat_type=ThreatType.IDENTITY_MISMATCH,
+                         severity=Severity.HIGH,
+                         payload={"user_id": "bob", "biometric_score": 0.2,
+                                  "claimed_location": "Mumbai", "detected_location": "Moscow"})
+        f = await agent.analyse(ev)
+        assert f.severity in (Severity.HIGH, Severity.CRITICAL)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sig,locks", [("RANSOMWARE_C2", True), ("SQL_INJECTION", True),
+                                           ("SSH_BRUTE_FORCE", True), ("PORT_SCAN", False)])
+    async def test_send_event_signatures(self, sig, locks):
+        from agents.cyber_threat_agent import CyberThreatAgent
+        from core.event_bus import EventBus
+        from core.events import ThreatEvent, ThreatType, Severity, ResponseAction
+        agent = CyberThreatAgent(EventBus())
+        ev = ThreatEvent(source="test-sensor", threat_type=ThreatType.NETWORK_INTRUSION,
+                         severity=Severity.HIGH,
+                         payload={"src_ip": "10.0.0.1", "dst_port": 443, "signature": sig})
+        f = await agent.analyse(ev)
+        assert (ResponseAction.PSEUDO_LOCK in f.actions) is locks
+        assert "suspicious port 443" not in f.summary
+
+
+class TestAuditPolicyCheck:
+    @pytest.mark.parametrize("out,expected", [
+        ("System audit policy\nCategory/Subcategory      Setting\nLogon/Logoff\n  Logon                     Success\n", False),
+        ("Logon/Logoff\n  Logon                     Success and Failure\n", True),
+        ("Logon/Logoff\n  Logon                     No Auditing\n", False),
+        ("Anmelden/Abmelden\n  Anmelden                  Erfolg\n", None),
+    ])
+    def test_parse_auditpol(self, out, expected):
+        assert WindowsEventIngestor.logon_failure_auditing(out) is expected
+
+
+class TestRunasBruteForceEndToEnd:
+    """Replay of the user's real test: 5 x `runas /user:lalit cmd` with a wrong password."""
+
+    @pytest.mark.asyncio
+    async def test_five_runas_failures_give_one_high_finding(self):
+        import yaml, pathlib, asyncio
+        from datetime import timedelta
+        from core.events import AgentFinding
+        from agents.cyber_threat_agent import CyberThreatAgent
+        from agents.zero_trust_agent import ZeroTrustAgent
+        from agents.identity_agent import IdentityVerificationAgent
+        data = yaml.safe_load((pathlib.Path(__file__).parent.parent / "config" / "event_rules.yaml").read_text())
+        rules, channels, settings = parse_rules(data)
+        bus = EventBus()
+        ing = WindowsEventIngestor(bus, log_names=channels, rules=rules, settings=settings)
+        for a in (CyberThreatAgent(bus), ZeroTrustAgent(bus), IdentityVerificationAgent(bus)):
+            a.register()
+        findings = []
+
+        async def collect(f):
+            findings.append(f)
+        bus.subscribe(AgentFinding, collect)
+
+        t0 = datetime.now()
+        for i in range(7):
+            s = ["S-1-5-21-1-2-3-1001", "lalit", "ANONMOYOUS", "0x5d7a1", "S-1-0-0", "lalit",
+                 "ANONMOYOUS", "0xc000006d", "%%2313", "0xc000006a", "2", "seclogo", "Negotiate",
+                 "ANONMOYOUS", "-", "-", "0", "0x1f4", "C:\\\\Windows\\\\System32\\\\svchost.exe", "::1", "0"]
+            ev = ing._normalize_event("Security", _raw_event(4625, s, record=100 + i,
+                                                             when=t0 + timedelta(seconds=2 * i)))
+            ev = ing._apply_brute_force(ev)
+            if ev.severity.weight >= ing.min_severity.weight:
+                await bus.publish(ev)
+        await asyncio.sleep(0.3)
+        high = [f for f in findings if f.severity.value == "high"]
+        assert len(high) == 1, [f.summary for f in findings]
+        assert "Possible password guessing: 5 failed logons for user 'lalit'" in high[0].summary

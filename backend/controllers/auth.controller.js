@@ -1,4 +1,5 @@
-import { register, login, getMe } from '../services/auth.service.js';
+import { register, login, getMe, changePassword } from '../services/auth.service.js';
+import logger from '../utils/logger.js';
 
 export const registerCtrl = async (req, res, next) => {
   try {
@@ -17,8 +18,11 @@ export const loginCtrl = async (req, res, next) => {
     if (!email || !password) {
       return res.status(400).json({ message: 'Email and password are required' });
     }
-    const { token, user } = await login(req.body);
-    res.json({ token, user });
+    const { token, user, mustChangePassword } = await login(req.body);
+    if (mustChangePassword) {
+      logger.warn(`SECURITY: ${user.email} logged in with a default password - it must be changed`);
+    }
+    res.json({ token, user, mustChangePassword });
   } catch (err) { next(err); }
 };
 
@@ -26,5 +30,13 @@ export const meCtrl = async (req, res, next) => {
   try {
     const user = await getMe(req.user.id);
     res.json(user);
+  } catch (err) { next(err); }
+};
+
+export const changePasswordCtrl = async (req, res, next) => {
+  try {
+    await changePassword(req.user.id, req.body || {});
+    logger.info(`Password changed for user ${req.user.email || req.user.id}`);
+    res.json({ ok: true, message: 'Password changed' });
   } catch (err) { next(err); }
 };

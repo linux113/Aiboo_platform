@@ -19,6 +19,13 @@ export interface Camera {
   status: "online" | "offline" | "error";
   stream_url?: string;
   rtsp_url?: string;
+  // fields from backend/models/Camera.js
+  streamUrl?: string;
+  enabled?: boolean;
+  type?: "ip" | "rtsp" | "mobile" | "usb";
+  resolution?: string;
+  fps?: number;
+  detectionEnabled?: boolean;
   metadata?: Record<string, unknown>;
 }
 
@@ -41,7 +48,7 @@ export interface Threat {
   source: string;
   asset: string;
   severity: Severity;
-  status: "active" | "investigating" | "contained" | "resolved";
+  status: "open" | "investigating" | "resolved";   // backend/models/Threat.js
   timestamp: string;
   description?: string;
   actions?: string[];
@@ -73,6 +80,50 @@ export interface CorrelatedAlert {
   timestamp: string;
 }
 
+// ---- TriGate (Gate 1 Trust -> Gate 2 Intent -> Gate 3 Impact) ----
+export interface TriGateFactor {
+  points: number;
+  text: string;
+}
+
+export interface TriGateScore {
+  score: number;          // 0-100
+  level: string;          // trusted/uncertain/untrusted, malicious/suspicious/..., severe/moderate/limited
+  factors: TriGateFactor[];
+}
+
+export interface TriGateRecommendation {
+  action: string;         // remote action (block_access, revoke_identity, isolate_asset) or "manual"/"log"/"notify_security"
+  target: string;
+  text: string;
+}
+
+export interface TriGateResult {
+  context?: {
+    pattern: string;
+    pattern_label: string;
+    mitre_id?: string;
+    mitre_name?: string;
+    description?: string;
+    entity?: string;
+    subject?: string;
+    src_ip?: string;
+    event_id_raw?: number | string | null;
+    local_time?: string;
+    test_event?: boolean;
+  };
+  trust?: TriGateScore;
+  intent?: TriGateScore & { mitre?: { id?: string; name?: string } };
+  impact?: TriGateScore & { importance?: Importance };
+  risk?: { score: number; level: string };
+  recommended?: TriGateRecommendation[];
+  pattern?: string;
+  entity?: string;
+  subject?: string;
+}
+
+export type Importance = "low" | "normal" | "high" | "critical";
+
 export interface GateDecision {
   gate: number;
   gate_label: string;
@@ -84,6 +135,16 @@ export interface GateDecision {
   reason: string;
   actions: string[];
   timestamp: string;
+  source?: string;
+  metadata?: { trigate?: TriGateResult; [key: string]: unknown };
+  feedback?: {
+    kind: "false_alarm" | "confirmed";
+    cmd_id?: string;
+    by?: string;
+    at?: string;
+    status?: string;
+    error?: string | null;
+  };
 }
 
 export interface PseudoLock {
@@ -245,4 +306,13 @@ export interface ActionStats {
   success_rate: number;
   failure_rate: number;
   last_action_at: string | null;
+}
+
+/** One message in the JARVIS chat panel. */
+export interface ChatMsg {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  isTyping?: boolean;
+  meta?: { confidence?: number; sources?: string };
 }

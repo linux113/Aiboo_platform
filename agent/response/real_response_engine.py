@@ -756,6 +756,22 @@ class RealResponseEngine:
                 f"net user failed: {(result.stderr or result.stdout).strip()}"
             )
         log.warning("Locked user account: %s", user_id)
+        # Double-check so the dashboard never says "Success" for nothing.
+        try:
+            check = subprocess.run(["net", "user", user_id], capture_output=True,
+                                   text=True, timeout=10)
+            for line in (check.stdout or "").splitlines():
+                if line.lower().startswith("account active"):
+                    state = line.split()[-1]
+                    if state.lower() in ("yes", "ja", "oui", "sí", "si"):
+                        raise RuntimeError(
+                            f"Windows still reports '{user_id}' as active after net user /active:no")
+                    return f"Account '{user_id}' disabled (verified: Account active = {state})"
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        return f"Account '{user_id}' disabled (net user /active:no)"
 
     async def _send_alert(self, event: Event):
         log.warning("Security alert sent for event %s", event.event_id)
