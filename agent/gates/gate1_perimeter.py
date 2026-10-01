@@ -28,7 +28,8 @@ from core.event_bus import EventBus
 from core.events import GateDecision, GateLevel, GateVerdict, Severity, ThreatEvent
 from gates.trigate_memory import get_memory
 from gates.trigate_patterns import (
-    clean, classify, ip_kind, local_time, logon_kind, test_event_intent,
+    clean, classify, ip_kind, local_account, local_time, logon_kind,
+    test_event_intent, this_pc_names,
 )
 
 log = logging.getLogger("Gate1.Trust")
@@ -50,18 +51,36 @@ def trust_level(score: int) -> str:
     return "trusted" if score >= 70 else "uncertain" if score >= 40 else "untrusted"
 
 
+def _describe(p: dict, pat, event) -> str:
+    """Best human-readable sentence for the card."""
+    for key in ("description", "message", "reason", "summary", "details"):
+        v = p.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    if pat.key == "generic":
+        tt = getattr(event.threat_type, "value", str(event.threat_type or ""))
+        src = event.source or "agent"
+        return f"{pat.label} ({str(tt).replace('_', ' ')}) reported by {src}"
+    return pat.label
+
+
 def build_context(event: ThreatEvent) -> dict:
     """Everything the three gates need about one event (JSON-safe)."""
     p = event.payload or {}
     pat = classify(event)
-    user = clean(p.get("user_id"))
-    actor = clean(p.get("actor"))
-    target = clean(p.get("target_user"))
+    # Windows writes local accounts as "THISPC\\alice"; show (and act on) "alice".
+    pcs = this_pc_names(p.get("computer_name"), p.get("device_id"))
+    user = local_account(p.get("user_id"), pcs)
+    actor = local_account(p.get("actor"), pcs)
+    target = local_account(p.get("target_user"), pcs)
 
     if pat.key in _LOGON_PATTERNS or not actor:
-        entity = user or actor or clean(p.get("entity_id"))
+        entity = user or actor or local_account(p.get("entity_id"), pcs)
     else:
         entity = actor                                   # admin change: who did it
+    pc_full = {clean(p.get("computer_name")).lower(), clean(p.get("device_id")).lower()} - {""}
+    if entity and (entity.lower() in pcs or entity.lower() in pc_full):
+        entity = ""        # the ingestor fell back to the PC name: no real user known
     subject = target or user or entity                   # who / what it was done to
 
     command = clean(p.get("image_path")) or clean(p.get("task_command")) or clean(p.get("command_line"))
@@ -85,7 +104,7 @@ def build_context(event: ThreatEvent) -> dict:
         "mitre_id": pat.mitre_id,
         "mitre_name": pat.mitre_name,
         "event_id_raw": p.get("event_id_raw"),
-        "description": str(p.get("description") or p.get("message") or pat.label)[:300],
+        "description": _describe(p, pat, event)[:300],
         "entity": entity,
         "subject": subject,
         "user_id": user,

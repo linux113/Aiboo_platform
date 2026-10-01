@@ -1,5 +1,21 @@
 # TriGate v2 – Windows test guide
 
+## Test status (PC "gorilla" / Anonmoyous, run of 1–2 Oct 2026)
+
+| Test | Status | Result seen |
+|---|---|---|
+| Setup (auditpol) | ✅ Done | all 4 commands succeeded |
+| 1 Password guessing | ✅ Done | risk 66 HIGH BLOCK (Trust 30 / Intent 80 / Impact 45) |
+| 2 False alarm / Real threat | ✅ Done | risk dropped 66 → 56; "score HIGHER" message after Real threat |
+| 3 New admin account (scores) | ✅ Done | risk 70 HIGH BLOCK, "created only 1 min ago", attack chain +15 |
+| 3 **Run** button | 🔧 Fixed – re-test needed | failed on `Anonmoyous\aibootest2`; fixed (PC-name prefix removed, never locks your own account) |
+| 4 Importance → Critical | ⏳ Pending | not done yet |
+| 5 Suspicious service | ✅ Done | risk 56 HIGH, suspicious command +15, persistence +10 |
+| 6 Send Event + blocklist IP | ✅ Done | risk 70 HIGH, blocklist +30 |
+| 7 Restart keeps memory | ❓ Confirm | likely passed if the agent was restarted before the 12:15 AM log-cleared card |
+| 8 Security log cleared | ✅ Done | risk 64 HIGH BLOCK, Intent 100, "covering tracks?" +10 |
+| Clean up | ⏳ Pending | service deleted ✅; delete aibootest / 2 / 3; remove 45.95.147.3 from blocklist |
+
 TriGate = 3 gates that **every** Windows event now goes through:
 
 | Gate | Question | Score 0–100 | High score means |
@@ -86,6 +102,8 @@ Expected 2 cards. The second: **"User added to an admin group"**, MITRE T1098, *
 - Impact ~55: `Affects administrator rights (+15)`
 - Recommended: `Disable account 'aibootest2'` → click **Run** → OK. Agent disables the account; see the **Isolation & Termination** tab.
   (It acts on **aibootest2**, never on you – the admin who made the change.)
+- Check it worked: `net user aibootest2` → `Account active  No`. Undo: `net user aibootest2 /active:yes`.
+- Safety: Run will **refuse** to disable the account the agent runs as (you) or SYSTEM, and says why.
 
 ## 4. Importance → Impact changes
 

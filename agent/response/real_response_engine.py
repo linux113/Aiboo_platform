@@ -35,6 +35,63 @@ def _validate_user_id(user_id: str) -> bool:
     return bool(_USER_ID_PATTERN.match(user_id))
 
 
+# Prefixes that mean "an account on this very PC". Windows event logs give
+# names like "MYPC\\alice", but `net user` only accepts the bare "alice".
+_LOCAL_DOMAIN_ALIASES = {".", "builtin", "localhost"}
+
+
+def _local_computer_names() -> set:
+    import socket
+    names = set(_LOCAL_DOMAIN_ALIASES)
+    for n in (os.environ.get("COMPUTERNAME"), socket.gethostname()):
+        if n:
+            names.add(n.lower())
+            names.add(n.split(".")[0].lower())
+    return names
+
+
+def _to_local_account_name(user_id: str) -> str:
+    """'MYPC\\alice' -> 'alice' when MYPC is this computer.
+
+    A real domain account (e.g. 'CORP\\alice') can't be disabled with a plain
+    `net user` on this PC, so we refuse with a clear message instead of letting
+    Windows print its confusing "syntax of this command" help text.
+    """
+    if "\\" not in user_id:
+        return user_id
+    domain, name = user_id.rsplit("\\", 1)
+    if not name:
+        raise RuntimeError(f"Invalid user_id format: {user_id}")
+    if domain.lower() in _local_computer_names():
+        return name
+    raise RuntimeError(
+        f"'{user_id}' is a domain account (domain '{domain}'). It can only be "
+        f"disabled on the domain controller, not on this PC.")
+
+
+_SYSTEM_ACCOUNTS = {"system", "local service", "network service", "localsystem"}
+
+
+def _refuse_if_self_or_system(name: str) -> None:
+    """Never let a Run click lock the person out of their own PC."""
+    low = name.lower()
+    if low in _SYSTEM_ACCOUNTS:
+        raise RuntimeError(f"Refusing to disable '{name}': it is a built-in Windows system account.")
+    me = set()
+    for getter in (lambda: os.environ.get("USERNAME", ""),
+                   lambda: __import__("getpass").getuser()):
+        try:
+            v = getter()
+        except Exception:
+            v = ""
+        if v:
+            me.add(v.split("\\")[-1].lower())
+    if low in me:
+        raise RuntimeError(
+            f"Refusing to disable '{name}': it is the account this agent is running as "
+            f"(you would lock yourself out). Disable it from another admin account if needed.")
+
+
 # ---------------------------------------------------------------------------
 # Never-kill list - processes whose termination would BSOD, break the OS,
 # or kill our own agent. Checked by name (case-insensitive) before any kill.
@@ -745,6 +802,8 @@ class RealResponseEngine:
             raise RuntimeError("Cannot lock user: missing user_id")
         if not _validate_user_id(user_id):
             raise RuntimeError(f"Invalid user_id format: {user_id}")
+        user_id = _to_local_account_name(user_id)
+        _refuse_if_self_or_system(user_id)
 
         cmd = ["net", "user", user_id, "/active:no"]
         try:

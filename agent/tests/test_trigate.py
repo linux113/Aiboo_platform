@@ -441,3 +441,40 @@ class TestIntegration:
         assert r["false_alarm"] == 1 and r["pattern"] == "brute_force"
         with pytest.raises(RuntimeError):
             await o._cmd_trigate_feedback("zz", {"feedback": "false_alarm", "event_id": "zz"})
+
+
+class TestLocalAccountNames:
+    """Windows writes 'THISPC\\user'; cards and the Run button need plain 'user'."""
+
+    def test_local_pc_prefix_removed_from_card(self):
+        ctx = build_context(win_event(4732, actor="GORILLA\\lalit", target_user="GORILLA\\aibootest2",
+                                      user_id="GORILLA\\lalit", group="Administrators",
+                                      privileged_group=True))
+        assert ctx["subject"] == "aibootest2" and ctx["entity"] == "lalit"
+        recs = recommend(ctx, 70)
+        assert any(r["action"] == "revoke_identity" and r["target"] == "aibootest2" for r in recs)
+
+    def test_domain_account_kept(self):
+        ctx = build_context(win_event(4720, user_id="CORP\\alice", target_user="CORP\\alice"))
+        assert ctx["subject"] == "CORP\\alice"
+
+    def test_pc_name_is_not_a_user(self):
+        # 7045 has no user: the ingestor puts the PC name in entity_id
+        ctx = build_context(win_event(7045, user_id="unknown", entity_id="GORILLA", device_id="GORILLA",
+                                      service_name="AiBooTestSvc", image_path="cmd.exe /c echo"))
+        assert ctx["entity"] == ""
+        trust, factors = score_trust(ctx)
+        assert any("Could not tell which user" in f["text"] for f in factors)
+
+    def test_engine_events_get_names_and_descriptions(self):
+        ev = ThreatEvent(source="device_trust_engine", threat_type=ThreatType.DEVICE_HEALTH_FAIL,
+                         severity=Severity.HIGH, payload={"device_id": "GORILLA", "reason": "Firewall off"})
+        ctx = build_context(ev)
+        assert ctx["pattern_label"] == "Device health check failed"
+        assert ctx["description"] == "Firewall off"
+        assert classify(win_event(None, threat=ThreatType.CONN_BLOCK)).key == "firewall_event"
+
+    def test_generic_description_says_what_it_was(self):
+        ev = ThreatEvent(source="x_engine", threat_type=ThreatType.TAILGATING, severity=Severity.LOW,
+                         payload={})
+        assert build_context(ev)["description"].startswith("Tailgating")

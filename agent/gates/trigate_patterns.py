@@ -77,8 +77,32 @@ PATTERNS: dict[str, Pattern] = {p.key: p for p in [
     Pattern("phishing", "Phishing", 60, "T1566", "Phishing"),
     Pattern("anomalous_behavior", "Unusual behaviour", 40, "", ""),
     Pattern("physical_intrusion", "Physical intrusion", 50, "", ""),
+    # Events made by the agent's own engines (Zero Trust, UEBA, device trust...)
+    Pattern("access_request", "Access request check", 20, "", ""),
+    Pattern("device_health_fail", "Device health check failed", 40, "", ""),
+    Pattern("zero_trust_violation", "Zero Trust policy violation", 50, "", ""),
+    Pattern("behavioral_anomaly", "Unusual behaviour", 40, "", ""),
+    Pattern("geo_velocity", "Login from an impossible location", 60, "T1078", "Valid Accounts"),
+    Pattern("ghost_login", "Login from an impossible location", 60, "T1078", "Valid Accounts"),
+    Pattern("threat_intel_alert", "Matches a known-bad indicator (threat intel)", 65, "", ""),
+    Pattern("physical_cyber_mismatch", "Badge / login location mismatch", 50, "T1078", "Valid Accounts"),
+    Pattern("correlated_attack", "Several alerts linked together (possible attack chain)", 65, "", ""),
+    Pattern("memory_threat", "Malicious code found in memory", 75, "T1055", "Process Injection"),
+    Pattern("insider_threat_converged", "Insider pattern over several days", 55, "", ""),
+    Pattern("tailgating", "Tailgating (badge and camera do not match)", 45, "", ""),
+    Pattern("ransomware_prelude", "Ransomware warning signs", 80, "T1486", "Data Encrypted for Impact"),
+    Pattern("logon_success", "Successful logon", 10, "T1078", "Valid Accounts"),
+    Pattern("privilege_use", "Sensitive privilege used", 30, "T1078", "Valid Accounts"),
     Pattern("generic", "Security event", 30, "", ""),
 ]}
+
+# Windows-plugin threat types that mean the same as an existing pattern
+_THREAT_TYPE_ALIASES = {
+    "explicit_cred": "explicit_credentials",
+    "process_create": "process_started",
+    "conn_allow": "firewall_event",
+    "conn_block": "firewall_event",
+}
 
 # Severity chosen on the Send Event tab -> base intent for test events
 _TEST_SEVERITY_INTENT = {"low": 25, "medium": 45, "high": 65, "critical": 80}
@@ -134,6 +158,7 @@ def classify(event: Any) -> Pattern:
         return PATTERNS["firewall_event"]
 
     tt = _val(getattr(event, "threat_type", "")).lower()
+    tt = _THREAT_TYPE_ALIASES.get(tt, tt)
     return PATTERNS.get(tt, PATTERNS["generic"])
 
 
@@ -156,6 +181,31 @@ def clean(value: Any) -> str:
     """'' for empty / placeholder values ('unknown', '-')."""
     v = str(value or "").strip()
     return "" if v.lower() in ("", "-", "unknown", "none", "null", "?") else v
+
+
+def _short_host(name: Any) -> str:
+    return str(name or "").strip().split(".")[0].lower()
+
+
+def this_pc_names(*extra: Any) -> set:
+    """Lower-case names that mean 'this computer' (plus any given extras)."""
+    import os
+    import socket
+    names = {".", "builtin", "localhost"}
+    for n in (os.environ.get("COMPUTERNAME"), socket.gethostname(), *extra):
+        if clean(n):
+            names.add(_short_host(n))
+    return names
+
+
+def local_account(name: Any, pc_names: set) -> str:
+    """'MYPC\\alice' -> 'alice' when MYPC is this computer (domain accounts kept)."""
+    v = clean(name)
+    if "\\" in v:
+        domain, user = v.rsplit("\\", 1)
+        if user and _short_host(domain) in pc_names:
+            return user
+    return v
 
 
 def ip_kind(ip: Any) -> str:
