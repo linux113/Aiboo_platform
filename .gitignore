@@ -23,3 +23,7 @@ trigate_memory.json.bad
 threat_feeds/
 access_control_state.json
 access_control_state.json.tmp
+# Agent offline queue (per-PC, holds unsent alerts) - never commit.
+# An old copy in the repo re-sent September alerts on every fresh install.
+alerts_queue.db
+alerts_queue.db-journal

@@ -160,9 +160,11 @@ class CyberThreatAgent(BaseAgent):
 
     async def _scan_memory_for_threats(self) -> List[MemoryThreat]:
         threats = []
-        for proc in psutil.process_iter(['pid', 'name', 'exe', 'cmdline', 'memory_info']):
+        for proc in psutil.process_iter(['pid', 'ppid', 'name', 'exe', 'cmdline', 'memory_info']):
             try:
                 proc_fingerprint = f"{proc.info['pid']}_{proc.info['name']}"
+                if self._started_by_aiboo(proc):
+                    continue   # our own helper (e.g. the Gate 1 posture check)
                 name_threat = self._check_process_name(proc)
                 if name_threat and proc_fingerprint not in self._scanned_processes:
                     threats.append(name_threat)
@@ -188,6 +190,29 @@ class CyberThreatAgent(BaseAgent):
             self._scanned_processes = {k: v for k, v in self._scanned_processes.items() if k in alive}
 
         return threats
+
+    @staticmethod
+    def _started_by_aiboo(proc) -> bool:
+        """True for helper processes this agent started itself.
+
+        The Gate 1 device-posture check runs
+        'powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ...'
+        and account / throttle playbooks run powershell / net / netsh.
+        Without this check AiBoO reported its own posture check as
+        "Malicious process detected: powershell.exe" (85%, high).
+        """
+        own = os.getpid()
+        info = getattr(proc, "info", None) or {}
+        ppid = info.get("ppid")
+        if ppid is None:
+            return False
+        if ppid == own:
+            return True
+        # one level more: agent -> cmd/conhost -> powershell
+        try:
+            return psutil.Process(ppid).ppid() == own
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ValueError, OSError):
+            return False
 
     def _check_process_name(self, proc) -> Optional[MemoryThreat]:
         name = proc.info['name'].lower() if proc.info['name'] else ""

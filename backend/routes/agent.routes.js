@@ -166,6 +166,13 @@ const updateEndpointHeartbeat = (source) => {
   }
 };
 
+// Agent clock time if it is a real date and not in the future; else now.
+const validAgentTime = (value) => {
+  const t = value ? new Date(value).getTime() : NaN;
+  const now = Date.now();
+  return Number.isFinite(t) && t <= now + 5 * 60 * 1000 ? new Date(t).toISOString() : new Date(now).toISOString();
+};
+
 // ============================================================
 //  PUBLIC AGENT ENDPOINTS (used by remote AiBoO agents)
 // ============================================================
@@ -186,8 +193,19 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
     const source = getSource(req);
     updateEndpointHeartbeat(source);
 
+    // Keep the agent's own id and time when they look valid. Before, every
+    // finding got a new random id + "now", so a finding re-sent from the
+    // agent's offline queue showed up again as a brand-new alert.
+    const agentId = String(req.body.id || '');
+    const id = /^[A-Za-z0-9_.:-]{4,100}$/.test(agentId)
+      ? agentId
+      : `remote_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    if (store.findings.some((f) => f.id === id)) {
+      return res.status(200).json({ ok: true, duplicate: true, id });
+    }
+
     const finding = {
-      id: `remote_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      id,
       agent_name: agent_name || 'UnknownAgent',
       threat_type,
       severity,
@@ -196,7 +214,7 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
       actions: actions || [],
       metadata: metadata || {},
       source,
-      timestamp: new Date().toISOString(),
+      timestamp: validAgentTime(req.body.timestamp),
     };
 
     push(store.findings, finding);

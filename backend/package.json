@@ -9,6 +9,7 @@
     "start": "node server.js",
     "seed": "node seed.js",
     "set-password": "node set-password.js",
+    "clear-alerts": "node clear-alerts.js",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {

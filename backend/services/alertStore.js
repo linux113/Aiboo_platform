@@ -149,9 +149,20 @@ export const fromGateDecision = (d) => {
   };
 };
 
+// A finding made from a Windows Event Log record is a copy of something
+// TriGate already scored (TriGate sees every Windows event and makes its own,
+// better alert for HOLD/BLOCK). Turning both into alerts doubled the count.
+export const isWindowsEventFinding = (f) => {
+  const md = f?.metadata || {};
+  if (md.windows_event_id !== undefined && md.windows_event_id !== null && md.windows_event_id !== '') return true;
+  if (String(md.source || '').startsWith('windows_event_log')) return true;
+  return /^\[Windows \d+\]/.test(String(f?.summary || ''));
+};
+
 export const fromFinding = (f) => {
   const s = sev(f?.severity);
   if (!['high', 'critical'].includes(s)) return null;
+  if (isWindowsEventFinding(f)) return null; // TriGate already covers it
   return {
     alertId: `fd_${f.id}`,
     kind: 'finding',
@@ -164,6 +175,23 @@ export const fromFinding = (f) => {
     firstSeen: f.timestamp || new Date().toISOString(),
     data: { agent: f.agent_name, actions: (f.actions || []).slice(0, 6) },
   };
+};
+
+// Alerts made before the fixes of 2 Oct 2026 that are known noise:
+//  - finding alerts copied from Windows events (TriGate has its own alert)
+//  - "identity mismatch (...)" / "insider threat (...)" finding alerts that an
+//    old offline-queue file re-sent from September
+//  - "[CORRELATED] ..." cards from the old correlation engine (now off)
+// Used by `npm run clear-alerts -- --old-noise`.
+export const isOldNoiseAlert = (a) => {
+  if (!a) return false;
+  const title = String(a.title || '');
+  if (a.kind === 'finding') {
+    if (/^\[Windows \d+\]/.test(String(a.description || ''))) return true;
+    return /^(identity mismatch|insider threat) \(/i.test(title);
+  }
+  if (a.kind === 'incident') return title.startsWith('[CORRELATED]');
+  return false;
 };
 
 export const fromCorrelated = (c) => {

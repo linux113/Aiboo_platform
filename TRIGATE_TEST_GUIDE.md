@@ -217,7 +217,11 @@ behaviour_analytics        = true
 behaviour_min_logons       = 20      ; learning needs 20 real logons ...
 behaviour_min_days         = 3       ; ... over at least 3 days before it alerts
 legacy_behaviour_alerts    = false   ; old UEBA / DNA cards (the unnamed "Security event" ones)
+legacy_correlation         = false   ; old "[CORRELATED] Identity compromise ..." cards (replaced by ATTACK CHAIN)
 ```
+
+Optional Windows environment variable (not in config.ini):
+`AIBOO_QUEUE_MAX_AGE_HOURS=24` – unsent alerts older than this are thrown away instead of being sent late.
 
 `backend\.env`
 ```ini
@@ -333,3 +337,31 @@ net accounts /lockoutthreshold:0      (only if you changed it in Test 15 and wan
 ```
 - Remove `1.1.1.1` from `agent\config\ip_blocklist.txt`.
 - Remove `BADGE_WEBHOOK_URL` from `backend\.env` if you used webhook.site.
+
+## 19. Fixes from the 2 Oct 2026 test
+
+What you saw → why → what changed:
+
+| You saw | Real cause | Fix |
+|---|---|---|
+| ~28 "identity mismatch (ZeroTrustAgent / IdentityAgent)" and "insider threat" alerts right after start, posture 37–38 | The file `agent\alerts_queue.db` was stored in GitHub with 120 old unsent items from 12 Sept (PC "Sejal"). Every fresh ZIP re-sent them, and the backend gave each one a new id and today's date | File removed from GitHub and ignored. The agent now throws away queued items older than 24 h or tried 5 times. The backend keeps the agent's own id and time, so a re-sent item can never become a second alert |
+| "[CORRELATED] Identity compromise with lateral movement", source "unknown", 19 days ago | Same old file + the old correlation engine | Old engine off (`legacy_correlation = false`). ATTACK CHAIN replaces it |
+| "identity mismatch (ZeroTrustAgent)" risk 75 next to TriGate "Password guessing" | A finding made from a Windows event was turned into a second alert | Findings made from Windows events no longer become alerts; TriGate's alert is the one to handle (the finding still shows in the live feed) |
+| "Malicious process detected: powershell.exe" 85% | AiBoO's own Gate 1 device check runs `powershell -EncodedCommand ...` and the scanner flagged it | Processes started by the agent itself are skipped. Encoded PowerShell started by anyone else is still reported |
+| Excel shows `01-Jan` for endpoints | "1 / 1" looks like a date to Excel | Two rows: `Endpoints online` and `Endpoints known` |
+| Empty space beside "Security posture" | A wide widget came straight after a half one | Half-width widgets are paired, and the grid fills gaps by itself (also in a custom order) |
+
+**Remove the old junk alerts that are already in your database** (once):
+1. Stop the backend window (Ctrl+C).
+2. In the `backend` folder:
+   ```
+   npm run clear-alerts -- --old-noise --dry-run
+   npm run clear-alerts -- --old-noise
+   ```
+   The first line only counts. The second deletes only the junk (identity mismatch / insider threat findings, Windows-event copies and "[CORRELATED]" cards). TriGate alerts and ATTACK CHAIN incidents are kept.
+   To start completely fresh instead: `npm run clear-alerts -- --all`.
+3. Start the backend again (`npm run dev`).
+
+**If you re-use an old folder:** delete `agent\alerts_queue.db` before starting the agent (the new agent would drop the old items anyway).
+
+**Excel tip:** `########` in the Date column only means the column is too narrow – double-click the line between column headers A and B.

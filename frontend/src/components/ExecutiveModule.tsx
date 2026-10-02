@@ -26,10 +26,11 @@ const WIDGETS: Record<WidgetId, { title: string; hint: string; wide: boolean }> 
   users: { title: "Most targeted users", hint: "Accounts that appear in most alerts", wide: false },
   ips: { title: "Top attacking IPs", hint: "Source IPs in most alerts", wide: false },
   compliance: { title: "Compliance", hint: "ISO 27001 / NIST CSF device checks", wide: true },
-  protection: { title: "Protection status", hint: "Threat feeds, behaviour learning, live restrictions", wide: false },
+  protection: { title: "Protection status", hint: "Threat feeds, behaviour learning, live restrictions", wide: true },
   critical: { title: "Latest serious alerts", hint: "High and critical, newest first", wide: true },
 };
-const DEFAULT_ORDER: WidgetId[] = ["kpis", "posture", "trend", "severity", "status", "patterns", "users", "compliance", "protection", "ips", "critical"];
+// Half-width widgets come in pairs so no row has an empty half.
+const DEFAULT_ORDER: WidgetId[] = ["kpis", "posture", "severity", "trend", "status", "patterns", "compliance", "users", "ips", "protection", "critical"];
 const STORE_KEY = "aiboo_exec_layout_v1";
 
 type Layout = { order: WidgetId[]; hidden: WidgetId[]; wide: Partial<Record<WidgetId, boolean>> };
@@ -177,7 +178,9 @@ export default function ExecutiveModule({
       {error && <div className="rounded border border-red-500/40 bg-red-500/10 px-3 py-2 text-[12px] text-red-200">{error}</div>}
 
       {data && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        // grid-flow-row-dense: a half-width widget moves up into an empty
+        // half next to a previous one, even in a customised order
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 lg:grid-flow-row-dense">
           {visible.map((id) => (
             <div key={id} className={cn("flex flex-col rounded-xl border border-slate-800/80 bg-slate-950/80 p-3",
               (layout.wide[id] ?? WIDGETS[id].wide) && "lg:col-span-2")}>

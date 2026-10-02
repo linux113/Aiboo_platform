@@ -70,7 +70,9 @@ const kpiRows = (a) => [
   ['Correlated incidents', a.kpis.incidents],
   ['TriGate BLOCK decisions', a.kpis.blocked],
   ['TriGate HOLD decisions', a.kpis.held],
-  ['Endpoints (online / known)', `${a.kpis.endpointsOnline} / ${a.kpis.endpoints}`],
+  // two plain numbers: Excel turned "1 / 1" into the date 01-Jan
+  ['Endpoints online', a.kpis.endpointsOnline],
+  ['Endpoints known', a.kpis.endpoints],
   ['Average compliance score', a.kpis.avgCompliance ?? 'n/a'],
 ];
 

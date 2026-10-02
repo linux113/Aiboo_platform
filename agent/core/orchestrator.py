@@ -96,7 +96,12 @@ class Orchestrator:
         ]
 
         # ---- Core engines (DISABLED: Unicode logging causes cp1252 errors) ----
+        # Old correlation engine: it made vague "[CORRELATED] Identity
+        # compromise with lateral movement" cards with no user / PC. The new
+        # IncidentCorrelator (ATTACK CHAIN) replaces it. legacy_correlation = true
+        # turns the old one back on.
         self.correlation = CorrelationEngine(bus)
+        self._legacy_correlation = _cfg_bool(self.config, 'legacy_correlation', False)
         # self.dashboard = CommandDashboard(bus)          # DISABLED
         # self.response_eng = AutonomousResponseEngine(bus) # DISABLED
 
@@ -365,7 +370,8 @@ class Orchestrator:
         self._autosave_task = asyncio.create_task(self._trigate_autosave())
 
         # ---- Start core engines (disabled) ----
-        self.correlation.start()
+        if self._legacy_correlation:
+            self.correlation.start()
         # self.dashboard.start()          # DISABLED
         # self.response_eng.start()       # DISABLED
         if self.auto_response:
@@ -521,7 +527,8 @@ class Orchestrator:
         # ---- Stop other engines (disabled) ----
         # self.real_response.stop() if hasattr(self.real_response, 'stop') else None
         # self.response_eng.stop() if hasattr(self.response_eng, 'stop') else None
-        self.correlation.stop()
+        if self._legacy_correlation and hasattr(self.correlation, 'stop'):
+            self.correlation.stop()
 
         # ---- Save TriGate memory (history, known logons, feedback) ----
         task = getattr(self, "_autosave_task", None)

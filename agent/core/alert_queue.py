@@ -23,6 +23,18 @@ URGENT_ENDPOINTS = {"actions", "pseudo-lock", "pseudo-lock-restore", "gate-decis
 # Path to the SQLite database file (saved in the agent's root directory)
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alerts_queue.db")
 
+# Items older than this are never sent. Without a limit an old queue file
+# (e.g. copied with the code from another PC) re-sent weeks-old alerts as new.
+MAX_ATTEMPTS = 5
+
+
+def _max_age_seconds() -> float:
+    try:
+        hours = float(os.getenv("AIBOO_QUEUE_MAX_AGE_HOURS", "24") or 24)
+    except ValueError:
+        hours = 24.0
+    return max(hours, 0.1) * 3600
+
 
 class OfflineQueueManager:
     """
@@ -82,6 +94,28 @@ class OfflineQueueManager:
             c.execute('CREATE INDEX IF NOT EXISTS idx_attempts ON pending_alerts (attempts, timestamp)')
             conn.commit()
             conn.close()
+        self.purge_stale()
+
+    def purge_stale(self) -> int:
+        """Delete queued items that are too old or already failed too often.
+        Returns how many rows were removed."""
+        cutoff = time.time() - _max_age_seconds()
+        try:
+            with self._db_lock:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute("DELETE FROM pending_alerts WHERE timestamp < ? OR attempts >= ?",
+                          (cutoff, MAX_ATTEMPTS))
+                removed = c.rowcount or 0
+                conn.commit()
+                conn.close()
+        except sqlite3.Error as e:
+            log.error("Could not clean the offline queue: %s", e)
+            return 0
+        if removed:
+            log.info("Offline queue: dropped %d old item(s) (older than %.0f h or failed %d times)",
+                     removed, _max_age_seconds() / 3600, MAX_ATTEMPTS)
+        return removed
 
     # --- Public Async Methods ---
 
@@ -157,6 +191,7 @@ class OfflineQueueManager:
         while self._running:
             try:
                 self._wake.clear()   # anything queued after this point re-wakes us
+                self.purge_stale()   # keep the file small; never send stale items
                 pending = self._get_pending_alerts()
                 if pending:
                     log.info("Retry worker: %d pending alert(s) to send", len(pending))
@@ -214,12 +249,14 @@ class OfflineQueueManager:
     # --- Internal DB helpers (synchronous, thread-safe) ---
 
     def _get_pending_alerts(self):
-        """Fetch all alerts with less than 5 attempts, ordered by oldest first."""
+        """Fetch recent alerts with fewer than MAX_ATTEMPTS tries, oldest first."""
+        cutoff = time.time() - _max_age_seconds()
         with self._db_lock:
             conn = sqlite3.connect(DB_PATH)
             c = conn.cursor()
             c.execute(
-                "SELECT id, payload FROM pending_alerts WHERE attempts < 5 ORDER BY timestamp"
+                "SELECT id, payload FROM pending_alerts WHERE attempts < ? AND timestamp >= ? ORDER BY timestamp",
+                (MAX_ATTEMPTS, cutoff),
             )
             rows = c.fetchall()
             conn.close()
