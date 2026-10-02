@@ -7,6 +7,7 @@ import sqlite3
 import json
 import time
 import os
+import sys
 import threading
 import logging
 import asyncio
@@ -20,8 +21,13 @@ log = logging.getLogger("AlertQueue")
 # next 30s retry cycle (dashboard users are watching these in real time).
 URGENT_ENDPOINTS = {"actions", "pseudo-lock", "pseudo-lock-restore", "gate-decision", "correlated", "compliance", "agent-status"}
 
-# Path to the SQLite database file (saved in the agent's root directory)
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alerts_queue.db")
+# Path to the SQLite database file (saved in the agent's root directory).
+# In the compiled AiBoO-Agent.exe, __file__ points into a temporary folder
+# that is deleted when the agent stops, so keep the queue next to the .exe.
+if getattr(sys, "frozen", False):
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "alerts_queue.db")
+else:
+    DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "alerts_queue.db")
 
 # Items older than this are never sent. Without a limit an old queue file
 # (e.g. copied with the code from another PC) re-sent weeks-old alerts as new.

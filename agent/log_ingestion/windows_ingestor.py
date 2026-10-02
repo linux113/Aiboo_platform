@@ -88,6 +88,9 @@ def _resolve_config_path() -> str:
         os.path.join(base, "event_rules.yaml"),
         os.path.join(os.getcwd(), "config", "event_rules.yaml"),
     ]
+    bundled = getattr(sys, "_MEIPASS", None)      # copy packed inside the .exe
+    if bundled:
+        candidates.append(os.path.join(bundled, "config", "event_rules.yaml"))
     for path in candidates:
         if os.path.exists(path):
             return path

@@ -22,14 +22,27 @@ import asyncio
 import ipaddress
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
 
 log = logging.getLogger("ThreatIntelLookup")
 
-DEFAULT_BLOCKLIST = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "ip_blocklist.txt")
+def _default_blocklist() -> str:
+    """agent/config/ip_blocklist.txt - for the compiled AiBoO-Agent.exe the
+    editable copy in the config folder NEXT TO the .exe (the bundled copy
+    lives in a temporary folder and cannot be edited)."""
+    bundled = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config", "ip_blocklist.txt")
+    if getattr(sys, "frozen", False):
+        beside_exe = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "config", "ip_blocklist.txt")
+        if os.path.exists(beside_exe) or not os.path.exists(bundled):
+            return beside_exe
+    return bundled
+
+
+DEFAULT_BLOCKLIST = _default_blocklist()
 ABUSEIPDB_URL = "https://api.abuseipdb.com/api/v2/check"
 CACHE_SECONDS = 6 * 3600
 TIMEOUT_SECONDS = 3.0

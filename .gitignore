@@ -27,3 +27,7 @@ access_control_state.json.tmp
 # An old copy in the repo re-sent September alerts on every fresh install.
 alerts_queue.db
 alerts_queue.db-journal
+
+# PyInstaller build output and build environment (agent/build_agent.bat)
+agent/build/
+agent/.buildenv/
