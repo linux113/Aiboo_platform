@@ -365,3 +365,177 @@ What you saw → why → what changed:
 **If you re-use an old folder:** delete `agent\alerts_queue.db` before starting the agent (the new agent would drop the old items anyway).
 
 **Excel tip:** `########` in the Date column only means the column is too narrow – double-click the line between column headers A and B.
+
+## 20. PseudoLock – Pending approvals and multi-step playbooks (new)
+
+Full description: `PSEUDOLOCK_SPECIFICATION_v1.0.md`. Nothing new to install (no new packages).
+
+**Before you start**
+1. Download the new ZIP and unzip it. Copy your old `backend\.env` and `agent\config.ini` into the new folders (the ZIP does not contain them).
+2. Start the backend (`npm run dev` in `backend`), the frontend (`npm run dev` in `frontend`) and the agent (**Run as Administrator**), the same way as before.
+3. In `agent\config.ini`, `auto_response` must be `false` (or not there at all). That is the default. With `true` the agent acts by itself and no approvals are created.
+4. Open the dashboard. There is a new tab **Response** next to **Alerts**.
+
+### 20.1 Safe test – nothing changes on the PC (do this first)
+1. **Response** → **📘 Playbooks** → the card **"Safe test (changes nothing on the PC)"** → **▶ Run**.
+2. In the window: PC = your PC name (it is filled in if only one agent is online) → **▶ Start**.
+3. The screen jumps to **▶ Runs**. You see the steps:
+   - ✅ Notify;
+   - ◔ Wait 5 s;
+   - then ⏳ "Wait for approval".
+
+   The bell shows "Test playbook started on <PC>".
+4. The **Response** tab now has an amber number **1**. Click **✋ Approvals**. You see a card "Test approval – press Approve or Reject …" with a **countdown** (about 10:00) and the time it expires.
+5. Type a note, e.g. `testing`, and press **✔ Approve**.
+6. **▶ Runs** → the run is **Done**, every step ✅, and step 3 says "Approved by <your email>". The bell shows "Test playbook finished".
+7. Run it again, and this time press **✖ Reject**. The run becomes **Stopped**, and the last step is *Skipped*.
+8. **✋ Approvals** → **History**: both entries show **Approved by / Rejected by** your email, the time and your note.
+
+### 20.2 TriGate asks for approval (real attack test)
+1. Admin Command Prompt: `net user aibootest7 Test@12345 /add`
+2. Do **Test 1** with the user `aibootest7`: run `runas /user:aibootest7 cmd` and type a **wrong** password, 6 times (as in Test 1).
+3. Within about 30 seconds:
+   - the bell shows **"Approval needed – Disable account 'aibootest7' for 30 min …"**;
+   - the **Response** tab gets an amber number.
+
+   (A local test like `runas` has no IP, so there is no "Block IP" approval. An attack from another PC over the network also gives a "Block IP" approval.)
+4. **Response → ✋ Approvals**. Check that the card shows:
+   - **TriGate BLOCK**;
+   - **risk** (about 60–70);
+   - Action: *Disable account for N minutes → aibootest7 · 30 min*;
+   - your PC;
+   - the countdown (30:00).
+5. Make more wrong passwords. The **same** card now says **seen ×2**, and the timer starts again. No second card appears.
+6. Press **✔ Approve**. The card shows "Sent to … waiting", then **✅ Done on the PC: Account 'aibootest7' disabled for 30 min …**.
+7. Check in the Command Prompt: `net user aibootest7` → "Account active **No**".
+8. Turn it back on early: Agent Console → Dispatch → **Lift restriction** → `aibootest7`. Otherwise it is turned back on by itself after 30 minutes.
+9. **Reject test:** repeat steps 2–4 and press **✖ Reject**. `net user aibootest7` stays "Account active **Yes**".
+
+**Expiry test (optional):**
+1. Put `APPROVAL_EXPIRY_MINUTES=2` in `backend\.env` and restart the backend.
+2. Repeat step 2 and do **not** click anything.
+3. After 2 minutes the card moves to **History** as **Expired** ("Nobody decided within 2 min").
+4. Remove the line from `backend\.env` afterwards and restart the backend.
+
+### 20.3 Run a playbook from an alert
+1. **Alerts** → click the "Password guessing – aibootest7" alert → button **▶ Run playbook**.
+2. The window shows:
+   - **For alert:** …;
+   - playbook **"Contain password guessing"** is chosen already;
+   - PC and User name (`aibootest7`) are filled in.
+3. IP address: if it is empty (local `runas` test), type the test IP `45.95.147.3` → **▶ Start**.
+4. The screen jumps to **Response → ▶ Runs**:
+   - ✅ Block IP 45.95.147.3;
+   - ✅ Disable account aibootest7 (30 min);
+   - ✅ Notify.
+
+   The bell shows "Blocked 45.95.147.3 and disabled account aibootest7 for 30 min on <PC>".
+5. Check:
+   - Windows Defender Firewall → Inbound Rules → a rule `AiBoO_Block_45_95_147_3_…`;
+   - `net user aibootest7` → Active **No**.
+
+### 20.4 Make your own playbook with the editor
+1. **Response → 📘 Playbooks → ＋ New playbook**.
+2. Name: `My test playbook`.
+3. Step 1 is already there (Action, Block IP). Change **Action** to *Disable account for N minutes*. Target becomes `{user}`. Minutes = `2`.
+4. Click **＋ ✋ Wait for approval**, then **＋ 📣 Notify dashboards**. Change the message to `Done for {user} on {pc}`.
+5. Use **↑** on the approval step so that it is step 1 (approval first, then the account, then the message).
+6. Press **💾 Save playbook**. If something is missing, a red list tells you exactly what. The card shows **CUSTOM v1**.
+7. **▶ Run** → PC = yours, User name = `aibootest7` → Start → **Approvals** → **Approve**. The account is disabled for 2 minutes, and **Runs** shows all ✅.
+8. **✎ Edit** → untick **Enabled** → Save. **▶ Run** is now greyed out. **🗑 Delete** removes it.
+9. Built-in playbooks have no Edit or Delete: use **⧉ Copy & edit**.
+
+### 20.5 What a viewer sees (optional)
+Log in as a user with the **viewer** role. They can open **Response** and see everything, but there are **no** Approve, Reject, Run or Edit buttons. The message says only admin or analyst can approve.
+
+### 20.6 Clean up
+```
+net user aibootest7 /delete
+```
+Remove the test firewall rule in **Admin PowerShell**:
+```
+Remove-NetFirewallRule -DisplayName "AiBoO_Block_45_95_147_3*"
+```
+
+## 21. PseudoLock – Response rules: playbooks that start by themselves (new)
+
+A **rule** says: *WHEN this kind of attack happens → THEN run this playbook* (automatically, after one click, or only a message). Full description: `PSEUDOLOCK_SPECIFICATION_v1.0.md` §7.7. Nothing new to install.
+
+**Before you start**
+- Do the setup of §20 first: new ZIP, copy your old `backend\.env` and `agent\config.ini`, start the backend, the frontend and the agent (**Run as Administrator**).
+- The test user `aibootest7` from §20.2 must exist. If you deleted it, run this again in an Admin Command Prompt: `net user aibootest7 Test@12345 /add`
+- Open the dashboard → **Response** → there is a new tab **⚙ Rules**.
+
+> ⚠ **Important:** a rule acts on **every** matching attack, also on real users. Keep the test rule limited to **your PC** (step 21.2) and **delete it at the end** (step 21.8). Wait **5 minutes** between two wrong-password rounds (as in Test 1), otherwise Windows may not report a new attack.
+
+### 21.1 Make a small test playbook (only needs the user name)
+A local `runas` test has **no IP address**. The built-in "Contain password guessing" needs an IP, so with `runas` the rule would only say *Skipped*. So we make a playbook that only needs the user:
+1. **Response → 📘 Playbooks → ＋ New playbook**.
+2. Name: `Rule test - disable user 2 min`
+3. Step 1: **Action** = *Disable account for N minutes*, Target = `{user}`, Minutes = `2`.
+4. Click **＋ 📣 Notify dashboards**, message: `Rule disabled {user} on {pc} for 2 min`
+5. **💾 Save playbook**.
+
+### 21.2 Make the rule – in TEST MODE first (nothing happens on the PC)
+1. **Response → ⚙ Rules → ＋ New rule**.
+2. Name: `Test rule - password guessing`
+3. **WHEN** part:
+   - Attack type: **Password guessing (many failed logons)** is already ticked. Leave it like that.
+   - Risk at least: `55`. TriGate verdict: **BLOCK** ticked, HOLD not ticked.
+   - Only these PCs: click the grey button **+ <your PC name>** under the box (or type your PC name exactly as on the Dashboard).
+   - Where the attack comes from: **Any (or no IP)**. Time of day: **Any time**.
+4. **THEN** part: click **⚡ Run automatically**. Playbook: **Rule test - disable user 2 min**.
+   - A yellow box says this playbook needs the **user name**. That is correct.
+5. **🧪 Test mode** is ticked (it is ticked for every new rule). Leave it ticked.
+6. **💾 Save rule**. The list now shows a card **#1 Test rule - password guessing** with **⚡ Run automatically**, **🧪 test mode** and **ON**.
+
+### 21.3 "Test against old alerts"
+1. On the card, click **🔍 Test against old alerts**.
+2. You see: *"Last 30 days: this rule would have matched N of M TriGate alerts"* and a small table.
+   - If you did Test 1 or §20.2 before, N is 1 or more, and the table shows the "Password guessing – aibootest7" alerts.
+   - N = 0 is also fine if you never did a password test on this PC.
+   - Below the table: "Not matched because: other attack type (…)". This shows why the other alerts would not start the rule.
+
+### 21.4 Attack in test mode
+1. In a normal Command Prompt: `runas /user:aibootest7 cmd` and type a **wrong** password, 6 times (as in Test 1).
+2. Within about 30 seconds, go to **⚙ Rules** and press **⟳ Refresh**. In **📜 Activity** you see:
+   **🧪 Test mode - nothing done** · rule Test rule - password guessing · *"TEST MODE - would have: run "Rule test - disable user 2 min". Matched: Password guessing on <PC> (risk …, user aibootest7)"*
+   If one round of wrong passwords gives TriGate more than one BLOCK, you also see **⏸ Cooldown - already handled** lines just above it. That is normal: one round is handled once.
+3. Check: `net user aibootest7` → "Account active **Yes**". Nothing was changed.
+4. **✋ Approvals** still shows the normal TriGate card "Disable account 'aibootest7' for 30 min". In test mode the rule does not hide it. Press **✖ Reject** on it.
+
+### 21.5 Switch test mode OFF – the rule now acts by itself
+1. On the rule card: **✎ Edit** → untick **🧪 Test mode**. A yellow warning appears: *"This rule will change PCs without asking anyone."* → **💾 Save rule**. The card no longer shows "test mode".
+2. Wait **5 minutes** after the last wrong-password round. Then do the 6 wrong passwords for `aibootest7` again.
+3. Within about 30 seconds:
+   - The bell shows **"Rule disabled aibootest7 on <PC> for 2 min"**.
+   - **⚙ Rules → ⟳ Refresh → Activity**: **▶ Ran playbook** · *"Started "Rule test - disable user 2 min" automatically …"*. Click **see run**.
+   - **▶ Runs**: the run has the purple badge **⚙ automatic (rule)** and *"started by Rule "Test rule - password guessing""*. All steps are ✅.
+   - **✋ Approvals**: **no** new card. The rule took care of it, so you are not asked twice.
+4. Check: `net user aibootest7` → "Account active **No**". After 2 minutes it shows **Yes** again by itself.
+5. The rule card now shows **"matched 2× · last …"** (one test match and one real match).
+
+### 21.6 Cooldown – the same attack is not handled twice
+1. Wait until `net user aibootest7` shows **Active Yes** again. Also wait 5 minutes after the last round.
+2. Do the 6 wrong passwords again (within 30 minutes of step 21.5).
+3. **Activity** shows **⏸ Cooldown - already handled** · *"Already handled N min ago (cooldown 30 min)"*. The account stays **Active Yes**, and no approval appears.
+
+### 21.7 "Ask first" – the playbook starts only after you click
+1. **✎ Edit** → **✋ Ask first** → **💾 Save rule**. Saving also starts the cooldown fresh.
+2. Wait 5 minutes, then do the 6 wrong passwords again.
+3. The bell shows **"Approval needed – Rule "Test rule - password guessing" wants to run "Rule test - disable user 2 min" on <PC> (user aibootest7)"**.
+4. **✋ Approvals**: the card has the grey label **Response rule**, the text *"Starts playbook Rule test - disable user 2 min when approved"*, and a countdown.
+5. Press **✔ Approve & start**. In **History** the card says **✅ Playbook "Rule test - disable user 2 min" started**.
+6. **▶ Runs** shows *"started by Rule "Test rule - password guessing" (approved by <your email>)"*, and `net user aibootest7` → Active **No** (back to Yes after 2 minutes).
+7. *(Optional)* Repeat once more after 5 minutes and press **✖ Reject**: no run is started, and the account stays Active Yes.
+
+**Optional – other things on the Rules screen:**
+- **…or start from an example**: 4 ready rules (password guessing from the internet, known-bad IP, new admin at night, security log cleared). They open in the editor in test mode. Save one, use **↑ ↓** to change the order, then delete it.
+- **Switch off**: the card turns grey and shows **OFF**. An OFF rule is never checked, so the normal approvals come back.
+- A playbook that a rule uses cannot be deleted. The message says which rule uses it.
+- A user with the **viewer** role sees the rules and the Activity, but has no New, Edit, Switch or Delete buttons.
+
+### 21.8 Clean up (important)
+1. **⚙ Rules** → on **Test rule - password guessing** press **🗑** → OK.
+2. **📘 Playbooks** → **Rule test - disable user 2 min** → **🗑 Delete**. This only works after the rule is deleted.
+3. If you no longer need the test user: `net user aibootest7 /delete`

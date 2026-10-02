@@ -7,6 +7,8 @@ import {
   ingest as ingestAlert, fromFinding, fromGateDecision, fromCorrelated,
   saveCompliance, latestCompliance, setAlertEmitter,
 } from '../services/alertStore.js';
+import { freezeBadge, badgeConfigured } from '../services/badge.service.js';
+import { onTriGateDecision } from '../services/responseRules.service.js';
 
 const router = express.Router();
 
@@ -591,6 +593,11 @@ router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
   push(store.gateDecisions, decision);
   emit('agent:gate', decision);
   if (decision.event_id) ingestAlert(fromGateDecision(decision)); // HOLD/BLOCK only
+  // PseudoLock: response rules first (first matching rule wins); when no rule
+  // takes over, BLOCK actions the agent did NOT run itself wait for approval.
+  const status = { ...(store.agentStatus[decision.source] || {}), importance: store.importance[decision.source] };
+  onTriGateDecision(decision, status).catch((err) =>
+    logger.error(`Response rules / approvals for TriGate decision failed: ${err.message}`));
   res.json({ ok: true });
 });
 
@@ -601,44 +608,28 @@ router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
 //   BADGE_WEBHOOK_URL=https://...      BADGE_WEBHOOK_TOKEN=optional-secret
 // and this playbook POSTs {action:'freeze_badge', badge_id, user, reason, ...}.
 router.get('/playbooks/status', protect, (req, res) => {
-  res.json({ badge: { configured: Boolean(process.env.BADGE_WEBHOOK_URL) } });
+  res.json({ badge: { configured: badgeConfigured() } });
 });
 
 router.post('/playbooks/freeze-badge', protect, authorize('admin', 'analyst'), async (req, res) => {
-  const url = process.env.BADGE_WEBHOOK_URL;
   const badgeId = String(req.body?.badge_id || '').trim().slice(0, 120);
   const reason = String(req.body?.reason || '').trim().slice(0, 300);
-  if (!badgeId) return res.status(400).json({ ok: false, error: 'badge_id (badge number or employee ID) is required' });
-  if (!url) {
-    return res.status(501).json({
-      ok: false,
-      error: 'No badge system connected. Add BADGE_WEBHOOK_URL (and optional BADGE_WEBHOOK_TOKEN) to backend/.env and restart the backend.',
-    });
-  }
   const by = req.user?.email || req.user?.name || 'analyst';
-  const body = { action: 'freeze_badge', badge_id: badgeId, reason, requested_by: by, requested_at: new Date().toISOString() };
-  const record = {
+  const out = await freezeBadge({ badgeId, reason, by });
+  if (out.httpStatus === 400 || out.notConfigured) return res.status(out.httpStatus).json({ ok: false, error: out.error });
+  pushAction({
     id: `badge_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
     action: 'freeze_badge', action_label: 'Badge Frozen', target: badgeId, source: 'badge-system',
-    agent: 'Playbook', reason: reason || 'Freeze Badge playbook', timestamp: body.requested_at,
-  };
-  try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (process.env.BADGE_WEBHOOK_TOKEN) headers.Authorization = `Bearer ${process.env.BADGE_WEBHOOK_TOKEN}`;
-    const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: AbortSignal.timeout(8000) });
-    const text = (await resp.text()).slice(0, 300);
-    const ok = resp.ok;
-    pushAction({ ...record, status: ok ? 'success' : 'failed', error: ok ? '' : `Badge system answered HTTP ${resp.status}` });
-    emit('agent:action', store.actions[0]);
-    logger.info(`Freeze badge ${badgeId} by ${by}: HTTP ${resp.status}`);
-    if (!ok) return res.status(502).json({ ok: false, error: `Badge system answered HTTP ${resp.status}`, detail: text });
-    return res.json({ ok: true, message: `Badge ${badgeId} freeze request accepted by the badge system`, detail: text });
-  } catch (err) {
-    pushAction({ ...record, status: 'failed', error: err.message });
-    emit('agent:action', store.actions[0]);
-    logger.warn(`Freeze badge ${badgeId} failed: ${err.message}`);
-    return res.status(502).json({ ok: false, error: `Could not reach the badge system: ${err.name === 'TimeoutError' ? 'no answer in 8 seconds' : err.message}` });
+    agent: 'Playbook', reason: reason || 'Freeze Badge playbook', timestamp: out.requestedAt,
+    status: out.ok ? 'success' : 'failed', error: out.ok ? '' : out.error,
+  });
+  emit('agent:action', store.actions[0]);
+  if (out.ok) {
+    logger.info(`Freeze badge ${badgeId} by ${by}: HTTP ${out.remoteStatus}`);
+    return res.json({ ok: true, message: out.message, detail: out.detail });
   }
+  logger.warn(`Freeze badge ${badgeId} failed: ${out.error}`);
+  return res.status(502).json({ ok: false, error: out.error, ...(out.detail !== undefined ? { detail: out.detail } : {}) });
 });
 
 // POST /api/agent/compliance - agent sends its ISO 27001 / NIST CSF check

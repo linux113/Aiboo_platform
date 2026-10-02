@@ -4,6 +4,7 @@ export type NavId =
   | "dashboard"
   | "executive"
   | "alerts"
+  | "response"
   | "reports"
   | "surveillance"
   | "intelligence"

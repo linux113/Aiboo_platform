@@ -7,6 +7,7 @@ import { cn } from "../utils/cn";
 import { sevCls } from "../utils/helpers";
 import { downloadReport, timeAgo, PATTERN_LABEL } from "../utils/reports";
 import type { AlertList, SecurityAlert, AlertStatus, CloseReason } from "../types";
+import { RunPlaybookDialog } from "./ResponseModule";
 
 const CLOSE_REASONS: { id: CloseReason; label: string; hint: string }[] = [
   { id: "resolved", label: "Resolved", hint: "Real problem, now fixed" },
@@ -32,12 +33,15 @@ export default function AlertsModule({
   userName,
   refreshTick,
   onNotify,
+  onOpenResponse,
 }: {
   canEdit: boolean;
   userName: string;
   refreshTick: number;
   onNotify?: (type: "critical" | "warning" | "info", title: string, body: string) => void;
+  onOpenResponse?: () => void;
 }) {
+  const [runFor, setRunFor] = useState<SecurityAlert | null>(null);
   const [tab, setTab] = useState<Tab>("active");
   const [severity, setSeverity] = useState("");
   const [kind, setKind] = useState("");
@@ -364,7 +368,7 @@ export default function AlertsModule({
                 {detail.data!.recommended.map((r: any, i: number) => (
                   <div key={i} className="text-slate-300">• {r.text || `${PATTERN_LABEL(r.action)}${r.target ? ` → ${r.target}` : ""}`}</div>
                 ))}
-                <div className="mt-1 text-[10px] text-slate-500">Run these from Agent Console → TriGate.</div>
+                <div className="mt-1 text-[10px] text-slate-500">Run these from Agent Console → TriGate, or press ▶ Run playbook below.</div>
               </div>
             )}
 
@@ -379,6 +383,8 @@ export default function AlertsModule({
                   )}
                   <button disabled={busy || !note.trim()} onClick={() => act("notes", { text: note }, "Note added")}
                     className="rounded border border-slate-600 px-2.5 py-1 text-slate-200 disabled:opacity-40">📝 Add note</button>
+                  <button disabled={busy} onClick={() => setRunFor(detail)} title="Run a multi-step PseudoLock playbook for this alert (IP, user and PC are filled in)"
+                    className="rounded bg-cyan-500/85 px-2.5 py-1 font-semibold text-slate-950 disabled:opacity-50">▶ Run playbook</button>
                   {detail.status === "closed" && (
                     <button disabled={busy} onClick={() => act("reopen", { note }, "Alert reopened")}
                       className="rounded border border-red-500/60 px-2.5 py-1 text-red-200 disabled:opacity-50">↩ Reopen</button>
@@ -435,6 +441,21 @@ export default function AlertsModule({
           </div>
         )}
       </div>
+      {runFor && (
+        <RunPlaybookDialog
+          prefill={{
+            endpoint: runFor.source && runFor.source !== "unknown" ? runFor.source : "",
+            vars: Object.fromEntries(Object.entries({
+              ip: runFor.srcIp || "", user: runFor.subject || runFor.entity || "",
+              pid: runFor.data?.pid ? String(runFor.data.pid) : "",
+            }).filter(([, v]) => v)),
+            alertId: runFor.alertId, pattern: runFor.pattern, title: runFor.title,
+          }}
+          onNotify={onNotify}
+          onClose={() => setRunFor(null)}
+          onStarted={() => { setRunFor(null); onOpenResponse?.(); }}
+        />
+      )}
     </div>
   );
 }

@@ -430,6 +430,29 @@ class TestIntegration:
         json.dumps(payload)                                   # must be JSON-safe
 
     @pytest.mark.asyncio
+    async def test_bridge_tells_backend_if_agent_runs_block_actions_itself(self):
+        """PseudoLock approvals: the backend only asks a person to approve when
+        the agent does NOT run BLOCK actions itself (auto_response = false)."""
+        from core.backend_bridge import DashboardBridge
+
+        class Q:
+            def __init__(self):
+                self.items = []
+
+            async def add_to_endpoint(self, ep, payload):
+                self.items.append(payload)
+
+        for auto in (False, True):
+            b = DashboardBridge.__new__(DashboardBridge)
+            b._queue, b._endpoint_id = Q(), "gorilla"
+            if auto:
+                b.auto_response = True
+            await b._on_gate_decision(GateDecision(
+                gate=GateLevel.GATE_3, event_id="e2", threat_type=ThreatType.IDENTITY_MISMATCH, severity=Severity.HIGH,
+                verdict=GateVerdict.BLOCK, confidence=0.8, reason="r", actions=[], metadata={}))
+            assert b._queue.items[0]["auto_response"] is auto
+
+    @pytest.mark.asyncio
     async def test_orchestrator_command_handlers(self):
         from core.orchestrator import Orchestrator
         o = Orchestrator.__new__(Orchestrator)

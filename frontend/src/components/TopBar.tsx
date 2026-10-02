@@ -8,6 +8,7 @@ const NAV: { id: NavId; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "⌘" },
   { id: "executive", label: "Executive", icon: "📈" },
   { id: "alerts", label: "Alerts", icon: "🚨" },
+  { id: "response", label: "Response", icon: "🛡" },
   { id: "reports", label: "Reports", icon: "📄" },
   { id: "surveillance", label: "Surveillance", icon: "👁" },
   { id: "intelligence", label: "Intelligence", icon: "🧠" },
@@ -26,6 +27,7 @@ export default function TopBar({
   searchState,
   onSearchNav,
   openAlerts = 0,
+  pendingApprovals = 0,
 }: {
   active: NavId;
   setActive: (n: NavId) => void;
@@ -41,6 +43,7 @@ export default function TopBar({
   };
   onSearchNav: (nav: NavId) => void;
   openAlerts?: number;
+  pendingApprovals?: number;
 }) {
   const [menu, setMenu] = useState(false);
   const [logoFallback, setLogoFallback] = useState(false);
@@ -107,6 +110,9 @@ export default function TopBar({
             {n.label}
             {n.id === "alerts" && openAlerts > 0 && (
               <span className="ml-1 rounded-full bg-red-500/80 px-1.5 text-[9px] font-bold text-white">{openAlerts > 99 ? "99+" : openAlerts}</span>
+            )}
+            {n.id === "response" && pendingApprovals > 0 && (
+              <span title="Actions waiting for your approval" className="ml-1 rounded-full bg-amber-500 px-1.5 text-[9px] font-bold text-slate-950 animate-pulse">{pendingApprovals > 99 ? "99+" : pendingApprovals}</span>
             )}
           </button>
         ))}
@@ -254,6 +260,7 @@ export default function TopBar({
             >
               {n.label}
               {n.id === "alerts" && openAlerts > 0 && <span className="ml-2 rounded-full bg-red-500/80 px-1.5 text-[10px] text-white">{openAlerts}</span>}
+              {n.id === "response" && pendingApprovals > 0 && <span className="ml-2 rounded-full bg-amber-500 px-1.5 text-[10px] text-slate-950">{pendingApprovals}</span>}
             </button>
           ))}
         </div>

@@ -162,6 +162,9 @@ class Orchestrator:
             api_key=self.config.get('api_key'),
             endpoint_id=self.config.get('endpoint_name') or None,
         )
+        # PseudoLock approvals: the backend only asks a person to approve TriGate
+        # BLOCK actions when this agent does NOT run them automatically.
+        self.dashboard_bridge.auto_response = self.auto_response
 
         # ---- Offline queue ----
         self.queue_manager = OfflineQueueManager(

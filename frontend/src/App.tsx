@@ -16,6 +16,7 @@ import EndpointsList from "./components/EndpointsList";
 const ExecutiveModule = lazy(() => import("./components/ExecutiveModule"));
 import AlertsModule from "./components/AlertsModule";
 import ReportsModule from "./components/ReportsModule";
+import ResponseModule from "./components/ResponseModule";
 import type { Camera, Detection, Threat, AgentFinding, CorrelatedAlert, GateDecision, PseudoLock, Notification, NavId, SearchResult, ActionRecord } from "./types";
 
 // ---- Endpoint type (with active flag) ----
@@ -32,6 +33,7 @@ const NAV: { id: NavId; label: string; icon: string }[] = [
   { id: "dashboard", label: "Dashboard", icon: "⌘" },
   { id: "executive", label: "Executive", icon: "📈" },
   { id: "alerts", label: "Alerts", icon: "🚨" },
+  { id: "response", label: "Response", icon: "🛡" },
   { id: "reports", label: "Reports", icon: "📄" },
   { id: "surveillance", label: "Surveillance", icon: "👁" },
   { id: "intelligence", label: "Intelligence", icon: "🧠" },
@@ -128,6 +130,19 @@ export default function App() {
       alertTimerRef.current = null;
       setAlertTick(t => t + 1);
     }, 3000);
+  }, []);
+
+  // PseudoLock approvals / playbook runs (backend/routes/pseudolock.routes.js)
+  const [responseTick, setResponseTick] = useState(0);
+  const [pendingApprovals, setPendingApprovals] = useState(0);
+  const [responseTab, setResponseTab] = useState<"approvals" | "playbooks" | "runs">("approvals");
+  const responseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bumpResponse = useCallback(() => {
+    if (responseTimerRef.current) return;
+    responseTimerRef.current = setTimeout(() => {
+      responseTimerRef.current = null;
+      setResponseTick(t => t + 1);
+    }, 700);
   }, []);
 
   const addNotif = (type: "critical" | "warning" | "info", title: string, body: string) => {
@@ -376,6 +391,19 @@ export default function App() {
         ? { ...l, active: false, restoring: false, restored_at: restored_at || new Date().toISOString(), restore_message: message || l.restore_message }
         : l))
     );
+    // ---- PseudoLock: approvals + playbooks ----
+    socket.on("approval:new", (a: { title?: string; endpoint?: string; origin?: string }) => {
+      bumpResponse();
+      addNotif("warning", "Approval needed", `${a.title || "Action"}${a.endpoint ? ` · ${a.endpoint}` : ""} - open Response → Approvals`);
+    });
+    socket.on("approval:updated", bumpResponse);
+    socket.on("run:updated", bumpResponse);
+    socket.on("playbook:updated", bumpResponse);
+    socket.on("rule:updated", bumpResponse);
+    socket.on("rule:event", bumpResponse);
+    socket.on("pseudolock:notify", (n: { level?: string; title?: string; message?: string }) =>
+      addNotif(n.level === "critical" ? "critical" : n.level === "warning" ? "warning" : "info", n.title || "Playbook", n.message || "")
+    );
     socket.on("war-room:opened", (w: { opened_by?: string; note?: string }) =>
       addNotif("critical", "War Room Opened", `${w.opened_by || "An analyst"} opened a war room${w.note ? `: ${w.note}` : ""}`)
     );
@@ -436,6 +464,22 @@ export default function App() {
     }, 800);
     return () => { stop = true; clearTimeout(t); };
   }, [token, alertTick]);
+
+  // ---- Approvals waiting for a person (badge on the Response tab) ----
+  useEffect(() => {
+    if (!token) return;
+    let stop = false;
+    const get = async () => {
+      try {
+        const r = await api.get(`${API}/pseudolock/approvals/count`);
+        if (!stop) setPendingApprovals(Number(r.data?.pending) || 0);
+      } catch { /* older backend without PseudoLock routes */ }
+    };
+    get();
+    // also catches approvals that expired while nobody had the dashboard open
+    const iv = setInterval(get, 60000);
+    return () => { stop = true; clearInterval(iv); };
+  }, [token, responseTick]);
 
   // ---- NEW: fallback poll for actions every 5s when socket is offline ----
   useEffect(() => {
@@ -534,7 +578,7 @@ export default function App() {
     <div className="flex min-h-screen flex-col bg-[#020617] text-slate-50">
       <TopBar
         active={active}
-        setActive={setActive}
+        setActive={(n) => { if (n === "response") setResponseTab("approvals"); setActive(n); }}
         notifications={notifications}
         onReadNotif={(id) => setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n))}
         onClearNotifs={() => setNotifications([])}
@@ -543,6 +587,7 @@ export default function App() {
         searchState={searchState}
         onSearchNav={(nav) => setActive(nav)}
         openAlerts={openAlertCount}
+        pendingApprovals={pendingApprovals}
       />
       <main className="relative flex-1 overflow-hidden bg-gradient-to-br from-[#020617] via-slate-950 to-slate-950/90" style={{ height: "calc(100vh - 56px)" }}>
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.08),transparent_60%),radial-gradient(circle_at_bottom,_rgba(15,118,110,0.15),transparent_60%)] opacity-80" />
@@ -561,7 +606,7 @@ export default function App() {
           <div className="flex items-center justify-between px-5 pt-3 pb-2 text-[11px] flex-shrink-0">
             <div className="flex items-center gap-2">
               <span className="rounded-full border border-slate-700/80 bg-slate-900/80 px-2.5 py-0.5 text-[10px] uppercase tracking-[0.16em] text-slate-400">
-                {active === "dashboard" ? "Command & Control" : active === "executive" ? "Executive Dashboard · Trends" : active === "alerts" ? "Alert Management" : active === "reports" ? "Reports · Compliance" : active === "surveillance" ? "Surveillance Intelligence" : active === "intelligence" ? "Intelligence & Identity" : active === "agent" ? "Agent Console · Tri-Gate" : active === "endpoints" ? "Endpoints · Distributed Agents" : "Platform Settings"}
+                {active === "dashboard" ? "Command & Control" : active === "executive" ? "Executive Dashboard · Trends" : active === "alerts" ? "Alert Management" : active === "response" ? "PseudoLock · Approvals & Playbooks" : active === "reports" ? "Reports · Compliance" : active === "surveillance" ? "Surveillance Intelligence" : active === "intelligence" ? "Intelligence & Identity" : active === "agent" ? "Agent Console · Tri-Gate" : active === "endpoints" ? "Endpoints · Distributed Agents" : "Platform Settings"}
               </span>
               <span className="hidden text-[10px] text-slate-500 md:inline">Live · Tri-Gate · YOLOv8 · JARVIS</span>
             </div>
@@ -594,7 +639,8 @@ export default function App() {
                     <ExecutiveModule refreshTick={alertTick} onNavigate={setActive} onNotify={addNotif} />
                   </Suspense>
                 )}
-                {active === "alerts" && <AlertsModule canEdit={canEdit} userName={userName} refreshTick={alertTick} onNotify={addNotif} />}
+                {active === "alerts" && <AlertsModule canEdit={canEdit} userName={userName} refreshTick={alertTick} onNotify={addNotif} onOpenResponse={() => { setResponseTab("runs"); setActive("response"); }} />}
+                {active === "response" && <ResponseModule key={responseTab} initialTab={responseTab} canEdit={canEdit} refreshTick={responseTick} onNotify={addNotif} />}
                 {active === "reports" && <ReportsModule refreshTick={alertTick} onNotify={addNotif} />}
                 {active === "surveillance" && <SurveillanceModule cameras={cameras} detections={detections} onCamsChange={setCameras} />}
                 {active === "intelligence" && <IntelligenceModule detections={detections} cameras={cameras} findings={findings} />}

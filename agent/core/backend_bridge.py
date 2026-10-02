@@ -111,6 +111,9 @@ class DashboardBridge:
     Also sends a heartbeat every 60 seconds.
     """
 
+    # config.ini auto_response (set by the orchestrator); see _on_gate_decision
+    auto_response = False
+
     def __init__(
         self,
         bus: EventBus,
@@ -137,6 +140,10 @@ class DashboardBridge:
         self._running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._subscriptions = []
+        # Set by the orchestrator from config.ini auto_response. Sent with every
+        # TriGate decision so the backend knows whether the agent already ran
+        # the BLOCK actions itself (true) or a person must approve them (false).
+        self.auto_response = False
 
         log.info(
             "DashboardBridge initialized: backend=%s, endpoint=%s",
@@ -303,6 +310,7 @@ class DashboardBridge:
             payload["severity"] = payload["severity"].lower()
         payload["source"] = self._endpoint_id
         payload["endpoint"] = self._endpoint_id
+        payload["auto_response"] = bool(self.auto_response)
         await self._queue.add_to_endpoint("gate-decision", payload)
 
     # ------------------------------------------------------------------

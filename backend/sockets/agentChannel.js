@@ -30,6 +30,10 @@ const agents = new Map();
 const pendingCommands = new Map();
 const MAX_COMMAND_HISTORY = 500;
 
+// Listeners told about every command ack (used by approvals / playbook runs
+// to wait until the agent says executed / failed).
+const ackListeners = new Set();
+
 function trimCommandHistory() {
   if (pendingCommands.size <= MAX_COMMAND_HISTORY) return;
   // Map preserves insertion order — drop oldest first
@@ -135,6 +139,9 @@ export function registerAgentChannel(io) {
         }
       }
       io.emit('command:ack', data);
+      for (const fn of ackListeners) {
+        try { fn(data, cmd || null); } catch (err) { logger.error(`Ack listener error: ${err.message}`); }
+      }
       logger.info(
         `Command ack: ${data?.cmd_id} → ${data?.status}` +
           (data?.error ? ` (${data.error})` : '')
@@ -223,9 +230,10 @@ export function registerAgentChannel(io) {
       return Array.from(pendingCommands.values()).reverse();
     },
 
-    /** Look up a single command by id. */
-    getCommand(cmdId) {
-      return pendingCommands.get(cmdId);
+    /** Call fn(ackData, command) for every ack. Returns an unsubscribe function. */
+    onAck(fn) {
+      ackListeners.add(fn);
+      return () => ackListeners.delete(fn);
     },
 
     /** Is this endpoint currently connected? */

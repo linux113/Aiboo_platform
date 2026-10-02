@@ -145,6 +145,10 @@ export const fromGateDecision = (d) => {
       intent: tri.intent?.score,
       impact: tri.impact?.score,
       recommended: (tri.recommended || []).slice(0, 6),
+      // used by PseudoLock response rules ("test against old alerts")
+      importance: tri.impact?.importance || null,
+      ip_kind: ctx.ip_kind || null,
+      local_hour: Number.isInteger(ctx.local_hour) ? ctx.local_hour : null,
     },
   };
 };

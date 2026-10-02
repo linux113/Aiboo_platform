@@ -29,6 +29,8 @@ import { seedDemoAgentData } from './routes/agent.routes.js';
 import alertRoutes from './routes/alert.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import reportRoutes from './routes/report.routes.js';
+import pseudolockRoutes from './routes/pseudolock.routes.js';
+import { initPseudoLock } from './services/pseudolock.service.js';
 
 // ❌ Outbound WebSocket import removed – agents push via HTTP.
 // ✅ Inbound agent command channel added – dashboard → agent dispatch.
@@ -87,6 +89,7 @@ app.use('/api/dashboard', apiLimiter, dashboardRoutes);
 app.use('/api/alerts', apiLimiter, alertRoutes);          // Alert management (ack / assign / close)
 app.use('/api/analytics', apiLimiter, analyticsRoutes);  // Executive dashboard, charts, trends
 app.use('/api/reports', apiLimiter, reportRoutes);       // Risk / compliance / executive (PDF, CSV)
+app.use('/api/pseudolock', apiLimiter, pseudolockRoutes); // Approvals, multi-step playbooks, runs
 
 // ✅ Agent routes now use agentLimiter (more permissive)
 app.use('/api/agent', agentLimiter, agentRoutes);
@@ -107,6 +110,8 @@ socketHandler(io);
 const agentChannel = registerAgentChannel(io);
 app.set('agentChannel', agentChannel);
 logger.info('Agent command channel registered on /agent-channel namespace');
+// PseudoLock approvals + playbooks send actions through the same channel
+initPseudoLock({ agentChannel, emitter: (ev, data) => io.emit(ev, data) });
 
 // ❌ Outbound WebSocket connection to agent is completely removed.
 // Remote agents push findings via HTTP POST to /api/agent/findings.
