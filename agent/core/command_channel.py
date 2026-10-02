@@ -152,8 +152,10 @@ class CommandChannel:
                 await self._ack(cmd_id, "executed",
                                 result=result if isinstance(result, dict) else None)
                 return
-            await self._engine.execute_remote_action(action, target, params)
-            await self._ack(cmd_id, "executed")
+            result = await self._engine.execute_remote_action(action, target, params)
+            # result = {"message": ...} -> shown on the approval / playbook step
+            await self._ack(cmd_id, "executed",
+                            result=result if isinstance(result, dict) else None)
         except Exception as exc:
             log.error("Remote command %s failed: %s", cmd_id, exc)
             await self._ack(cmd_id, "failed", str(exc))

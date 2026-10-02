@@ -467,8 +467,9 @@ class TestAccessControl:
         from core.events import ActionRecord
         bus.subscribe(ActionRecord, cap)
         eng = RealResponseEngine(bus, auto_response=False)
-        await eng.execute_remote_action("restrict_identity", "eve", {"minutes": 5})
+        res = await eng.execute_remote_action("restrict_identity", "eve", {"minutes": 5})
         assert records[-1].status == "active" and "5 min" in records[-1].details
+        assert res == {"message": records[-1].details[:500], "status": "active"}  # sent back in the ack
         await eng.execute_remote_action("lift_restriction", "eve", {})
         assert ["net", "user", "eve", "/active:yes"] in w.cmds
         await eng.execute_remote_action("force_logout", "eve", {})

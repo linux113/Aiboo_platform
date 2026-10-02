@@ -325,7 +325,7 @@ class RealResponseEngine:
         action_name: str,
         target: str,
         params: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         """
         Entry point for commands pushed via the CommandChannel WebSocket.
 
@@ -341,6 +341,11 @@ class RealResponseEngine:
             target:      target identifier (pid / ip / user_id / device_id)
             params:      optional dict - pid, src_ip, user_id, device_id,
                          process_name, severity, confidence, etc.
+
+        Returns:
+            {"message": <what was done>, "status": <record status>} - sent back
+            to the dashboard in the "executed" ack, so approvals and playbook
+            runs show e.g. "Account 'x' disabled for 30 min" instead of "Done".
         """
         params = dict(params or {})
         target = str(target or "").strip()
@@ -374,7 +379,7 @@ class RealResponseEngine:
                     raise RuntimeError(
                         f"{len(errors)}/{len(pids)} kills failed - " + "; ".join(errors)
                     )
-                return
+                return {"message": f"Stopped {len(pids)} processes matching '{target}'", "status": "success"}
             params["pid"] = pids[0]
             if not params.get("process_name"):
                 try:
@@ -471,6 +476,8 @@ class RealResponseEngine:
             # Surface the failure to the CommandChannel so the dashboard
             # gets a "failed" ack with the real reason.
             raise RuntimeError(record.error or f"{action.value} failed")
+        message = str(record.details or "").strip() or f"{action.value} done on {record.target or target or 'this PC'}"
+        return {"message": message[:500], "status": record.status}
 
     # ---- Remote target helpers ----
 

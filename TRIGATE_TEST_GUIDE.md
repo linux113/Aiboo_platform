@@ -393,7 +393,7 @@ Full description: `PSEUDOLOCK_SPECIFICATION_v1.0.md`. Nothing new to install (no
 
 ### 20.2 TriGate asks for approval (real attack test)
 1. Admin Command Prompt: `net user aibootest7 Test@12345 /add`
-2. Do **Test 1** with the user `aibootest7`: run `runas /user:aibootest7 cmd` and type a **wrong** password, 6 times (as in Test 1).
+2. Do **Test 1** with the user `aibootest7`: run `runas /user:aibootest7 cmd` and type a **wrong** password, **exactly 5 times**. (More can make Windows lock the account by itself – see the warning at the start of §21.)
 3. Within about 30 seconds:
    - the bell shows **"Approval needed – Disable account 'aibootest7' for 30 min …"**;
    - the **Response** tab gets an amber number.
@@ -461,12 +461,22 @@ Remove-NetFirewallRule -DisplayName "AiBoO_Block_45_95_147_3*"
 
 A **rule** says: *WHEN this kind of attack happens → THEN run this playbook* (automatically, after one click, or only a message). Full description: `PSEUDOLOCK_SPECIFICATION_v1.0.md` §7.7. Nothing new to install.
 
+**Test status (PC "gorilla", 2 Oct 2026):** 21.1–21.6 ✅ passed (test mode, automatic run "Ran playbook" + account disabled 2 min, cooldown). 21.7 approval card ✅ and Reject ✅; **Approve & start** still to be pressed once.
+
 **Before you start**
 - Do the setup of §20 first: new ZIP, copy your old `backend\.env` and `agent\config.ini`, start the backend, the frontend and the agent (**Run as Administrator**).
 - The test user `aibootest7` from §20.2 must exist. If you deleted it, run this again in an Admin Command Prompt: `net user aibootest7 Test@12345 /add`
 - Open the dashboard → **Response** → there is a new tab **⚙ Rules**.
 
-> ⚠ **Important:** a rule acts on **every** matching attack, also on real users. Keep the test rule limited to **your PC** (step 21.2) and **delete it at the end** (step 21.8). Wait **5 minutes** between two wrong-password rounds (as in Test 1), otherwise Windows may not report a new attack.
+> ⚠ **Important:** a rule acts on **every** matching attack, also on real users. Keep the test rule limited to **your PC** (step 21.2) and **delete it at the end** (step 21.8).
+
+> ⚠ **Windows locks the account by itself after too many wrong passwords** (usually 10 within 10 minutes). Then `runas` says *"1909: The referenced account is currently locked out"*, `net user aibootest7` says **Account active: Locked**, and TriGate reports **"Account locked out"** instead of **"Password guessing"**. To avoid this:
+> - type **exactly 5** wrong passwords per round (5 are enough for "Password guessing");
+> - wait **10 minutes** between two rounds;
+> - see your Windows limits with `net accounts` ("Lockout threshold", "Lockout duration");
+> - if the account is **Locked**: `net user aibootest7 /active:yes` (Admin Command Prompt) or wait 10 minutes.
+>
+> Before **every** round, `net user aibootest7` must say **Account active: Yes**.
 
 ### 21.1 Make a small test playbook (only needs the user name)
 A local `runas` test has **no IP address**. The built-in "Contain password guessing" needs an IP, so with `runas` the rule would only say *Skipped*. So we make a playbook that only needs the user:
@@ -480,7 +490,7 @@ A local `runas` test has **no IP address**. The built-in "Contain password guess
 1. **Response → ⚙ Rules → ＋ New rule**.
 2. Name: `Test rule - password guessing`
 3. **WHEN** part:
-   - Attack type: **Password guessing (many failed logons)** is already ticked. Leave it like that.
+   - Attack type: **Password guessing (many failed logons)** is already ticked. Also tick **Account locked out**, so the rule works even if Windows locks the account during the test.
    - Risk at least: `55`. TriGate verdict: **BLOCK** ticked, HOLD not ticked.
    - Only these PCs: click the grey button **+ <your PC name>** under the box (or type your PC name exactly as on the Dashboard).
    - Where the attack comes from: **Any (or no IP)**. Time of day: **Any time**.
@@ -497,7 +507,7 @@ A local `runas` test has **no IP address**. The built-in "Contain password guess
    - Below the table: "Not matched because: other attack type (…)". This shows why the other alerts would not start the rule.
 
 ### 21.4 Attack in test mode
-1. In a normal Command Prompt: `runas /user:aibootest7 cmd` and type a **wrong** password, 6 times (as in Test 1).
+1. In a normal Command Prompt: `runas /user:aibootest7 cmd` and type a **wrong** password, **exactly 5 times**.
 2. Within about 30 seconds, go to **⚙ Rules** and press **⟳ Refresh**. In **📜 Activity** you see:
    **🧪 Test mode - nothing done** · rule Test rule - password guessing · *"TEST MODE - would have: run "Rule test - disable user 2 min". Matched: Password guessing on <PC> (risk …, user aibootest7)"*
    If one round of wrong passwords gives TriGate more than one BLOCK, you also see **⏸ Cooldown - already handled** lines just above it. That is normal: one round is handled once.
@@ -506,7 +516,7 @@ A local `runas` test has **no IP address**. The built-in "Contain password guess
 
 ### 21.5 Switch test mode OFF – the rule now acts by itself
 1. On the rule card: **✎ Edit** → untick **🧪 Test mode**. A yellow warning appears: *"This rule will change PCs without asking anyone."* → **💾 Save rule**. The card no longer shows "test mode".
-2. Wait **5 minutes** after the last wrong-password round. Then do the 6 wrong passwords for `aibootest7` again.
+2. Check `net user aibootest7` says **Yes**, and wait **10 minutes** after the last wrong-password round. Then type a wrong password for `aibootest7` **exactly 5 times** again.
 3. Within about 30 seconds:
    - The bell shows **"Rule disabled aibootest7 on <PC> for 2 min"**.
    - **⚙ Rules → ⟳ Refresh → Activity**: **▶ Ran playbook** · *"Started "Rule test - disable user 2 min" automatically …"*. Click **see run**.
@@ -516,18 +526,18 @@ A local `runas` test has **no IP address**. The built-in "Contain password guess
 5. The rule card now shows **"matched 2× · last …"** (one test match and one real match).
 
 ### 21.6 Cooldown – the same attack is not handled twice
-1. Wait until `net user aibootest7` shows **Active Yes** again. Also wait 5 minutes after the last round.
-2. Do the 6 wrong passwords again (within 30 minutes of step 21.5).
+1. Wait until `net user aibootest7` shows **Active Yes** again. Also wait 10 minutes after the last round.
+2. Type a wrong password **exactly 5 times** again (within 30 minutes of step 21.5).
 3. **Activity** shows **⏸ Cooldown - already handled** · *"Already handled N min ago (cooldown 30 min)"*. The account stays **Active Yes**, and no approval appears.
 
 ### 21.7 "Ask first" – the playbook starts only after you click
 1. **✎ Edit** → **✋ Ask first** → **💾 Save rule**. Saving also starts the cooldown fresh.
-2. Wait 5 minutes, then do the 6 wrong passwords again.
+2. Wait 10 minutes (`net user aibootest7` = **Yes**), then type a wrong password **exactly 5 times** again.
 3. The bell shows **"Approval needed – Rule "Test rule - password guessing" wants to run "Rule test - disable user 2 min" on <PC> (user aibootest7)"**.
 4. **✋ Approvals**: the card has the grey label **Response rule**, the text *"Starts playbook Rule test - disable user 2 min when approved"*, and a countdown.
 5. Press **✔ Approve & start**. In **History** the card says **✅ Playbook "Rule test - disable user 2 min" started**.
 6. **▶ Runs** shows *"started by Rule "Test rule - password guessing" (approved by <your email>)"*, and `net user aibootest7` → Active **No** (back to Yes after 2 minutes).
-7. *(Optional)* Repeat once more after 5 minutes and press **✖ Reject**: no run is started, and the account stays Active Yes.
+7. *(Optional)* Repeat once more after 10 minutes and press **✖ Reject**: no run is started, and the account stays Active Yes.
 
 **Optional – other things on the Rules screen:**
 - **…or start from an example**: 4 ready rules (password guessing from the internet, known-bad IP, new admin at night, security log cleared). They open in the editor in test mode. Save one, use **↑ ↓** to change the order, then delete it.

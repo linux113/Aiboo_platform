@@ -147,6 +147,20 @@ class TestCommandChannel:
         assert eng.calls[0][0:2] == ("terminate_process", "1234")
 
     @pytest.mark.asyncio
+    async def test_executed_ack_carries_the_result_message(self):
+        # approvals / playbook steps show this text instead of just "Done"
+        eng = _FakeEngine()
+        async def run(action, target, params):
+            eng.calls.append((action, target, params))
+            return {"message": f"Account '{target}' disabled for 30 min", "status": "active"}
+        eng.execute_remote_action = run
+        ch, fake = _channel(eng)
+        await ch._handle_command({"cmd_id": "c9", "action": "restrict_identity", "target": "aibootest7"})
+        last = fake.emitted[-1][2]
+        assert last["status"] == "executed"
+        assert last["result"]["message"] == "Account 'aibootest7' disabled for 30 min"
+
+    @pytest.mark.asyncio
     async def test_engine_error_acks_failed_with_reason(self):
         ch, fake = _channel(_FakeEngine(RuntimeError("Access denied")))
         await ch._handle_command({"cmd_id": "c2", "action": "terminate_process", "target": "1"})
