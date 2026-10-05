@@ -50,6 +50,8 @@ copy /Y "%~dp0AiBoO-Agent.exe" "%INSTALL_DIR%\" >nul || goto :copyfail
 copy /Y "%~dp0config.ini" "%INSTALL_DIR%\" >nul || goto :copyfail
 copy /Y "%~dp0nssm.exe" "%INSTALL_DIR%\" >nul
 copy /Y "%~dp0uninstall_service.bat" "%INSTALL_DIR%\" >nul
+copy /Y "%~dp0stop_agent.bat" "%INSTALL_DIR%\" >nul
+copy /Y "%~dp0show_status.bat" "%INSTALL_DIR%\" >nul
 if not exist "%INSTALL_DIR%\config" mkdir "%INSTALL_DIR%\config"
 copy /Y "%~dp0config\event_rules.yaml" "%INSTALL_DIR%\config\" >nul
 if not exist "%INSTALL_DIR%\config\ip_blocklist.txt" copy /Y "%~dp0config\ip_blocklist.txt" "%INSTALL_DIR%\config\" >nul
@@ -93,6 +95,7 @@ echo.
 echo  Service : %SVC%   (check: sc query %SVC%)
 echo  Folder  : %INSTALL_DIR%
 echo  Log     : %INSTALL_DIR%\logs\agent.log
+echo  Status  : "%INSTALL_DIR%\show_status.bat"  ^(running? connected? last log lines^)
 echo  Remove  : "%INSTALL_DIR%\uninstall_service.bat" (as Administrator)
 echo.
 echo  Note: as a service the agent cannot lock the screen (Windows does not allow

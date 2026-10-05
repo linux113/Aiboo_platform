@@ -48,6 +48,8 @@ copy /Y "installer\configure.ps1" "%PKG%\" >nul
 copy /Y "installer\install_service.bat" "%PKG%\" >nul
 copy /Y "installer\uninstall_service.bat" "%PKG%\" >nul
 copy /Y "installer\run_agent.bat" "%PKG%\" >nul
+copy /Y "installer\stop_agent.bat" "%PKG%\" >nul
+copy /Y "installer\show_status.bat" "%PKG%\" >nul
 copy /Y "installer\nssm.exe" "%PKG%\" >nul
 copy /Y "installer\README.txt" "%PKG%\" >nul
 copy /Y "config\event_rules.yaml" "%PKG%\config\" >nul
@@ -64,10 +66,13 @@ echo   DONE
 echo ==========================================================
 echo   %~dp0dist.zip
 echo.
-echo   Copy dist.zip to the other PC, unzip it, open the AiBoO-Agent folder and
-echo   right-click run_agent.bat (test, with a window)  or
-echo   install_service.bat (always on, starts with Windows) - "Run as administrator".
-echo   Both ask for the server address (your ngrok address) the first time.
+echo   On that PC, in the AiBoO-Agent folder:
+echo     run_agent.bat    - right-click - "Run as administrator"
+echo                        asks for the server address ONCE, then the agent
+echo                        runs in the BACKGROUND - no window is left open.
+echo     show_status.bat  - is it running and connected?  (log shown)
+echo     stop_agent.bat   - stop the background agent.
+echo     install_service.bat - always on from Windows start, also no window.
 echo.
 pause
 exit /b 0

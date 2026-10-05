@@ -94,10 +94,16 @@ exe = EXE(
     upx=False,              # UPX-packed files are flagged more often by antivirus
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,           # window mode shows the log; as a service the log goes to logs\agent.log
+    console=False,          # WINDOWLESS: no black window ever appears on the client PC.
+                            # The agent still writes its log to logs\agent-stdout.log
+                            # next to the .exe (see prepare_std_streams() in main.py),
+                            # and show_status.bat shows it when you want to look.
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    uac_admin=True,         # ask Windows for Administrator rights (needed to read
+                            # the Security log). Windows shows its own yes/no box;
+                            # that is the correct, visible UAC prompt.
 )

@@ -17,6 +17,49 @@ from core.orchestrator import Orchestrator
 from core.event_bus import EventBus
 from api.ingestion_api import create_app
 
+
+def agent_base_dir():
+    """Folder the agent keeps its files in (works for script and frozen .exe)."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.getcwd()
+
+
+def prepare_std_streams():
+    """
+    Windowless builds (PyInstaller console=False / run in the background) have
+    NO console: Python sets sys.stdout and sys.stderr to None. Without this,
+    print() would fail and every log line would be thrown away.
+
+    Both streams are pointed at logs\\agent-stdout.log next to the .exe, so the
+    agent can always be checked later even though nothing appears on screen.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        log_dir = os.path.join(agent_base_dir(), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        stream = open(os.path.join(log_dir, 'agent-stdout.log'),
+                      'a', encoding='utf-8', errors='replace', buffering=1)
+        if sys.stdout is None:
+            sys.stdout = stream
+        if sys.stderr is None:
+            sys.stderr = stream
+    except Exception:
+        # No writable folder: drop the output instead of crashing.
+        try:
+            devnull = open(os.devnull, 'w')
+            if sys.stdout is None:
+                sys.stdout = devnull
+            if sys.stderr is None:
+                sys.stderr = devnull
+        except Exception:
+            pass
+
+
+# Must run before logging.basicConfig() and before any print().
+prepare_std_streams()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
@@ -33,10 +76,7 @@ def ensure_endpoint_config():
     No Unicode/emoji characters – plain ASCII only.
     """
     # Determine the base directory (works for both script and frozen .exe)
-    if getattr(sys, 'frozen', False):
-        base_dir = os.path.dirname(sys.executable)
-    else:
-        base_dir = os.getcwd()
+    base_dir = agent_base_dir()
     config_path = os.path.join(base_dir, 'config.ini')
 
     # Load existing config or create a new one
@@ -62,8 +102,11 @@ def ensure_endpoint_config():
 
     # If empty or default placeholder, we need to set one
     if not current_name or current_name.lower() in ('unknown', 'unknown_pc', ''):
-        # Check if we are running interactively (has a terminal)
-        if sys.stdin.isatty():
+        # Check if we are running interactively (has a terminal).
+        # sys.stdin is None when the agent runs without a console (background /
+        # service / windowless build), so it must be checked before isatty().
+        has_console = bool(sys.stdin) and getattr(sys.stdin, 'isatty', lambda: False)()
+        if has_console:
             # Interactive prompt – safe to use print/input
             print("\n" + "=" * 50)
             print("  Welcome to AiBoO Agent!")
