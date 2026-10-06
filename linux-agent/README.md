@@ -265,3 +265,23 @@ Check the tunnel itself from the server:
 
 `200` = the tunnel is fine; `502` = ngrok cannot reach your backend (restart the
 tunnel, or the backend); `000` = no connection at all.
+
+### False positives: what was fixed after the first live run
+
+The first live Ubuntu server showed how easy it is to alarm on normal Linux work.
+These were real bugs and are fixed (each one has a test):
+
+| What happened | Why | Fix |
+|---|---|---|
+| `strip -g -p /var/tmp/dracut.…` and `cp --reflink=auto …` reported as **critical reverse shell** | the matcher accepted a bare tool name (`mkfifo`, `chmod +x /tmp`) with no network step | a reverse shell now needs the real shape: `/dev/tcp`, `nc -e`, `socat … exec:`, `mkfifo … \| sh`, `curl … \| sh`, `python -c import socket`, ... |
+| `cp --reflink=auto -dfrp -L -t …` reported as an **attack tool** | the tool list matched plain substrings, so `"frp "` matched inside `-dfrp` | tools are matched as whole tokens (`pspy64` still matches `pspy`) |
+| Ubuntu **kernel/package work** in `/var/tmp/dracut.*` reported as "root ran a program from /tmp" | package managers legitimately build there | `dracut`, `initramfs`, `dpkg`, `apt`, `mkinitramfs` work is recognised as maintenance and skipped |
+| `sudo umount` / `sudo apt-get install curl` reported as **dangerous sudo** | substrings again (`"mount "` inside `umount`) | whole-token matching, and package-manager commands are ignored |
+| AiBoO **alerted on its own actions** (`usermod -L`, `iptables -I`, `ufw deny` it had just run) | the agent reads the same sudo/audit logs it writes to | the response engine records what it really ran and the detectors ignore those lines for 2 minutes |
+
+Real events still raise alerts, by design: a **root shell** (`sudo bash …`),
+`chpasswd`/`usermod`/`userdel`, `iptables`/`ufw` used by a human, log truncation.
+
+**Running `tests/prove_real.sh` creates real account events** (`useradd` →
+`userdel` → `chpasswd` for its test account) plus a `sudo bash` line. Those alerts
+are correct - close or acknowledge them after a test run.

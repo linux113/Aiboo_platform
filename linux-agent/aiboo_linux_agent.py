@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 AGENT_NAME = "AiBoO-Linux-Sentinel"
 
 try:
@@ -254,15 +254,47 @@ PATTERNS: dict[str, Pattern] = {p.key: p for p in [
     Pattern("device_health_fail", "Server health check failed", 40, "device_health_fail"),
 ]}
 
-# Commands that make a sudo line interesting (T1548)
-SUSPICIOUS_SUDO_COMMANDS = (
-    "/bin/su", "/usr/bin/su", " /bin/bash", " /bin/sh", "/usr/sbin/useradd", "useradd",
-    "usermod", "userdel", "passwd", "visudo", "/etc/sudoers", "chmod 777", "chattr",
-    "systemctl start", "systemctl enable", "systemctl stop", "service ", "crontab",
-    "nc ", "netcat", "ncat", "socat", "curl ", "wget ", " python", "python3", "perl ",
-    "base64", "openssl s_client", "iptables", "ufw ", "nft ", "journalctl --vacuum",
-    "rm -rf /var/log", "truncate -s 0", "dd if=", "mount ", "insmod", "modprobe",
+# Commands that make a sudo line interesting (T1548). Single words are matched as
+# WHOLE tokens - plain substrings made "umount" match "mount " and "chpasswd" match
+# "passwd", which is how a normal kernel update filled the dashboard with alerts.
+SUSPICIOUS_SUDO_WORDS = (
+    "su", "sudo", "bash", "sh", "dash", "zsh", "ksh", "useradd", "usermod", "userdel",
+    "passwd", "chpasswd", "visudo", "chattr", "chmod", "crontab", "nc", "netcat",
+    "ncat", "socat", "curl", "wget", "python", "python3", "perl", "ruby", "base64",
+    "iptables", "ip6tables", "ufw", "nft", "mount", "insmod", "modprobe", "systemctl",
+    "service", "docker", "kubectl", "ssh", "scp", "rsync", "at", "batch",
 )
+SUSPICIOUS_SUDO_PHRASES = (
+    "/etc/sudoers", "chmod 777", "/etc/passwd", "/etc/shadow", "systemctl start",
+    "systemctl enable", "systemctl stop", "systemctl disable", "journalctl --vacuum",
+    "rm -rf /var/log", "truncate -s 0", "dd if=", "openssl s_client", "> /var/log",
+    "history -c", "> ~/.bash_history",
+)
+_SUDO_WORD_RES = [re.compile(r"(?:^|[\s/])" + re.escape(w) + r"(?![a-z])", re.I)
+                  for w in SUSPICIOUS_SUDO_WORDS]
+
+
+# sudo apt/dpkg/snap/pip work is routine maintenance, not attacker behaviour
+SUDO_PACKAGE_TOOLS = (
+    "apt", "apt-get", "aptitude", "dpkg", "dpkg-deb", "snap", "pip", "pip3", "yum",
+    "dnf", "zypper", "rpm", "unattended-upgrade", "needrestart", "debconf",
+    "add-apt-repository", "apt-key", "update-alternatives", "ucf",
+)
+
+
+def find_suspicious_sudo(cmd: str) -> str:
+    """Which suspicious command/word appears in this sudo command line?"""
+    low = (cmd or "").lower()
+    first = os.path.basename((cmd or "").split()[0]).lower() if (cmd or "").split() else ""
+    if first in SUDO_PACKAGE_TOOLS:
+        return ""                       # apt-get install curl is not an attack
+    for phrase in SUSPICIOUS_SUDO_PHRASES:
+        if phrase.lower() in low:
+            return phrase
+    for word, rx in zip(SUSPICIOUS_SUDO_WORDS, _SUDO_WORD_RES):
+        if rx.search(cmd or ""):
+            return word
+    return ""
 
 # User agents of scanners / attack tools
 SCANNER_AGENTS = (
@@ -627,7 +659,9 @@ def detect_auth_line(line: str, st: Settings, state: AgentState, fname: str) -> 
                 description=f"'{user}' ran '{cmd[:200]}' - security logging is now off.",
                 extra={"command": cmd[:200]},
             )]
-        hit = next((c for c in SUSPICIOUS_SUDO_COMMANDS if c in cmd), "")
+        if state_ran_recently(state, cmd):
+            return out                      # this was AiBoO's own response action
+        hit = find_suspicious_sudo(cmd)
         if hit:
             out.append(Finding(
                 pattern="suspicious_sudo", severity="high",
@@ -1343,23 +1377,62 @@ def risk_of(finding: Finding, trust: int, importance: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 # Shell/C2 one-liners that are almost never legitimate in a server log
+# A reverse shell needs a NETWORK step. Matching on a bare tool name made Ubuntu's
+# own package work look like an attack (strip/cp/dracut showed up as "reverse shell"
+# on a real server), so every branch below requires the actual C2 shape.
 REVERSE_SHELL_RE = re.compile(
-    r"(/dev/(tcp|udp)/|bash -i|sh -i|nc -e|ncat -e|netcat.*-e |socat .*(exec|EXEC):|"
-    r"mkfifo|python[0-9.]* -c .*(import socket|socket\.socket|pty\.spawn|subprocess)|"
-    r"perl -e .*socket|php -r .*(fsockopen|shell_exec)|"
-    r"curl [^|]*\| ?(ba)?sh|wget [^|]*\| ?(ba)?sh|"
-    r"openssl s_client -connect.*-quiet|base64 -d.*\| ?(ba)?sh|"
-    r"chmod \+x /(tmp|dev/shm|var/tmp)|screen -dm|tmux new-session -d)",
+    r"(/dev/(tcp|udp)/\S+"
+    r"|\bnc\b[^|;]*\s-e\s|\bncat\b[^|;]*\s-e\s|\bnetcat\b[^|;]*\s-e\s"
+    r"|\bsocat\b[^|;]*\b(exec|EXEC):"
+    r"|\bmkfifo\b[^\n]*\|[^\n]*(nc|ncat|cat|openssl|(ba|z|k)?sh)\b"
+    r"|\bnc\b[^\n]*<[^\n]*\|[^\n]*(ba|z|k)?sh\b"
+    r"|\b(ba|z|k)?sh\b\s+-i\b"
+    r"|\bpython[0-9.]*\b\s+-c\b[^;]*(import socket|socket\.socket|pty\.spawn)"
+    r"|\bperl\b\s+-e\b[^;]*socket|\bphp\b\s+-r\b[^;]*(fsockopen|shell_exec)"
+    r"|\b(curl|wget)\b[^|;]*\|\s*(sudo\s+)?(ba)?sh\b"
+    r"|\bopenssl\b[^|;]*s_client[^|;]*-quiet"
+    r"|\bbase64\b[^|;]*-d[^|;]*\|\s*(ba)?sh\b"
+    r"|\bscreen\b\s+-dm\b|\btmux\b\s+new-session\s+-d\b)",
     re.I)
 
-# Known exploitation tools / miners seen in process lists
-TOOL_MARKERS = (
-    "xmrig", "minerd", "cpuminer", "masscan", "nmap -", "hydra ", "medusa ",
-    "sqlmap", "metasploit", "msfconsole", "beef", "ettercap", "aircrack",
-    "john ", "hashcat", "responder.py", "impacket", "psexec.py", "wmiexec.py",
-    "linpeas", "linenum.sh", "pspy", "chisel", "frp ", "ngrok", "ligolo",
-    "gost -L", "reGeorg", "socks5", "tun0", "proxychains", "mimikatz",
+# Package manager / kernel maintenance work happens in /var/tmp with tools that
+# look scary in a process list. Never call that a reverse shell.
+MAINTENANCE_HINTS = (
+    "dracut", "initramfs", "update-initramfs", "unattended-upgrade", "kernel-install",
+    "plymouth", "dpkg", "apt-get", "apt ", "/var/lib/dpkg", ".deb ", "mkinitramfs",
 )
+
+# Temp folders that package managers legitimately build in.
+PACKAGE_TEMP_PREFIXES = ("/var/tmp/dracut.", "/var/tmp/apt", "/tmp/apt", "/tmp/dpkg-",
+                         "/var/tmp/dpkg", "/var/tmp/mkinitramfs", "/tmp/mkinitramfs")
+
+
+def is_maintenance_command(cmd: str) -> bool:
+    """True when a command line is normal package/kernel maintenance."""
+    low = (cmd or "").lower()
+    return any(h in low for h in MAINTENANCE_HINTS)
+
+# Known exploitation tools / miners. Matched as WHOLE tokens, never as plain
+# substrings: "frp " used to match inside "cp --reflink=auto -dfrp -L", which made
+# a copy command look like a tunnelling tool on a real server.
+TOOL_MARKERS = (
+    "xmrig", "minerd", "cpuminer", "masscan", "nmap", "hydra", "medusa",
+    "sqlmap", "metasploit", "msfconsole", "beef", "ettercap", "aircrack",
+    "john", "hashcat", "responder.py", "impacket", "psexec.py", "wmiexec.py",
+    "linpeas", "linenum.sh", "pspy", "chisel", "frp", "ngrok", "ligolo",
+    "gost", "regeorg", "socks5", "tun0", "proxychains", "mimikatz",
+    "etterlog", "airbase", "pwnkit", "mimipenguin", "linux-exploit-suggester",
+)
+_TOOL_RES = [(marker, re.compile(r"(?:^|[\s/])" + re.escape(marker) + r"(?![a-z])", re.I))
+             for marker in TOOL_MARKERS]
+
+
+def find_tool_marker(cmd: str) -> str:
+    """Which known tool appears in this command line (whole token only)?"""
+    for marker, rx in _TOOL_RES:
+        if rx.search(cmd or ""):
+            return marker
+    return ""
 
 SUSPICIOUS_EXEC_DIRS = ("/tmp/", "/dev/shm/", "/var/tmp/", "/run/", "/home/*/.cache/")
 SCRIPT_EXTS = (".php", ".phtml", ".jsp", ".jspx", ".asp", ".aspx", ".sh", ".pl", ".py",
@@ -1401,9 +1474,11 @@ def detect_suspicious_processes(st: Settings, state: AgentState) -> list[Finding
         key_base = f"{p['name']}:{cmd[:60]}:{p['started']}"
         if state.already_sent(f"proc:{key_base}"):
             continue
-        shell = REVERSE_SHELL_RE.search(cmd)
-        tool = next((t for t in TOOL_MARKERS if t in cmd.lower()), "")
-        in_bad_dir = any(cmd.startswith(d) for d in ("/tmp/", "/dev/shm/", "/var/tmp/"))
+        maintenance = is_maintenance_command(cmd)
+        shell = None if maintenance else REVERSE_SHELL_RE.search(cmd)
+        tool = find_tool_marker(cmd)
+        in_bad_dir = (any(cmd.startswith(d) for d in ("/tmp/", "/dev/shm/", "/var/tmp/"))
+                      and not maintenance and not cmd.startswith(PACKAGE_TEMP_PREFIXES))
         if shell:
             out.append(Finding(
                 pattern="reverse_shell", severity="critical",
@@ -1464,7 +1539,8 @@ def detect_audit_line(line: str, st: Settings, state: AgentState, fname: str) ->
             except ValueError:
                 cmd = ""
         cmd = (cmd or args).strip()
-        if cmd and REVERSE_SHELL_RE.search(cmd):
+        maintenance = is_maintenance_command(cmd)
+        if cmd and not maintenance and REVERSE_SHELL_RE.search(cmd):
             out.append(Finding(
                 pattern="reverse_shell", severity="critical",
                 summary=f"Kernel saw a reverse-shell command: {cmd[:120]}",
@@ -1473,7 +1549,7 @@ def detect_audit_line(line: str, st: Settings, state: AgentState, fname: str) ->
                 description=f"auditd recorded the execution: {cmd[:250]}",
                 extra={"command": cmd[:250], "source": "auditd"},
             ))
-        elif cmd and any(t in cmd.lower() for t in TOOL_MARKERS):
+        elif cmd and find_tool_marker(cmd):
             out.append(Finding(
                 pattern="malware", severity="high",
                 summary=f"Kernel saw an attack tool running: {cmd[:110]}",
@@ -1497,7 +1573,9 @@ def detect_audit_line(line: str, st: Settings, state: AgentState, fname: str) ->
             exe = re.search(r'exe="([^"]+)"', line)
             name = (comm.group(1) if comm else "") or ""
             path = (exe.group(1) if exe else "") or ""
-            if path.startswith(("/tmp/", "/dev/shm/", "/var/tmp/")) or name in ("nc", "ncat", "socat", "xmrig"):
+            if (path.startswith(("/tmp/", "/dev/shm/", "/var/tmp/"))
+                    and not path.startswith(PACKAGE_TEMP_PREFIXES)
+                    and not maintenance) or name in ("nc", "ncat", "socat", "xmrig"):
                 out.append(Finding(
                     pattern="dropped_file", severity="high",
                     summary=f"Root executed a program from a temporary folder: {path or name}",
@@ -1728,6 +1806,27 @@ def journal_lines(unit: str, state: AgentState, limit: int = 200) -> list[str]:
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
+
+def _norm_command(cmd: str) -> str:
+    """'/usr/sbin/usermod -L bob' and 'sudo usermod -L bob' -> 'usermod -L bob'."""
+    parts = (cmd or "").split()
+    while parts and os.path.basename(parts[0]) in ("sudo", "env"):
+        parts = parts[1:]
+    if not parts:
+        return ""
+    return os.path.basename(parts[0]) + (" " + " ".join(parts[1:]) if len(parts) > 1 else "")
+
+
+def state_ran_recently(state: "AgentState", cmd: str, window: float = 120.0) -> bool:
+    """True when AiBoO itself ran this command a moment ago (do not alert on ourselves)."""
+    engine = getattr(state, "engine", None)
+    if engine is None or not cmd:
+        return False
+    try:
+        return engine.recently_ran(cmd, window)
+    except Exception:                                             # noqa: BLE001
+        return False
+
 
 def should_decide(finding: Finding) -> bool:
     """Posture/health advice stays advisory: no approval popup for a low item."""
