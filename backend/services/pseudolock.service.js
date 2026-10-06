@@ -23,6 +23,7 @@ import PlaybookModel from '../models/Playbook.js';
 import PlaybookRunModel from '../models/PlaybookRun.js';
 import ResponseRuleModel from '../models/ResponseRule.js';
 import RuleEventModel from '../models/RuleEvent.js';
+import { queueCommand, waitForCommand } from './commandQueue.service.js';
 import logger from '../utils/logger.js';
 import { freezeBadge } from './badge.service.js';
 
@@ -117,7 +118,25 @@ function cleanParams(action, raw = {}) {
   return out;
 }
 
-export const actionLabel = (a) => ACTIONS[a]?.label || a;
+// Same actions, but named the way each operating system does them. A Linux
+// endpoint must never show "Windows Firewall" on a button.
+const LINUX_LABELS = {
+  block_access: 'Block IP (Linux firewall / fail2ban)',
+  isolate_asset: 'Isolate - cut the host off from an IP (iptables / ufw)',
+  throttle_segment: 'Slow down traffic (tc / iptables)',
+  remove_throttle: 'Remove slow-down',
+  restrict_identity: 'Lock the account for N minutes',
+  lift_restriction: 'Unlock the account now',
+  revoke_identity: 'Lock the account (until someone unlocks it)',
+  force_logout: 'Log the user out of their sessions',
+  step_up_auth: 'Lock the sessions (sign in again)',
+  terminate_process: 'Stop a process',
+  pseudo_lock: 'Open decoy port (honeypot listener)',
+};
+const isLinux = (platform) => String(platform || '').toLowerCase().startsWith('linux');
+
+export const actionLabel = (a, platform) =>
+  (isLinux(platform) ? (LINUX_LABELS[a] || ACTIONS[a]?.label) : ACTIONS[a]?.label) || a;
 export const catalog = () => ({
   actions: Object.entries(ACTIONS).map(([id, a]) => ({
     id, label: a.label, help: a.help, target: a.target, targetHint: TARGETS[a.target].hint,
@@ -234,10 +253,24 @@ export async function executeAction({ endpoint, action, target, params = {}, by 
     const out = await freezeBadge({ badgeId: target, reason, by });
     return { ok: out.ok, status: out.ok ? 'executed' : 'failed', error: out.ok ? null : out.error, result: { message: out.message || out.error } };
   }
-  if (!channel) return { ok: false, status: 'failed', error: 'Agent channel not initialized (backend not fully started)' };
   if (!endpoint) return { ok: false, status: 'failed', error: 'No PC (endpoint) chosen for this action' };
-  const sent = channel.dispatch(String(endpoint), action, String(target ?? ''), params);
-  if (!sent?.ok) return { ok: false, status: 'failed', error: `PC '${endpoint}' is not connected - start the agent on that PC and try again` };
+  // Windows agents live on the socket channel; Linux agents poll the REST queue.
+  const sent = channel ? channel.dispatch(String(endpoint), action, String(target ?? ''), params) : { ok: false };
+  if (!sent?.ok) {
+    // Windows agents answer on the socket. A Linux agent has no socket.io - it
+    // polls /api/agent/commands/pending, so queue the command for it instead.
+    const queued = queueCommand(String(endpoint), action, String(target ?? ''), params,
+                                { requested_by: by, reason: reason ? String(reason).slice(0, 200) : '' });
+    if (!queued.ok) {
+      return { ok: false, status: 'failed',
+               error: `PC '${endpoint}' is not connected - start the agent on that PC and try again` };
+    }
+    emit('command:sent', { cmd_id: queued.cmd_id, endpoint_id: endpoint, action,
+                           target: target || '', sent_at: nowIso(), queued: true });
+    const restAck = await waitForCommand(queued.cmd_id, actionTimeoutMs());
+    return { ok: restAck.ok, status: restAck.status, cmd_id: queued.cmd_id,
+             error: restAck.error || null, result: restAck.result || null };
+  }
   emit('command:sent', { cmd_id: sent.cmd_id, endpoint_id: endpoint, action, target: target || '', sent_at: nowIso() });
   const ack = await new Promise((resolve) => {
     const timer = setTimeout(() => { ackWaiters.delete(sent.cmd_id); resolve(null); }, actionTimeoutMs());
@@ -298,8 +331,9 @@ export async function createApproval(input) {
     id: newId('apr'),
     status: 'pending',
     kind: input.runId ? 'playbook_step' : 'action',
-    title: clip(input.title || `${actionLabel(action)}${target ? `: ${target}` : ''}`, 200),
-    action, actionLabel: actionLabel(action), target,
+    title: clip(input.title || `${actionLabel(action, input.platform)}${target ? `: ${target}` : ''}`, 200),
+    action, actionLabel: actionLabel(action, input.platform), target,
+    platform: input.platform || '',
     params: cleanParams(action, input.params),
     endpoint,
     reason: clip(input.reason, 600),
@@ -395,7 +429,8 @@ export async function approvalsFromDecision(decision, agentStatus) {
         action: rec.action, target: String(rec.target).trim(),
         params: rec.action === 'restrict_identity' ? { minutes: 30 } : {},
         endpoint: decision.source || decision.endpoint || '',
-        title: clip(rec.text || `${actionLabel(rec.action)}: ${rec.target}`, 200),
+        platform: decision.platform || decision.metadata?.platform || '',
+        title: clip(rec.text || `${actionLabel(rec.action, decision.platform)}: ${rec.target}`, 200),
         reason: clip(`TriGate BLOCK (risk ${tri.risk?.score ?? '?'}): ${ctx.pattern_label || tri.pattern || decision.threat_type || ''}${ctx.description ? ` - ${ctx.description}` : ''}`, 600),
         risk: tri.risk?.score, level: tri.risk?.level, verdict, pattern: tri.pattern || ctx.pattern,
         origin: 'trigate', alertId: decision.event_id ? `tg_${decision.event_id}` : null, eventId: decision.event_id,

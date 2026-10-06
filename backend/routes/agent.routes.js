@@ -9,6 +9,10 @@ import {
 } from '../services/alertStore.js';
 import { freezeBadge, badgeConfigured } from '../services/badge.service.js';
 import { onTriGateDecision } from '../services/responseRules.service.js';
+import {
+  getCommandState, queueCommand as queueRestCommand,
+  takePendingCommands, finishCommand as finishQueuedCommand, findCommand,
+} from '../services/commandQueue.service.js';
 
 const router = express.Router();
 
@@ -29,9 +33,10 @@ const store = {
   compliance: {},    // endpoint -> latest compliance report
   // Remote commands for agents that CANNOT keep a Socket.IO connection open
   // (the Linux Sentinel polls over HTTPS). Windows agents keep using the
-  // socket channel; both end up in commandHistory.
-  commandQueue: [],  // waiting for the endpoint to pick them up
-  commandHistory: [],// everything, newest first (status: queued/sent/executed/failed)
+  // socket channel; both paths share the queue in services/commandQueue.service.js
+  // so approvals and playbooks can reach REST agents too.
+  commandQueue: getCommandState().commandQueue,
+  commandHistory: getCommandState().commandHistory,
 };
 
 // Read-only view used by analytics / reports
@@ -487,47 +492,20 @@ router.get('/actions/stats', protect, (req, res) => {
 //  Both end up in store.commandHistory and emit 'command:sent'.
 // ============================================================
 
-// Make a command id that is unique and readable in the logs.
-const newCommandId = () => `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-// Queue a command for an agent that polls over REST.
+// Queue/dispatch helpers live in services/commandQueue.service.js so the response
+// engine (approvals, playbooks) can queue commands for REST agents as well.
 const queueCommand = (endpoint_id, action, target, params) => {
-  const cmd_id = newCommandId();
-  const entry = {
-    cmd_id,
-    endpoint_id,
-    action,
-    target: target || '',
-    params: params && typeof params === 'object' ? params : {},
-    status: 'queued',
-    queued_at: new Date().toISOString(),
-    delivered_at: null,
-    completed_at: null,
-    error: null,
-    result: null,
-    via: 'rest',
-  };
-  store.commandQueue.push(entry);
-  if (store.commandQueue.length > 200) store.commandQueue.shift();
-  store.commandHistory.unshift(entry);
-  if (store.commandHistory.length > 500) store.commandHistory.pop();
-  emit('command:sent', {
-    cmd_id, endpoint_id, action, target: entry.target, sent_at: entry.queued_at, queued: true,
-  });
-  logger.info(`Remote command queued (REST) for ${endpoint_id}: ${action} (${cmd_id})`);
-  return { ok: true, cmd_id, queued: true, via: 'rest' };
+  const queued = queueRestCommand(endpoint_id, action, target, params);
+  if (queued.ok) {
+    emit('command:sent', {
+      cmd_id: queued.cmd_id, endpoint_id, action,
+      target: target || '', sent_at: queued.entry.queued_at, queued: true,
+    });
+  }
+  return queued;
 };
 
-// Remember the outcome of a command (used by both paths).
-const finishCommand = (cmd_id, status, error, result) => {
-  const entry = store.commandHistory.find((c) => c.cmd_id === cmd_id);
-  if (!entry) return null;
-  entry.status = status || entry.status;
-  entry.completed_at = new Date().toISOString();
-  entry.error = error || null;
-  if (result && typeof result === 'object') entry.result = result;
-  return entry;
-};
+const finishCommand = (cmd_id, status, error, result) => finishQueuedCommand(cmd_id, status, error, result);
 
 // POST /api/agent/commands – dispatch an action to a specific agent
 // Remote actions change the endpoint (kill processes, firewall rules), so
@@ -620,12 +598,7 @@ router.get('/commands/pending', validateAgentApiKey, (req, res) => {
   const endpoint = String(req.headers['x-endpoint-id'] || req.query.endpoint_id || '').trim();
   if (!endpoint) return res.status(400).json({ ok: false, error: 'x-endpoint-id header required' });
 
-  const mine = store.commandQueue.filter((c) => c.endpoint_id === endpoint);
-  store.commandQueue = store.commandQueue.filter((c) => c.endpoint_id !== endpoint);
-  for (const c of mine) {
-    c.status = 'sent';
-    c.delivered_at = new Date().toISOString();
-  }
+  const mine = takePendingCommands(endpoint);
   if (mine.length) logger.info(`${endpoint} picked up ${mine.length} queued command(s)`);
   res.json({ ok: true, count: mine.length, commands: mine });
 });
@@ -722,7 +695,10 @@ router.post('/correlated', validateAgentOrJWT, (req, res) => {
 
 router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
   const decision = { ...req.body, source: getSource(req) };
-  updateEndpointHeartbeat(decision.source, req.body?.platform || req.body?.metadata?.platform);
+  const decidedPlatform = req.body?.platform || req.body?.metadata?.platform
+    || store.endpoints[decision.source]?.platform || '';
+  decision.platform = decidedPlatform;
+  updateEndpointHeartbeat(decision.source, decidedPlatform);
   const imp = decision.metadata?.trigate?.impact?.importance;
   if (IMPORTANCE_LEVELS.has(String(imp || ''))) store.importance[decision.source] = String(imp);
   push(store.gateDecisions, decision);
