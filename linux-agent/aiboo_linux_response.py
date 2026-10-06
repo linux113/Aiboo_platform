@@ -38,6 +38,7 @@ Supported actions (same names the Windows agent and the dashboard use)
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 import random
@@ -52,7 +53,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # ---------------------------------------------------------------- guard rails
 PROTECTED_PIDS = {0, 1}
@@ -206,6 +207,13 @@ class ResponseEngine:
             return " WARNING: ufw is installed but NOT enabled - rule stored, traffic not dropped yet (run: ufw enable)"
         return ""
 
+    def _iptables_binary(self, target: str) -> str:
+        """iptables cannot touch IPv6 - those need ip6tables."""
+        binary = "ip6tables" if ":" in (target or "") else "iptables"
+        if shutil.which(binary):
+            return binary
+        return ""
+
     def _firewall_tool_preferred(self):
         """ufw when it is really filtering, otherwise iptables/nft."""
         if shutil.which("ufw") and self._ufw_active():
@@ -225,15 +233,56 @@ class ResponseEngine:
         except Exception:
             return False
 
+    def _server_ip(self) -> str:
+        try:
+            return socket.gethostbyname(re.sub(r"^https?://", "", self.st.remote_url).split(":")[0])
+        except Exception:
+            return ""
+
+    def _ip_guard(self, ip: str) -> str:
+        """Return a refusal reason, or "" when this target is safe to block.
+
+        Only real IP addresses and CIDR networks are accepted. Names such as
+        "localhost", junk strings such as "1" and huge nets such as 0.0.0.0/0 are
+        refused here, before any firewall command is built.
+        """
+        raw = (ip or "").strip()
+        if not raw:
+            return "no address given"
+        if raw.lower() in {n.lower() for n in NEVER_BLOCK}:
+            return f"refused to block {raw} (localhost or the AiBoO server)"
+        server_ip = self._server_ip()
+        if raw == server_ip:
+            return f"refused to block {raw} (that is the AiBoO server)"
+        try:
+            if "/" in raw:
+                net = ipaddress.ip_network(raw, strict=False)
+            else:
+                addr = ipaddress.ip_address(raw)
+                net = ipaddress.ip_network(f"{addr}/{addr.max_prefixlen}", strict=False)
+        except ValueError:
+            return f"refused to block '{raw}' (not an IP address or CIDR network)"
+        if net.prefixlen == 0:
+            return f"refused to block {raw} (that is every address, including the AiBoO server)"
+        if net.is_loopback or net.is_link_local or net.is_multicast or net.is_unspecified:
+            return f"refused to block {raw} (loopback / local / multicast address)"
+        if net.version == 4 and net.broadcast_address == ipaddress.ip_address("255.255.255.255"):
+            return f"refused to block {raw} (broadcast address)"
+        if net.version == 6 and net.num_addresses <= 1 and net[0].ipv4_mapped:
+            return self._ip_guard(str(net[0].ipv4_mapped))
+        if server_ip:
+            try:
+                if ipaddress.ip_address(server_ip) in net:
+                    return f"refused to block {raw} (it would cut off the AiBoO server too)"
+            except ValueError:
+                pass
+        return ""
+
     def block_ip(self, ip: str, reason: str = "") -> dict:
         ip = (ip or "").strip()
-        server_ip = ""
-        try:
-            server_ip = socket.gethostbyname(re.sub(r"^https?://", "", self.st.remote_url).split(":")[0])
-        except Exception:
-            server_ip = ""
-        if not ip or ip in NEVER_BLOCK or ip == server_ip or ip.startswith("127."):
-            return {"status": "failed", "message": f"refused to block {ip or '(empty)'} (localhost or the AiBoO server)"}
+        why = self._ip_guard(ip)
+        if why:
+            return {"status": "failed", "message": why}
         if not self.enabled:
             return {"status": "failed",
                     "message": "local response is OFF on this server (allow_response = no in config.ini)"}
@@ -252,11 +301,23 @@ class ResponseEngine:
         if tool == "ufw":
             code, out = self._run(["ufw", "--force", "deny", "from", ip, "to", "any"])
         elif tool == "iptables":
-            code, out = self._run(["iptables", "-I", "INPUT", "-s", ip, "-j", "DROP"])
-            if code == 0 and not self.dry:
-                self._run(["iptables", "-I", "OUTPUT", "-d", ip, "-j", "DROP"])
+            binary = self._iptables_binary(ip) or "iptables"
+            if binary == "iptables" and ":" in ip:
+                if shutil.which("nft"):
+                    tool = "nft"
+                    code, out = self._run(["nft", "add", "rule", "inet", "filter", "input",
+                                           "ip6", "saddr", ip, "drop"])
+                else:
+                    return {"status": "failed",
+                            "message": f"{ip} is an IPv6 address but ip6tables is not installed "
+                                       f"(install iptables/ip6tables or nftables)"}
+            else:
+                code, out = self._run([binary, "-I", "INPUT", "-s", ip, "-j", "DROP"])
+                if code == 0 and not self.dry:
+                    self._run([binary, "-I", "OUTPUT", "-d", ip, "-j", "DROP"])
         else:
-            code, out = self._run(["nft", "add", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"])
+            fam = "ip6" if ":" in ip else "ip"
+            code, out = self._run(["nft", "add", "rule", "inet", "filter", "input", fam, "saddr", ip, "drop"])
         status = "executed" if code == 0 else "failed"
         message = (f"blocked {ip} with {tool}" if code == 0 else f"{tool} failed: {out}") + warn
         self._audit("block_access", ip, status, message, {"tool": tool, "reason": reason[:200]})
@@ -265,14 +326,16 @@ class ResponseEngine:
 
     def unblock_ip(self, ip: str) -> dict:
         ip = (ip or "").strip()
-        if not ip:
-            return {"status": "failed", "message": "no IP given"}
+        why = self._ip_guard(ip)
+        if why:
+            return {"status": "failed", "message": why.replace("refused to block", "refused to unblock")}
         tool = self._firewall_tool_preferred()
         if tool == "ufw":
             code, out = self._run(["ufw", "delete", "deny", "from", ip, "to", "any"])
         elif tool == "iptables":
-            code, out = self._run(["iptables", "-D", "INPUT", "-s", ip, "-j", "DROP"])
-            self._run(["iptables", "-D", "OUTPUT", "-d", ip, "-j", "DROP"])
+            binary = self._iptables_binary(ip) or "iptables"
+            code, out = self._run([binary, "-D", "INPUT", "-s", ip, "-j", "DROP"])
+            self._run([binary, "-D", "OUTPUT", "-d", ip, "-j", "DROP"])
         elif tool == "nft":
             code, out = self._run(["nft", "-a", "delete", "rule", "inet", "filter", "input", "ip", "saddr", ip, "drop"])
         else:
@@ -452,6 +515,10 @@ class ResponseEngine:
         code, out = self._run(["usermod", "-L", user])
         if code != 0:
             return {"status": "failed", "message": f"usermod -L failed: {out}"}
+        state = self._password_state(user)
+        if state == "P":
+            return {"status": "failed",
+                    "message": f"usermod reported success but passwd -S {user} still shows the account as usable"}
         # log the user's sessions off, like the Windows agent does
         if shutil.which("loginctl"):
             self._run(["loginctl", "terminate-user", user])
@@ -467,11 +534,35 @@ class ResponseEngine:
         return {"status": "executed", "message": message,
                 "metadata": {"user": user, "minutes": minutes, "dry_run": self.dry}}
 
+    def _password_state(self, user: str) -> str:
+        """'L' locked, 'P' has a password, 'NP' no password, '' unknown."""
+        if not shutil.which("passwd"):
+            return ""
+        code, out = self._run(["passwd", "-S", user])
+        if code != 0 or not out:
+            return ""
+        parts = out.split()
+        return parts[1] if len(parts) > 1 else ""
+
     def unlock_user(self, user: str) -> dict:
         why = self._refuse_user(user)
         if why:
             return {"status": "failed", "message": why}
         code, out = self._run(["usermod", "-U", user])
+        state = self._password_state(user)
+        # usermod -U refuses to unlock an account that has no password at all,
+        # because that would create an account you can log into with ANY password.
+        if state == "L" and "passwordless" in out.lower():
+            msg = (f"account '{user}' cannot be unlocked: it has no password set, "
+                   f"so unlocking would allow login with an empty password. "
+                   f"Give it a password first (passwd {user}), then run lift_restriction again.")
+            self._audit("lift_restriction", user, "failed", msg)
+            return {"status": "failed", "message": msg}
+        if state == "L":
+            msg = (f"account '{user}' is still locked (usermod said: {out or 'no output'}). "
+                   f"Check the account by hand: passwd -S {user}")
+            self._audit("lift_restriction", user, "failed", msg)
+            return {"status": "failed", "message": msg}
         status = "executed" if code == 0 else "failed"
         message = f"account '{user}' unlocked" if code == 0 else f"usermod -U failed: {out}"
         self._audit("lift_restriction", user, status, message)

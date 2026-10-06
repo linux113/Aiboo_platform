@@ -358,6 +358,139 @@ def test_block_then_unblock_use_the_same_tool():
     assert any("-D" in c for c in iptables_calls), iptables_calls
 
 
+# --------------------------------------------------------------------------
+# target validation - only real addresses may reach a firewall command
+# --------------------------------------------------------------------------
+
+def _with_fake_iptables(fn):
+    """Pretend iptables exists (this sandbox has no firewall tools at all)."""
+    return _with_fake_system({"iptables"}, False, fn)
+
+
+def test_junk_and_names_are_never_blocked():
+    """Ubuntu showed this: 'iptables -s 1' or '-s localhost' can become a rule."""
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+    ran = []
+    eng._run = lambda cmd: (ran.append(cmd), (0, ""))[1]
+    bad_targets = ["1", "localhost", "example.com", "0.0.0.0/0", "", "  ",
+                   "::ffff:127.0.0.1", "169.254.169.254", "255.255.255.255", "999.1.1.1",
+                   "10.0.0.0/8", "127.0.0.1", "127.1.2.3", "::1"]
+    for t in bad_targets:
+        out = eng.block_ip(t, "guard test")
+        assert out["status"] == "failed", f"{t!r} was not refused: {out}"
+    assert ran == [], f"a firewall command was built for a bad target: {ran}"
+
+
+def test_real_public_address_is_still_allowed():
+    def go():
+        eng, _ = engine(allow_response=True, response_dry_run=False)
+        ran = []
+        eng._run = lambda cmd: (ran.append(cmd), (0, ""))[1]
+        out = eng.block_ip("45.95.147.3", "real attacker")
+        return out, ran
+    out, ran = _with_fake_iptables(go)
+    assert out["status"] == "executed", out
+    assert any("45.95.147.3" in c for c in ran), ran
+
+
+def test_a_network_that_contains_the_aiboo_server_is_refused():
+    # AiBoO server lives at 203.0.113.9 -> a /24 around it must be refused,
+    # otherwise the agent would cut off the dashboard it reports to.
+    eng, _ = engine(allow_response=True, response_dry_run=False,
+                    remote_url="http://203.0.113.9:4000")
+    out = eng.block_ip("203.0.113.0/24")
+    assert out["status"] == "failed", out
+    assert "AiBoO server" in out["message"], out["message"]
+    assert eng.block_ip("203.0.113.9")["status"] == "failed"
+    assert eng.block_ip("198.51.100.0/24")["status"] in ("executed", "failed")
+
+
+def test_a_normal_network_can_still_be_blocked():
+    def go():
+        eng, _ = engine(allow_response=True, response_dry_run=False)
+        ran = []
+        eng._run = lambda cmd: (ran.append(cmd), (0, ""))[1]
+        return eng.block_ip("203.0.113.0/24"), ran
+    out, ran = _with_fake_iptables(go)
+    assert out["status"] == "executed", out
+    assert any("203.0.113.0/24" in c for c in ran), ran
+
+
+# --------------------------------------------------------------------------
+# account lock - never claim an unlock that did not happen
+# --------------------------------------------------------------------------
+
+def _with_fake_accounts(state_after, fn):
+    """Pretend passwd -S reports `state_after` and usermod prints its warning."""
+    real_which, real_run = resp.shutil.which, resp.ResponseEngine._run
+
+    def fake_run(self, cmd, stdin=None):
+        if cmd[:1] == ["passwd"]:
+            return 0, f"aibootest {state_after} 2026-10-06 0 99999 7 -1"
+        if cmd[:1] == ["usermod"]:
+            return 0, "unlocking the user's password would result in a passwordless account"
+        return 0, ""
+
+    real_uid = resp.ResponseEngine._user_uid
+    resp.ResponseEngine._run = fake_run
+    resp.ResponseEngine._user_uid = lambda self, user: 1005      # a normal desktop user
+    resp.shutil.which = lambda n: f"/usr/sbin/{n}" if n in ("usermod", "passwd", "loginctl") else None
+    try:
+        eng, _ = engine(allow_response=True, response_dry_run=False)
+        return fn(eng)
+    finally:
+        resp.ResponseEngine._run = real_run
+        resp.ResponseEngine._user_uid = real_uid
+        resp.shutil.which = real_which
+
+
+def test_passwordless_account_unlock_is_reported_as_failed():
+    out = _with_fake_accounts("L", lambda eng: eng.unlock_user("aibootest"))
+    assert out["status"] == "failed", out
+    assert "no password set" in out["message"], out["message"]
+
+
+def test_working_unlock_is_reported_as_executed():
+    out = _with_fake_accounts("P", lambda eng: eng.unlock_user("aibootest"))
+    assert out["status"] == "executed", out
+    assert "unlocked" in out["message"], out["message"]
+
+
+def test_lock_that_did_not_take_effect_is_reported_as_failed():
+    out = _with_fake_accounts("P", lambda eng: eng.lock_user("aibootest"))
+    assert out["status"] == "failed", out
+    assert "still shows the account as usable" in out["message"], out["message"]
+
+
+def test_ipv6_target_uses_ip6tables():
+    def go():
+        eng, _ = engine(allow_response=True, response_dry_run=False)
+        ran = []
+        eng._run = lambda cmd: (ran.append(cmd), (0, ""))[1]
+        return eng.block_ip("2001:db8::1", "ipv6 attacker"), ran
+    out, ran = _with_fake_system({"iptables", "ip6tables"}, False, go)
+    assert out["status"] == "executed", out
+    assert any(c[:1] == ["ip6tables"] for c in ran), ran
+    assert not any(c[:1] == ["iptables"] for c in ran), ran
+
+
+def test_ipv6_without_ip6tables_fails_honestly():
+    def go():
+        eng, _ = engine(allow_response=True, response_dry_run=False)
+        eng._run = lambda cmd: (0, "")
+        return eng.block_ip("2001:db8::1", "ipv6 attacker")
+    out = _with_fake_system({"iptables"}, False, go)          # ip6tables missing
+    assert out["status"] == "failed", out
+    assert "ip6tables" in out["message"], out["message"]
+
+
+def test_unblock_also_refuses_junk_targets():
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+    for t in ("", "localhost", "1", "0.0.0.0/0"):
+        out = eng.unblock_ip(t)
+        assert out["status"] == "failed", f"{t!r} was not refused: {out}"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

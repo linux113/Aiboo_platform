@@ -152,6 +152,7 @@ line "5. firewall block / unblock (needs root + iptables or ufw)"
 # a rule can live in iptables, nft or ufw depending on which one is really filtering
 rule_present() {
   iptables -S 2>/dev/null | grep -q -- "$1" && return 0
+  ip6tables -S 2>/dev/null | grep -q -- "$1" && return 0
   nft list ruleset 2>/dev/null | grep -q -- "$1" && return 0
   ufw status numbered 2>/dev/null | grep -q -- "$1" && return 0
   return 1
@@ -200,7 +201,11 @@ else
   sleep 0.3
   if rule_present "$TEST_IP"; then bad "rule still there after unblock_access"; else ok "unblock_access removed the rule again"; fi
 
-  ui_remove() { iptables -D INPUT -s "$1" -j DROP 2>/dev/null; iptables -D OUTPUT -d "$1" -j DROP 2>/dev/null; ufw --force delete deny from "$1" to any >/dev/null 2>&1; }
+  ui_remove() {
+  iptables -D INPUT -s "$1" -j DROP 2>/dev/null; iptables -D OUTPUT -d "$1" -j DROP 2>/dev/null
+  ip6tables -D INPUT -s "$1" -j DROP 2>/dev/null; ip6tables -D OUTPUT -d "$1" -j DROP 2>/dev/null
+  ufw --force delete deny from "$1" to any >/dev/null 2>&1
+}
   ui_remove "$TEST_IP"; ui_remove "$REAL_IP"
 fi
 
@@ -211,10 +216,13 @@ elif ! command -v useradd >/dev/null; then
   echo "  skipped (useradd not installed - apt install passwd)"
 else
   useradd -m -s /bin/bash "$TEST_USER" 2>/dev/null
+  echo "$TEST_USER:TestPass123!" | chpasswd 2>/dev/null   # needs a password, else 'unlock' is untestable
+  echo "  account state before locking : $(passwd -S "$TEST_USER" 2>/dev/null | awk '{print $2}')"
   if id "$TEST_USER" >/dev/null 2>&1; then
     OUT="$(run_action restrict_identity "$TEST_USER" | tr -d '\n')"
     STATE="$(passwd -S "$TEST_USER" 2>/dev/null | awk '{print $2}')"
     if [ "$STATE" = "L" ]; then ok "account $TEST_USER is LOCKED (passwd -S = L)"; else bad "account not locked (passwd -S = $STATE)"; fi
+    echo "  unlock answer: $(echo "$OUT" | tr -d '\n' | tail -c 150)"
     run_action lift_restriction "$TEST_USER" >/dev/null 2>&1
     STATE="$(passwd -S "$TEST_USER" 2>/dev/null | awk '{print $2}')"
     if [ "$STATE" = "P" ]; then ok "account unlocked again (passwd -S = P)"; else bad "account still locked (passwd -S = $STATE)"; fi
@@ -225,16 +233,27 @@ else
 fi
 
 line "7. guards refuse dangerous targets (must all be refused)"
+GUARD_TARGETS="block_access:127.0.0.1 block_access:::1 block_access:localhost block_access:1
+block_access:0.0.0.0/0 block_access:example.com terminate_process:1 revoke_identity:root"
 REFUSED=0
-for target in 127.0.0.1 ::1 localhost 1; do
-  OUT="$(run_action block_access "$target" 2>/dev/null | tr -d '\n')"
-  echo "$OUT" | grep -q '"status": "failed"' && REFUSED=$((REFUSED+1))
+TOTAL=0
+ESCAPED=""
+for pair in $GUARD_TARGETS; do
+  ACT="${pair%%:*}"; TGT="${pair#*:}"
+  TOTAL=$((TOTAL+1))
+  OUT="$(run_action "$ACT" "$TGT" 2>/dev/null | tr -d '\n')"
+  if echo "$OUT" | grep -q '"status": "failed"'; then
+    REFUSED=$((REFUSED+1))
+  else
+    ESCAPED="$ESCAPED [$ACT $TGT]"
+    echo "  !! NOT REFUSED: $ACT $TGT -> $(echo "$OUT" | tail -c 160)"
+  fi
 done
-OUT="$(run_action terminate_process 1 | tr -d '\n')"
-echo "$OUT" | grep -q '"status": "failed"' && REFUSED=$((REFUSED+1))
-OUT="$(run_action revoke_identity root | tr -d '\n')"
-echo "$OUT" | grep -q '"status": "failed"' && REFUSED=$((REFUSED+1))
-if [ "$REFUSED" -ge 6 ]; then ok "all 6 dangerous targets were refused"; else bad "only $REFUSED of 6 dangerous targets were refused"; fi
+if [ "$REFUSED" -eq "$TOTAL" ]; then
+  ok "all $TOTAL dangerous targets were refused"
+else
+  bad "only $REFUSED of $TOTAL refused - escaped:$ESCAPED"
+fi
 
 line "8. auditd (kernel view) - optional"
 if [ -f /var/log/audit/audit.log ] && [ -r /var/log/audit/audit.log ]; then

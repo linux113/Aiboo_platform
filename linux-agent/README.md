@@ -192,3 +192,40 @@ sudo auditctl -l | head
 | action says *"READ-ONLY mode"* | `allow_response = yes` in `config.ini`, then restart the agent |
 | no kernel-level findings | install auditd + `audit-rules/aiboo.rules`, and make sure `audit_log` is readable |
 | want to see what an action would do | keep `response_dry_run = yes` and read `actions.jsonl` |
+
+### Firewall choices (and one honest warning)
+
+AiBoO picks the tool that is **really filtering traffic** on the server:
+
+| Situation | What AiBoO uses | What the dashboard says |
+|---|---|---|
+| iptables/nft present | `iptables -I INPUT -s IP -j DROP` (and OUTPUT) | `blocked 45.95.147.3 with iptables` |
+| ufw installed **and enabled** | `ufw deny from IP to any` | `blocked ... with ufw` |
+| ufw installed but **inactive** (normal on AWS) | iptables/nft, if present | `blocked ... with iptables` |
+| ufw only, and it is switched off | ufw (rule stored, not enforced) | `blocked ... WARNING: ufw is NOT enabled - rule stored, traffic not dropped yet` |
+
+A rule added to a switched-off ufw drops nothing, so AiBoO never silently claims a
+block it did not make. AiBoO also never enables ufw itself - that can cut the SSH
+session you are working over.
+
+IPv6 targets (`2001:db8::1`) are blocked with `ip6tables`; if the server has no
+`ip6tables`, the action fails and says so instead of pretending.
+
+### What AiBoO will always refuse
+
+Not a single firewall, kill or lock command is built for these targets - they are
+refused before any command runs:
+
+| Refused target | Why |
+|---|---|
+| `localhost`, `127.0.0.1`, `127.x.x.x`, `::1` | would cut the server's own loopback traffic |
+| `169.254.169.254` (link-local) | cloud metadata service (AWS credentials live there) |
+| `0.0.0.0/0`, `255.255.255.255`, multicast/unspecified | would cut off everything, including AiBoO |
+| any network that contains the AiBoO server IP | the server would stop reporting to the dashboard |
+| `1`, `example.com`, text, empty strings | not an IP address - nothing to block |
+| PID 1, `systemd*`, `sshd*`, `auditd`, `cron`, `rsyslogd`, the agent itself | killing these takes the server down |
+| `root`, uid < 1000, the agent's own user | locking these locks out the admins |
+
+Lock and unlock also **verify their own result** with `passwd -S`. An account with
+no password at all cannot be "unlocked" (that would allow login with an empty
+password) - AiBoO reports that honestly and tells you to run `passwd <user>` first.
