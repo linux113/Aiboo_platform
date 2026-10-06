@@ -544,6 +544,38 @@ def test_security_relevant_sudo_is_still_caught():
         assert agent.find_suspicious_sudo(cmd) == expect, (cmd, agent.find_suspicious_sudo(cmd))
 
 
+def test_posture_findings_are_reported_once_a_day_not_hourly():
+    """'No fail2ban installed' cannot change every hour - do not repeat it hourly.
+
+    run_once() drops anything whose dedup_key is already in state.seen, and
+    send_finding() remembers the key after a successful send. The key is
+    regenerated once a day, so the reminder goes out daily, not hourly.
+    """
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+
+    first = agent.posture_findings(st, state)
+    assert first, "expected posture findings on a machine with no config.ini"
+    assert all(f.dedup_key.startswith("cfg:") for f in first), [f.dedup_key for f in first]
+
+    for f in first:                      # pretend the server accepted them
+        state.remember(f.dedup_key)
+
+    def what_run_once_would_send(findings):
+        return [f for f in findings if not (f.dedup_key and state.already_sent(f.dedup_key))]
+
+    assert what_run_once_would_send(agent.posture_findings(st, state)) == [], "repeated in the same hour"
+
+    state.counters.now += 3600           # one hour later, same day
+    assert what_run_once_would_send(agent.posture_findings(st, state)) == [], "repeated hourly"
+
+    state.counters.now += 86400          # next day: the daily reminder is expected
+    next_day = what_run_once_would_send(agent.posture_findings(st, state))
+    assert next_day, "the daily reminder should go out"
+    assert {f.dedup_key for f in next_day}.isdisjoint({f.dedup_key for f in first}), "keys did not rotate"
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

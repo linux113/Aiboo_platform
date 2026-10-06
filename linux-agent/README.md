@@ -317,3 +317,10 @@ If you installed with a wrong key, copy the working one and restart:
     sed -i "s|^api_key =.*|api_key = $KEY|" ~/aiboo-linux-agent/config.ini
     systemctl --user restart aiboo-linux-agent
     journalctl --user -u aiboo-linux-agent -n 5 --no-pager
+
+### Server posture findings (config_weakness) go out once a day
+
+Things like "No fail2ban installed" or "SSH MaxAuthTries is not set" describe the
+state of the server, not an event. They are reported **once per day**, are always
+low/medium, and never create a HOLD or BLOCK. Fix one (install fail2ban, set
+MaxAuthTries) and the reminder simply stops.

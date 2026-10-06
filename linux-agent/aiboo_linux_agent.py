@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 AGENT_NAME = "AiBoO-Linux-Sentinel"
 
 try:
@@ -1033,7 +1033,7 @@ def posture_findings(st: Settings, state: AgentState) -> list[Finding]:
             pattern="config_weakness" if severity in ("low", "medium", "high") else "device_health_fail",
             severity=severity, summary=summary, entity="server-config",
             confidence=0.8, source_file="config-scan", description=desc,
-            dedup_key=f"cfg:{key}:{int(now // 3600)}",
+            dedup_key=f"cfg:{key}:{int(now // 86400)}",   # server state, not an event: once a day
         ))
 
     sshd = Path("/etc/ssh/sshd_config")
