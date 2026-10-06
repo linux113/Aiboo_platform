@@ -1,0 +1,36 @@
+# AiBoO Linux Sentinel - systemd unit.
+# This is the SYSTEM version (needs root once to install):
+#   sudo cp aiboo-linux-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now aiboo-linux-agent
+#
+# Prefer the per-user version? install.sh writes ~/.config/systemd/user/... which
+# needs no root at all - that is the one that fits a read-only server account.
+[Unit]
+Description=AiBoO Linux Sentinel (read-only log agent)
+Documentation=file:/opt/aiboo-linux-agent/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as an unprivileged account (change to the account you were given).
+User=aiboo
+Group=aiboo
+# Only needs read access to the logs: add the user to the 'adm' group
+#   sudo usermod -aG adm aiboo
+WorkingDirectory=/opt/aiboo-linux-agent
+ExecStart=/usr/bin/python3 /opt/aiboo-linux-agent/aiboo_linux_agent.py
+Restart=always
+RestartSec=10
+Nice=10
+MemoryMax=256M
+
+# Hardening: the agent must never be able to change this server.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/opt/aiboo-linux-agent
+
+[Install]
+WantedBy=multi-user.target

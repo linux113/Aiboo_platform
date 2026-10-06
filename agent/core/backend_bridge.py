@@ -202,6 +202,10 @@ class DashboardBridge:
             "source": self._endpoint_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "online",
+            # One backend, many operating systems: the dashboard shows the OS
+            # badge on the Endpoints page from this field.
+            "platform": "windows",
+            "os": "windows",
         }
         await self._queue.add_to_endpoint("heartbeat", payload)
         log.debug("Heartbeat queued for %s", self._endpoint_id)

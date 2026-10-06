@@ -31,3 +31,13 @@ alerts_queue.db-journal
 # PyInstaller build output and build environment (agent/build_agent.bat)
 agent/build/
 agent/.buildenv/
+
+# Linux Sentinel - runtime files (settings + state stay on the server)
+linux-agent/config.ini
+linux-agent/linux-agent-state.json
+linux-agent/linux-agent-state.tmp
+linux-agent/linux-agent-queue.jsonl
+linux-agent/agent.log
+linux-agent/actions.jsonl
+linux-agent/quarantine/
+linux-agent/state/

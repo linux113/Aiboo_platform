@@ -10,8 +10,17 @@ interface Endpoint {
   active: boolean;
   connected?: boolean;          // agent command channel is connected
   hostname?: string;
+  platform?: string;            // 'windows' | 'linux' | 'darwin' | ''
   importance?: Importance | null; // TriGate Gate 3 (Impact)
 }
+
+// One AiBoO backend, agents on any OS: show which one this endpoint is.
+const PLATFORM_META: Record<string, { icon: string; label: string; cls: string }> = {
+  windows: { icon: '🪟', label: 'Windows', cls: 'border-sky-600/60 text-sky-300' },
+  linux: { icon: '🐧', label: 'Linux', cls: 'border-amber-500/60 text-amber-300' },
+  darwin: { icon: '🍎', label: 'macOS', cls: 'border-slate-500/60 text-slate-300' },
+  freebsd: { icon: '😈', label: 'FreeBSD', cls: 'border-red-500/60 text-red-300' },
+};
 
 // TriGate importance levels shown in the dropdown
 const IMPORTANCE_OPTIONS: { value: Importance; label: string; hint: string }[] = [
@@ -182,10 +191,25 @@ export default function EndpointsList({ onSelectEndpoint, selectedEndpoint = nul
                 title="Show only this endpoint's alerts"
               >
                 <div className="flex items-center gap-3 min-w-0">
-                  <span className="text-lg flex-shrink-0">🖥️</span>
+                  <span className="text-lg flex-shrink-0">
+                    {PLATFORM_META[ep.platform || '']?.icon || '🖥️'}
+                  </span>
                   <div className="text-left min-w-0">
-                    <div className="text-sm font-medium text-slate-200 truncate">
-                      {ep.source}
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm font-medium text-slate-200 truncate">
+                        {ep.source}
+                      </span>
+                      {PLATFORM_META[ep.platform || ''] && (
+                        <span
+                          title={`Detected on ${PLATFORM_META[ep.platform || ''].label}`}
+                          className={cn(
+                            'rounded border px-1.5 py-0.5 text-[9px] font-medium uppercase tracking-wide flex-shrink-0',
+                            PLATFORM_META[ep.platform || ''].cls
+                          )}
+                        >
+                          {PLATFORM_META[ep.platform || ''].label}
+                        </span>
+                      )}
                     </div>
                     <div className="text-[10px] text-slate-500">
                       {ep.active ? (

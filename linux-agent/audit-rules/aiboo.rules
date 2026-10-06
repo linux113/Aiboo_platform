@@ -1,0 +1,39 @@
+# AiBoO Linux Sentinel - auditd rules (OPTIONAL, needs root to install)
+# =====================================================================
+# With these rules the KERNEL records process executions and a few dangerous
+# syscalls in /var/log/audit/audit.log. The AiBoO agent reads that file (read
+# only) and reports:
+#     * reverse shells / command-and-control one-liners   -> reverse_shell (critical)
+#     * attack tools (nmap, sqlmap, hydra, pspy, chisel…) -> malware (high)
+#     * ptrace / process_vm_writev                        -> process_injection (high)
+#     * a root process started from /tmp, /dev/shm        -> dropped_file (high)
+#
+# Install (as root):
+#     sudo cp aiboo.rules /etc/audit/rules.d/
+#     sudo augenrules --load          # or: sudo service auditd restart
+#     sudo auditctl -l                # verify
+#
+# Remove them again with: sudo rm /etc/audit/rules.d/aiboo.rules && sudo augenrules --load
+
+# ---- 1. every program that is executed (argv is captured) ----------------
+-a always,exit -F arch=b64 -S execve -F key=aiboo_exec
+-a always,exit -F arch=b32 -S execve -F key=aiboo_exec
+
+# ---- 2. process injection / debugging attempts ---------------------------
+-a always,exit -F arch=b64 -S ptrace -F key=aiboo_inject
+-a always,exit -F arch=b32 -S ptrace -F key=aiboo_inject
+-a always,exit -F arch=b64 -S process_vm_writev -F key=aiboo_inject
+
+# ---- 3. files that should never change on a server ----------------------
+-w /etc/passwd -p wa -k aiboo_identity
+-w /etc/shadow -p wa -k aiboo_identity
+-w /etc/sudoers -p wa -k aiboo_identity
+-w /etc/sudoers.d -p wa -k aiboo_identity
+-w /root/.ssh/authorized_keys -p wa -k aiboo_ssh
+-w /etc/ssh/sshd_config -p wa -k aiboo_ssh
+-w /lib/systemd/system -p wa -k aiboo_persist
+-w /etc/cron.d -p wa -k aiboo_persist
+-w /etc/crontab -p wa -k aiboo_persist
+
+# ---- 4. keep the log from flooding (tune to taste) -----------------------
+#/etc/audit/auditd.conf : max_log_file = 50, num_logs = 5, max_log_file_action = ROTATE

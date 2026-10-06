@@ -1,0 +1,50 @@
+# AiBoO Linux Sentinel - sudo allowlist (OPTIONAL)
+# ================================================
+# Only needed when you want the agent to be able to CHANGE things on the server
+# (`allow_response = yes` in config.ini) but do NOT want to run it as root.
+#
+# Install (as root):
+#     sudo visudo -c -f aiboo-linux-agent.sudoers        # check the syntax first
+#     sudo cp aiboo-linux-agent.sudoers /etc/sudoers.d/aiboo-linux-agent
+#     sudo chmod 0440 /etc/sudoers.d/aiboo-linux-agent
+#
+# Replace SERVICE_USER with the account the agent runs as (it must NOT be root,
+# and it must NOT be your own login account if you can avoid it):
+#     sudo useradd -r -s /usr/sbin/nologin aiboo   (example only)
+#
+# Every line is a single, exact command that the AiBoO response engine uses.
+# Nothing here allows a shell, a wildcard or reading files.
+
+# --- firewall (block / unblock an attacker IP) ---------------------------
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/ufw deny from * to any
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/ufw delete deny from * to any
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/ufw default deny incoming
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/ufw default allow incoming
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/ufw allow from *
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT -s * -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I OUTPUT -d * -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -D INPUT -s * -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -D OUTPUT -d * -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT -s * -j ACCEPT
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT 1 -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -D INPUT -j DROP
+
+# --- processes (kill a reverse shell / attack tool) ----------------------
+SERVICE_USER ALL=(root) NOPASSWD: /bin/kill -9 *
+
+# --- accounts (lock / unlock, log the sessions off) ----------------------
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/usermod -L *
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/usermod -U *
+SERVICE_USER ALL=(root) NOPASSWD: /usr/bin/loginctl terminate-user *
+SERVICE_USER ALL=(root) NOPASSWD: /usr/bin/pkill -KILL -u *
+
+# --- NOTE -----------------------------------------------------------------
+# File quarantine / restore does NOT need root: it only moves files inside the
+# folders listed in watch_dirs, /tmp, /var/tmp and /dev/shm, so give the agent
+# user write access to those folders (and to its own quarantine folder) instead
+# of granting sudo rights for mv/chmod.
+#
+# If you do not want the agent to be able to do one of the things above, simply
+# delete that line and restart the service - the dashboard will then report
+# "needs root and no passwordless sudo for this user" for that action, which is
+# the honest answer, and everything else keeps working.

@@ -27,6 +27,11 @@ const store = {
   importance: {},    // TriGate: endpoint -> low|normal|high|critical (last known)
   agentStatus: {},   // endpoint -> latest agent-status report (threat intel, behaviour, ...)
   compliance: {},    // endpoint -> latest compliance report
+  // Remote commands for agents that CANNOT keep a Socket.IO connection open
+  // (the Linux Sentinel polls over HTTPS). Windows agents keep using the
+  // socket channel; both end up in commandHistory.
+  commandQueue: [],  // waiting for the endpoint to pick them up
+  commandHistory: [],// everything, newest first (status: queued/sent/executed/failed)
 };
 
 // Read-only view used by analytics / reports
@@ -159,11 +164,18 @@ const validateAgentOrJWT = (req, res, next) => {
 };
 
 // ---- Record endpoint heartbeat ----
-const updateEndpointHeartbeat = (source) => {
+// platform is optional ('windows' | 'linux' | 'darwin'); it is only replaced
+// when the agent sends one, so a Windows agent that never sends it keeps its
+// earlier value (or stays unknown).
+const updateEndpointHeartbeat = (source, platform) => {
   if (source && source !== 'unknown') {
+    const prev = store.endpoints[source] || {};
+    const pl = String(platform || '').toLowerCase().trim();
     store.endpoints[source] = {
+      ...prev,
       lastSeen: new Date().toISOString(),
       source,
+      platform: ['windows', 'linux', 'darwin', 'freebsd'].includes(pl) ? pl : (prev.platform || ''),
     };
   }
 };
@@ -193,7 +205,8 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
     } = req.body;
 
     const source = getSource(req);
-    updateEndpointHeartbeat(source);
+    const platform = req.body.platform || metadata?.platform || metadata?.os;
+    updateEndpointHeartbeat(source, platform);
 
     // Keep the agent's own id and time when they look valid. Before, every
     // finding got a new random id + "now", so a finding re-sent from the
@@ -215,6 +228,7 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
       summary: summary || 'No summary provided',
       actions: actions || [],
       metadata: metadata || {},
+      platform: store.endpoints[source]?.platform || '',
       source,
       timestamp: validAgentTime(req.body.timestamp),
     };
@@ -234,9 +248,10 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
 // POST /api/agent/heartbeat – Agent keeps alive
 router.post('/heartbeat', validateAgentApiKey, (req, res) => {
   const source = getSource(req);
-  updateEndpointHeartbeat(source);
-  logger.debug(`Heartbeat from ${source}`);
-  res.status(200).json({ ok: true, source });
+  const platform = req.body?.platform || req.body?.os;
+  updateEndpointHeartbeat(source, platform);
+  logger.debug(`Heartbeat from ${source}${platform ? ` (${platform})` : ''}`);
+  res.status(200).json({ ok: true, source, platform: store.endpoints[source]?.platform || '' });
 });
 
 // GET /api/agent/sources – List only LIVE endpoints
@@ -466,9 +481,53 @@ router.get('/actions/stats', protect, (req, res) => {
 // ============================================================
 //  REMOTE COMMAND DISPATCH (Isolation & Termination tab)
 //  JWT-only — the dashboard dispatches actions to remote agents.
-//  Agents themselves never call these; they connect via Socket.IO
-//  namespace /agent-channel (see backend/sockets/agentChannel.js).
+//  Two delivery paths:
+//    * Socket.IO namespace /agent-channel  (Windows agent)
+//    * REST queue, polled by the agent      (Linux Sentinel, no socket.io)
+//  Both end up in store.commandHistory and emit 'command:sent'.
 // ============================================================
+
+// Make a command id that is unique and readable in the logs.
+const newCommandId = () => `cmd_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+// Queue a command for an agent that polls over REST.
+const queueCommand = (endpoint_id, action, target, params) => {
+  const cmd_id = newCommandId();
+  const entry = {
+    cmd_id,
+    endpoint_id,
+    action,
+    target: target || '',
+    params: params && typeof params === 'object' ? params : {},
+    status: 'queued',
+    queued_at: new Date().toISOString(),
+    delivered_at: null,
+    completed_at: null,
+    error: null,
+    result: null,
+    via: 'rest',
+  };
+  store.commandQueue.push(entry);
+  if (store.commandQueue.length > 200) store.commandQueue.shift();
+  store.commandHistory.unshift(entry);
+  if (store.commandHistory.length > 500) store.commandHistory.pop();
+  emit('command:sent', {
+    cmd_id, endpoint_id, action, target: entry.target, sent_at: entry.queued_at, queued: true,
+  });
+  logger.info(`Remote command queued (REST) for ${endpoint_id}: ${action} (${cmd_id})`);
+  return { ok: true, cmd_id, queued: true, via: 'rest' };
+};
+
+// Remember the outcome of a command (used by both paths).
+const finishCommand = (cmd_id, status, error, result) => {
+  const entry = store.commandHistory.find((c) => c.cmd_id === cmd_id);
+  if (!entry) return null;
+  entry.status = status || entry.status;
+  entry.completed_at = new Date().toISOString();
+  entry.error = error || null;
+  if (result && typeof result === 'object') entry.result = result;
+  return entry;
+};
 
 // POST /api/agent/commands – dispatch an action to a specific agent
 // Remote actions change the endpoint (kill processes, firewall rules), so
@@ -485,10 +544,14 @@ router.post('/commands', protect, authorize('admin', 'analyst'), (req, res) => {
 
     const channel = req.app.get('agentChannel');
     if (!channel) {
-      logger.error('Remote dispatch attempted but agentChannel is not initialized');
-      return res
-        .status(503)
-        .json({ ok: false, error: 'Agent channel not initialized' });
+      // No live channel at all (e.g. a test, or the agent uses REST polling).
+      const queued = queueCommand(
+        String(endpoint_id),
+        String(action),
+        target ? String(target) : '',
+        params && typeof params === 'object' ? params : {}
+      );
+      return res.status(202).json({ ...queued, note: 'No live agent channel - queued for the endpoint\'s next poll' });
     }
 
     const result = channel.dispatch(
@@ -499,10 +562,17 @@ router.post('/commands', protect, authorize('admin', 'analyst'), (req, res) => {
     );
 
     if (!result.ok) {
-      logger.warn(
-        `Remote dispatch failed for ${endpoint_id}: ${result.error}`
+      // The endpoint is not on the socket channel (a Linux Sentinel never is,
+      // and a Windows agent may be between reconnects). Queue it: the agent
+      // picks it up on its next poll. If nothing polls, the command simply
+      // stays 'queued' and the dashboard shows that.
+      const queued = queueCommand(
+        String(endpoint_id),
+        String(action),
+        target ? String(target) : '',
+        params && typeof params === 'object' ? params : {}
       );
-      return res.status(404).json(result);
+      return res.status(202).json({ ...queued, note: 'Endpoint not on the live channel - queued for its next poll' });
     }
 
     logger.info(
@@ -540,6 +610,71 @@ router.get('/commands', protect, (req, res) => {
     logger.error(`Error listing commands: ${error.message}`);
     res.status(500).json({ ok: false, error: 'Failed to list commands' });
   }
+});
+
+// ---- REST command channel (Linux Sentinel and any REST-only agent) ----
+// GET /api/agent/commands/pending  (agent, x-api-key + x-endpoint-id)
+//   Hands the endpoint its waiting commands and marks them 'sent'. The agent
+//   must ack each one; an unfinshed command stays 'sent' in the history.
+router.get('/commands/pending', validateAgentApiKey, (req, res) => {
+  const endpoint = String(req.headers['x-endpoint-id'] || req.query.endpoint_id || '').trim();
+  if (!endpoint) return res.status(400).json({ ok: false, error: 'x-endpoint-id header required' });
+
+  const mine = store.commandQueue.filter((c) => c.endpoint_id === endpoint);
+  store.commandQueue = store.commandQueue.filter((c) => c.endpoint_id !== endpoint);
+  for (const c of mine) {
+    c.status = 'sent';
+    c.delivered_at = new Date().toISOString();
+  }
+  if (mine.length) logger.info(`${endpoint} picked up ${mine.length} queued command(s)`);
+  res.json({ ok: true, count: mine.length, commands: mine });
+});
+
+// POST /api/agent/commands/:cmdId/ack  (agent)
+//   Body: { status: executed|failed, error?, result?: {message, details, metadata} }
+//   Records the outcome, tells the dashboards and writes the ActionRecord the
+//   "Isolation & Termination" tab shows - the same shape the socket path uses.
+router.post('/commands/:cmdId/ack', validateAgentApiKey, (req, res) => {
+  const cmdId = String(req.params.cmdId || '');
+  const status = String(req.body?.status || 'executed').toLowerCase();
+  const error = req.body?.error ? String(req.body.error).slice(0, 400) : null;
+  const result = req.body?.result && typeof req.body.result === 'object' ? req.body.result : {};
+
+  const entry = finishCommand(cmdId, status, error, result);
+  emit('command:ack', { cmd_id: cmdId, status, error, result });
+
+  const source = getSource(req);
+  updateEndpointHeartbeat(source, req.body?.platform || 'linux');
+  // normaliseAction() maps 'summary'/'details' (there is no 'message' field),
+  // so both are filled in - the Isolation & Termination tab shows details.
+  const text = result.message || error || (status === 'executed' ? 'Done' : 'Failed');
+  const actionRecord = normaliseAction({
+    id: `act_${cmdId}`,
+    action: entry?.action || req.body?.action || 'unknown',
+    target: entry?.target || req.body?.target || '',
+    status: status === 'executed' ? 'success' : 'failed',
+    summary: text,
+    details: [text, result.details].filter(Boolean).join(' - '),
+    reason: entry?.params?.reason || '',
+    agent: 'AiBoO-Linux-Sentinel',
+    error: status === 'executed' ? null : text,
+    dry_run: !!result.metadata?.dry_run,
+    metadata: { ...(result.metadata || {}), cmd_id: cmdId, via: 'rest' },
+  }, source);
+  pushAction(actionRecord);
+  emit('agent:action', actionRecord);
+
+  logger.info(`Command ack (REST) ${cmdId} -> ${status}${error ? ` (${error})` : ''}`);
+  res.json({ ok: true, cmd_id: cmdId, status, action: actionRecord });
+});
+
+// GET /api/agent/commands/history – what was dispatched and what happened
+router.get('/commands/history', protect, (req, res) => {
+  const endpoint = String(req.query.endpoint_id || '').trim();
+  const list = endpoint
+    ? store.commandHistory.filter((c) => c.endpoint_id === endpoint)
+    : store.commandHistory;
+  res.json({ ok: true, count: list.length, commands: list.slice(0, 100) });
 });
 
 // GET /api/agent/agents-online – list agents currently connected via WebSocket
@@ -587,7 +722,7 @@ router.post('/correlated', validateAgentOrJWT, (req, res) => {
 
 router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
   const decision = { ...req.body, source: getSource(req) };
-  updateEndpointHeartbeat(decision.source);
+  updateEndpointHeartbeat(decision.source, req.body?.platform || req.body?.metadata?.platform);
   const imp = decision.metadata?.trigate?.impact?.importance;
   if (IMPORTANCE_LEVELS.has(String(imp || ''))) store.importance[decision.source] = String(imp);
   push(store.gateDecisions, decision);

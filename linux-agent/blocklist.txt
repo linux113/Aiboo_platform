@@ -1,0 +1,6 @@
+# AiBoO Linux Sentinel - your own list of known-bad IPs.
+# One IP address or CIDR range per line. Lines starting with # are ignored.
+# The agent re-reads this file automatically when you save it.
+#
+# Example (remove the # to activate):
+# 45.95.147.0/24

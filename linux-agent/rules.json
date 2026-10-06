@@ -1,0 +1,15 @@
+{
+  "_comment": "AiBoO Linux Sentinel - optional tuning file. Everything here is OPTIONAL: the agent has sane built-in defaults. Change a value and restart the agent.",
+  "_thresholds": {
+    "ssh_fail_threshold": "how many failed SSH logons from one IP/user before one HIGH 'brute force' alert (default 5)",
+    "ssh_fail_window": "seconds that must contain those failures (default 300)",
+    "web_fail_threshold": "failed web logins from one IP before a HIGH alert (default 10)",
+    "scan_404_threshold": "404 answers from one IP before 'endpoint scanning' (default 20)",
+    "error_burst_threshold": "failing HTTP responses from one IP before 'flood' (default 50)"
+  },
+  "extra_sensitive_paths": [],
+  "extra_scanner_user_agents": [],
+  "extra_suspicious_sudo_commands": [],
+  "ignore_paths": ["/health", "/healthz", "/favicon.ico", "/robots.txt", "/metrics"],
+  "ignore_ips": ["127.0.0.1", "::1"]
+}

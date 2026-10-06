@@ -1,0 +1,103 @@
+[AIBOO]
+; ---------------------------------------------------------------------------
+; AiBoO Linux Sentinel - settings (read-only log agent for Linux servers)
+;   install.sh asks for the server address the first time.
+; ---------------------------------------------------------------------------
+; Address of the AiBoO server (backend), WITHOUT "/" or "/health" at the end.
+;   cloud AIBoO server : http://<EC2 ip>:4000   or  https://aiboo.example.com
+;   same machine       : http://127.0.0.1:4000
+remote_url = http://127.0.0.1:4000
+
+; Must be the same value as AGENT_API_KEY in the server's backend/.env
+api_key = dev-key-change-in-production
+
+; Name shown on the dashboard - Endpoints page.
+endpoint_name = auroraa-prod-ubuntu
+
+; Impact (TriGate Gate 3). The dashboard can change this too (Endpoints page).
+;   low | normal | high | critical
+importance = high
+
+; ---------------------------------------------------------------------------
+; Where the logs are (only readable files are used; missing ones are skipped)
+; ---------------------------------------------------------------------------
+auth_log = /var/log/auth.log
+nginx_access_log = /var/log/nginx/access.log
+nginx_error_log = /var/log/nginx/error.log
+mysql_error_log = /var/log/mysql/error.log
+
+; systemd services whose journal should be watched (comma separated)
+app_services = maincar,sidecar
+
+; Any other log file:  kind=path   where kind is auth|access|error|mysql
+; extra_logs = access=/opt/app/logs/app.log
+
+; Your own bad-IP list (one IP or CIDR per line, # = comment)
+blocklist_file = blocklist.txt
+
+; ---------------------------------------------------------------------------
+; Tuning (defaults are the same as the Windows agent)
+; ---------------------------------------------------------------------------
+poll_seconds = 5
+heartbeat_seconds = 60
+ssh_fail_threshold = 5
+ssh_fail_window = 300
+web_fail_threshold = 10
+web_fail_window = 300
+scan_404_threshold = 20
+scan_404_window = 60
+error_burst_threshold = 50
+error_burst_window = 60
+
+; verify_tls = yes   -> check the HTTPS certificate (set no for a self-signed demo)
+verify_tls = yes
+
+; ---------------------------------------------------------------------------
+; Local response - let the dashboard CHANGE things on this server
+; ---------------------------------------------------------------------------
+; OFF by default: with no, the agent is pure detection (read-only) and every
+; action answers "this server is in READ-ONLY mode".
+;
+; To turn it on you need privileges: either run the agent as root, or install
+; sudoers/aiboo-linux-agent.sudoers (see README) and keep the agent as a normal
+; user. Check what is possible with:  python3 aiboo_linux_agent.py --capabilities
+allow_response = no
+
+; response_dry_run = yes -> run the checks and write the audit log, but change
+; nothing. Use this first for a day, read actions.jsonl, then set it to no.
+response_dry_run = yes
+
+; allow_full_isolation = yes -> allow cutting this host off the network
+; (only the AiBoO server can reach it; released automatically). Dangerous on a
+; remote server you reach over SSH: keep no unless you have console access.
+allow_full_isolation = no
+
+; Where quarantined files are moved (default: <agent folder>/quarantine)
+quarantine_dir =
+
+; Folders whose new files are watched (and the folders quarantine may touch).
+; Add your web root / upload folder. Comma separated.
+watch_dirs = /var/www,/opt/app
+
+; ---------------------------------------------------------------------------
+; EDR-ish collectors
+; ---------------------------------------------------------------------------
+; auditd log (kernel view). Install audit-rules/aiboo.rules to fill it.
+audit_log = /var/log/audit/audit.log
+
+; How often running processes are checked for reverse shells / attack tools
+proc_scan_seconds = 15
+
+; How often the watched folders are checked for new files
+integrity_seconds = 300
+
+; Act by itself on the worst findings (only with allow_response = yes)
+;   reverse shell / C2 running   -> kill that PID
+;   dropped file (web shell)     -> move it to quarantine
+edr_kill_on_sight = no
+edr_quarantine_on_sight = no
+
+; dry_run = yes -> print findings and send NOTHING (safe first test)
+dry_run = no
+
+log_level = INFO
