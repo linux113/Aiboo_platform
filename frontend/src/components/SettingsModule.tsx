@@ -9,6 +9,7 @@ const SECTIONS = [
   { k: "voice" as const, label: "Voice & Sound", icon: "🎙️", desc: "Audio & AI voice settings" },
   { k: "system" as const, label: "Service URLs", icon: "🔗", desc: "Backend & API configuration" },
   { k: "security" as const, label: "Security", icon: "🔒", desc: "Access & audit logs" },
+  { k: "users" as const, label: "Users & Access", icon: "🧑\u200d🤝\u200d🧑", desc: "Who can log in (admin)" },
 ];
 
 interface ModalConfig {
@@ -30,9 +31,10 @@ export default function SettingsModule({
   mustChangePassword?: boolean;
   onPasswordChanged?: () => void;
 }) {
-  const [section, setSection] = useState<"profile" | "alerts" | "voice" | "system" | "security">(
+  const [section, setSection] = useState<"profile" | "alerts" | "voice" | "system" | "security" | "users">(
     mustChangePassword ? "security" : "profile"
   );
+  const isAdmin = String(userRole || "").toLowerCase() === "admin";
   const [pwOpen, setPwOpen] = useState(mustChangePassword);
   const [pw, setPw] = useState({ current: "", next: "", confirm: "" });
   const [pwMsg, setPwMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -145,6 +147,71 @@ export default function SettingsModule({
     });
   };
 
+  // ---- Users & Access (admin only): who can log in, with which role --------
+  type Row = { id: string; name: string; email: string; role: string; active: boolean; lastLogin?: string | null };
+  const [users, setUsers] = useState<Row[]>([]);
+  const [usersMsg, setUsersMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [usersBusy, setUsersBusy] = useState(false);
+  const [newUser, setNewUser] = useState({ name: "", email: "", password: "", role: "analyst" });
+  const [resetId, setResetId] = useState<string | null>(null);
+  const [resetPw, setResetPw] = useState("");
+
+  const loadUsers = async () => {
+    try {
+      const r = await api.get("/users", authH());
+      setUsers(r.data?.users || []);
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { message?: string } } };
+      setUsersMsg({ ok: false, text: e.response?.data?.message || "Could not load users." });
+    }
+  };
+
+  useEffect(() => {
+    if (isAdmin) void loadUsers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin]);
+
+  const addUser = async () => {
+    setUsersMsg(null);
+    if (!newUser.name.trim() || !newUser.email.trim() || !newUser.password) {
+      return setUsersMsg({ ok: false, text: "Name, email and password are required." });
+    }
+    setUsersBusy(true);
+    try {
+      await api.post("/users", newUser, authH());
+      setNewUser({ name: "", email: "", password: "", role: "analyst" });
+      setUsersMsg({ ok: true, text: "User added." });
+      await loadUsers();
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { message?: string } } };
+      setUsersMsg({ ok: false, text: e.response?.data?.message || "Could not add the user." });
+    } finally {
+      setUsersBusy(false);
+    }
+  };
+
+  const patchUser = async (id: string, patch: Record<string, unknown>) => {
+    setUsersMsg(null);
+    setUsersBusy(true);
+    try {
+      await api.patch(`/users/${id}`, patch, authH());
+      await loadUsers();
+      setUsersMsg({ ok: true, text: "Saved." });
+    } catch (err: unknown) {
+      const e = err as { response?: { data?: { message?: string } } };
+      setUsersMsg({ ok: false, text: e.response?.data?.message || "Could not save." });
+    } finally {
+      setUsersBusy(false);
+    }
+  };
+
+  const roleCls = (role: string) =>
+    role === "admin"
+      ? "border-red-500/40 bg-red-500/10 text-red-200"
+      : role === "analyst"
+        ? "border-cyan-500/40 bg-cyan-500/10 text-cyan-200"
+        : "border-slate-600 bg-slate-800/60 text-slate-300";
+
   return (
     <div className="flex gap-4 h-full">
       <div className="w-56 flex-shrink-0 flex flex-col gap-3">
@@ -164,7 +231,7 @@ export default function SettingsModule({
           </div>
         </div>
         <div className="rounded-2xl border border-slate-800/80 bg-slate-950/80 overflow-hidden">
-          {SECTIONS.map((s) => (
+          {SECTIONS.filter((x) => x.k !== "users" || isAdmin).map((s) => (
             <button
               key={s.k}
               onClick={() => setSection(s.k)}
@@ -391,6 +458,103 @@ export default function SettingsModule({
             >
               {saving ? "Saving..." : saved ? "✓ Saved" : "Save Settings"}
             </button>
+          </div>
+        )}
+
+        {section === "users" && isAdmin && (
+          <div className="rounded-2xl border border-slate-800/80 bg-slate-950/80 p-6 space-y-4">
+            <div>
+              <div className="text-sm font-bold text-slate-200">Users &amp; Access</div>
+              <p className="mt-1 text-[11px] text-slate-500">
+                admin = everything · analyst = investigate and respond · viewer = read only.
+                New accounts only work after you press <b className="text-slate-400">Add user</b> — nobody can register themselves.
+              </p>
+            </div>
+
+            <div className="rounded-xl border border-slate-800 bg-slate-900/50 p-3 space-y-2">
+              <div className="text-[11px] font-semibold text-slate-300">Add a user</div>
+              <div className="grid grid-cols-2 gap-2">
+                <input value={newUser.name} onChange={(e) => setNewUser((u) => ({ ...u, name: e.target.value }))}
+                  placeholder="Full name" className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-500/60" />
+                <input value={newUser.email} onChange={(e) => setNewUser((u) => ({ ...u, email: e.target.value }))}
+                  placeholder="name@company.com" className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-500/60" />
+                <input value={newUser.password} onChange={(e) => setNewUser((u) => ({ ...u, password: e.target.value }))}
+                  type="text" placeholder="Password (8+ chars, letters + numbers)"
+                  className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-500/60" />
+                <div className="flex gap-2">
+                  <select value={newUser.role} onChange={(e) => setNewUser((u) => ({ ...u, role: e.target.value }))}
+                    className="flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-500/60">
+                    <option value="admin">admin</option>
+                    <option value="analyst">analyst</option>
+                    <option value="viewer">viewer</option>
+                  </select>
+                  <button onClick={addUser} disabled={usersBusy}
+                    className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-4 py-2 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-50">
+                    Add user
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              {users.map((u) => (
+                <div key={u.id} className="rounded-xl border border-slate-800 bg-slate-900/40 p-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className={cn("rounded border px-2 py-0.5 text-[10px] font-semibold", roleCls(u.role))}>{u.role}</span>
+                    <span className="text-sm font-semibold text-slate-100">{u.name || u.email}</span>
+                    <span className="text-[11px] text-slate-500">{u.email}</span>
+                    {!u.active && <span className="rounded bg-red-500/15 px-2 py-0.5 text-[10px] text-red-300">disabled</span>}
+                    <span className="ml-auto text-[10px] text-slate-500">
+                      {u.lastLogin ? `last login ${new Date(u.lastLogin).toLocaleString()}` : "never signed in"}
+                    </span>
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <select value={u.role} onChange={(e) => patchUser(u.id, { role: e.target.value })} disabled={usersBusy}
+                      className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-[11px] text-slate-200 outline-none focus:border-cyan-500/60">
+                      <option value="admin">admin</option>
+                      <option value="analyst">analyst</option>
+                      <option value="viewer">viewer</option>
+                    </select>
+                    {u.active ? (
+                      <button onClick={() => patchUser(u.id, { active: false })} disabled={usersBusy}
+                        className="rounded-lg border border-red-500/40 bg-red-500/10 px-3 py-1 text-[11px] text-red-200 hover:bg-red-500/20 disabled:opacity-50">
+                        Disable
+                      </button>
+                    ) : (
+                      <button onClick={() => patchUser(u.id, { active: true })} disabled={usersBusy}
+                        className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-50">
+                        Enable
+                      </button>
+                    )}
+                    <button onClick={() => { setResetId(resetId === u.id ? null : u.id); setResetPw(""); }} disabled={usersBusy}
+                      className="rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1 text-[11px] text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-50">
+                      Reset password
+                    </button>
+                    {resetId === u.id && (
+                      <span className="flex items-center gap-2">
+                        <input value={resetPw} onChange={(e) => setResetPw(e.target.value)} type="text"
+                          placeholder="New password"
+                          className="rounded-lg border border-slate-700 bg-slate-950 px-2 py-1 text-[11px] text-slate-100 outline-none focus:border-cyan-500/60" />
+                        <button onClick={async () => { await patchUser(u.id, { password: resetPw }); setResetId(null); setResetPw(""); }}
+                          disabled={usersBusy || resetPw.length < 8}
+                          className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1 text-[11px] text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-50">
+                          Save
+                        </button>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {!users.length && <div className="text-[11px] text-slate-500">No users loaded yet.</div>}
+            </div>
+
+            {usersMsg && (
+              <p className={cn("text-[11px]", usersMsg.ok ? "text-emerald-300" : "text-red-300")}>{usersMsg.text}</p>
+            )}
+            <p className="text-[10px] text-slate-600">
+              You cannot change your own role or disable your own account, and the last admin cannot be removed —
+              so you can never lock yourself out.
+            </p>
           </div>
         )}
 

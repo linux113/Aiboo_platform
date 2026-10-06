@@ -1,8 +1,5 @@
 import { useState, useRef, useCallback } from "react";
-import { cn } from "./utils/cn";
 import api, { API } from "./utils/api";
-
-type Mode = "login" | "register";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -11,25 +8,13 @@ export default function Login({
 }: {
   onLogin: (token: string) => void;
 }) {
-  const [mode, setMode] = useState<Mode>("login");
-  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [role, setRole] = useState("analyst");
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [logoFallback, setLogoFallback] = useState(false);
   const cooldownRef = useRef(false);
-
-  const reset = () => {
-    setError("");
-    setName("");
-    setEmail("");
-    setPassword("");
-    setConfirm("");
-  };
 
   const validateEmail = useCallback((e: string) => EMAIL_REGEX.test(e), []);
 
@@ -40,23 +25,11 @@ export default function Login({
     if (!email.trim()) return setError("Email is required.");
     if (!validateEmail(email)) return setError("Please enter a valid email address.");
 
-    if (mode === "register") {
-      if (!name.trim()) return setError("Full name is required.");
-      if (password.length < 6)
-        return setError("Password must be at least 6 characters.");
-      if (password !== confirm) return setError("Passwords do not match.");
-    } else {
-      if (!password) return setError("Password is required.");
-    }
+    if (!password) return setError("Password is required.");
 
     setLoading(true);
     try {
-      const res = await api.post(
-        mode === "login" ? "/auth/login" : "/auth/register",
-        mode === "login"
-          ? { email, password }
-          : { name, email, password, role }
-      );
+      const res = await api.post("/auth/login", { email, password });
       const { token } = res.data;
       if (!token) return setError("No token received.");
       if (token === "undefined")
@@ -611,26 +584,6 @@ export default function Login({
             </p>
           </div>
 
-          <div className="flex rounded-xl border border-slate-800 bg-slate-900/50 p-1 mb-5">
-            {(["login", "register"] as Mode[]).map((m) => (
-              <button
-                key={m}
-                onClick={() => {
-                  setMode(m);
-                  reset();
-                }}
-                className={cn(
-                  "flex-1 rounded-lg py-2 text-xs font-semibold transition-all",
-                  mode === m
-                    ? "bg-gradient-to-r from-cyan-500/15 to-emerald-500/15 text-cyan-200 ring-1 ring-cyan-500/25"
-                    : "text-slate-500 hover:text-slate-300"
-                )}
-              >
-                {m === "login" ? "Sign In" : "Create Account"}
-              </button>
-            ))}
-          </div>
-
           <div className="rounded-2xl border border-slate-800/70 bg-slate-950/90 p-5 shadow-2xl backdrop-blur-md">
             {error && (
               <div className="mb-4 flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/8 px-3 py-2.5">
@@ -652,23 +605,6 @@ export default function Login({
             )}
 
             <form onSubmit={handleSubmit} className="space-y-3.5">
-              {mode === "register" && (
-                <div>
-                  <label className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 mb-1.5">
-                    Full Name
-                  </label>
-                  <input
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                    placeholder="John Smith"
-                    type="text"
-                    required
-                    disabled={loading}
-                    className="w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/25 disabled:opacity-50 transition"
-                  />
-                </div>
-              )}
-
               <div>
                 <label className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 mb-1.5">
                   Email Address
@@ -693,11 +629,7 @@ export default function Login({
                     type={showPw ? "text" : "password"}
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
-                    placeholder={
-                      mode === "register"
-                        ? "Min. 6 characters"
-                        : "Enter your password"
-                    }
+                    placeholder="Enter your password"
                     required
                     disabled={loading}
                     className="w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-3.5 py-2.5 pr-10 text-sm text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/25 disabled:opacity-50 transition"
@@ -728,52 +660,6 @@ export default function Login({
                 </div>
               </div>
 
-              {mode === "register" && (
-                <>
-                  <div>
-                    <label className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 mb-1.5">
-                      Confirm Password
-                    </label>
-                    <input
-                      type="password"
-                      value={confirm}
-                      onChange={(e) => setConfirm(e.target.value)}
-                      placeholder="Re-enter password"
-                      required
-                      disabled={loading}
-                      className="w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none focus:ring-1 focus:ring-cyan-500/25 disabled:opacity-50 transition"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 mb-1.5">
-                      Access Role
-                    </label>
-                    <div className="grid grid-cols-3 gap-2">
-                      {[
-                        { v: "admin", l: "Admin", d: "Full access" },
-                        { v: "analyst", l: "Analyst", d: "SOC operator" },
-                        { v: "viewer", l: "Viewer", d: "Read only" },
-                      ].map((r) => (
-                        <button
-                          key={r.v}
-                          type="button"
-                          onClick={() => setRole(r.v)}
-                          className={cn(
-                            "rounded-lg border px-2 py-2 text-center transition",
-                            role === r.v
-                              ? "border-cyan-500/50 bg-cyan-500/10 text-cyan-200"
-                              : "border-slate-700/50 text-slate-500 hover:border-slate-600 hover:text-slate-300"
-                          )}
-                        >
-                          <div className="text-xs font-semibold">{r.l}</div>
-                          <div className="text-[9px] opacity-60">{r.d}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </>
-              )}
-
               <button
                 type="submit"
                 disabled={loading || cooldownRef.current}
@@ -800,31 +686,17 @@ export default function Login({
                         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                       />
                     </svg>
-                    {mode === "login"
-                      ? "Authenticating…"
-                      : "Creating Account…"}
+                    Authenticating…
                   </span>
-                ) : mode === "login" ? (
-                  "Authenticate & Enter"
                 ) : (
-                  "Create Secure Account"
+                  "Authenticate & Enter"
                 )}
               </button>
             </form>
 
             <p className="mt-4 text-center text-[11px] text-slate-500">
-              {mode === "login"
-                ? "New operator? "
-                : "Already have access? "}
-              <button
-                onClick={() => {
-                  setMode(mode === "login" ? "register" : "login");
-                  reset();
-                }}
-                className="text-cyan-400 hover:text-cyan-300 font-semibold"
-              >
-                {mode === "login" ? "Request Access →" : "Sign In →"}
-              </button>
+              No account? An admin can add you in{" "}
+              <b className="text-slate-400">Settings -&gt; Users</b>.
             </p>
           </div>
 

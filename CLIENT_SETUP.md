@@ -120,6 +120,47 @@ curl http://localhost:4000/api/auth/login -Method POST -ContentType "application
 
 ---
 
+## Step 3b — Accounts & roles
+
+Three roles exist:
+
+| Role | Can do |
+|------|--------|
+| **admin** | Everything, including adding/disabling users (Settings -> Users) |
+| **analyst** | Investigate, acknowledge alerts, approve responses, run playbooks |
+| **viewer** | Read-only — dashboards and reports, no actions |
+
+`npm run seed` creates one account per role (`admin@example.com`,
+`analyst@example.com`, `viewer@example.com`) and prints each password once.
+**Never run `npm run seed` after go-live — it drops the database.**
+
+Add people, change a role, reset a password or disable an account **without
+losing data** (run in `backend/`):
+
+```bash
+npm run add-user -- --email alice@company.com --name "Alice" --role analyst --password 'AlicePass123'
+npm run add-user -- --email bob@company.com --role viewer          # change a role
+npm run add-user -- --email bob@company.com --password 'NewPass123' # reset a password
+npm run add-user -- --email bob@company.com --disable              # block the login
+npm run add-user -- --email bob@company.com --enable
+npm run users                                                     # list every account
+```
+
+Or sign in as an **admin** -> **Settings -> Users & Access**: add a user, pick
+the role, reset a password, disable/enable an account. Nobody can change their
+own role or disable themselves, and the last admin cannot be removed — a
+dashboard can never lock itself out.
+
+Notes:
+* There is **no public sign-up**: the old "Create Account" box is gone, and
+  `POST /api/auth/register` now needs an admin token.
+* Disabling an account, or lowering a role, takes effect within seconds — the
+  user's existing 7-day token stops working for actions it may no longer do.
+* Passwords must be 8+ characters with letters and numbers, and cannot be a
+  known default (`admin123`, `password`, ...).
+
+---
+
 ## Step 4 — Frontend Setup
 
 Open a **new terminal**:

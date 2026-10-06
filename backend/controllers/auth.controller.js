@@ -7,7 +7,7 @@ export const registerCtrl = async (req, res, next) => {
     if (!name || !email || !password) {
       return res.status(400).json({ message: 'Name, email, and password are required' });
     }
-    const { token, user } = await register(req.body);
+    const { token, user } = await register(req.body, req.user);
     res.status(201).json({ token, user });
   } catch (err) { next(err); }
 };

@@ -1,7 +1,7 @@
 {
   "name": "aiboo-backend",
   "version": "1.0.0",
-  "description": "AiBoO – AI-driven Cyber-Physical Security Operations Platform",
+  "description": "AiBoO \u2013 AI-driven Cyber-Physical Security Operations Platform",
   "main": "server.js",
   "type": "module",
   "scripts": {
@@ -10,7 +10,9 @@
     "seed": "node seed.js",
     "set-password": "node set-password.js",
     "clear-alerts": "node clear-alerts.js",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "add-user": "node create-user.js",
+    "users": "node create-user.js --list"
   },
   "dependencies": {
     "axios": "^1.7.0",

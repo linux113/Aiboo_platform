@@ -7,6 +7,10 @@ const userSchema = new mongoose.Schema(
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     role: { type: String, enum: ['admin', 'analyst', 'viewer'], default: 'viewer' },
+    // An admin can switch an account off (Settings -> Users) without deleting
+    // it, so history keeps pointing at a real person. Missing = active, so
+    // accounts created before this field existed keep working.
+    active: { type: Boolean, default: true },
     lastLogin: { type: Date },
   },
   { timestamps: true }
