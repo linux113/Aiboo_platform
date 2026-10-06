@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 AGENT_NAME = "AiBoO-Linux-Sentinel"
 
 try:
@@ -99,6 +99,7 @@ class Settings:
     # ---- local response (changes the server - OFF by default) -------------
     allow_response: bool = False          # yes = the dashboard may change this server
     response_dry_run: bool = False        # yes = print/record what WOULD happen
+    first_run_lookback_minutes: int = 30  # on a fresh state, only read this far back
     allow_full_isolation: bool = False    # yes = allow cutting the host off the network
     quarantine_dir: str = ""              # default: <agent dir>/quarantine
     watch_dirs: str = ""                  # folders whose new files are watched (quarantine limit too)
@@ -166,6 +167,7 @@ def load_settings(path: Path, overrides: dict | None = None) -> Settings:
         log_level=get("log_level", "INFO").strip().upper(),
         allow_response=_bool(get("allow_response", "no"), False),
         response_dry_run=_bool(get("response_dry_run", "yes"), True),
+        first_run_lookback_minutes=max(0, _int(get("first_run_lookback_minutes", "30"), 30)),
         allow_full_isolation=_bool(get("allow_full_isolation", "no"), False),
         quarantine_dir=get("quarantine_dir", "").strip(),
         watch_dirs=get("watch_dirs", "").strip(),
@@ -259,14 +261,16 @@ PATTERNS: dict[str, Pattern] = {p.key: p for p in [
 # "passwd", which is how a normal kernel update filled the dashboard with alerts.
 SUSPICIOUS_SUDO_WORDS = (
     "su", "sudo", "bash", "sh", "dash", "zsh", "ksh", "useradd", "usermod", "userdel",
-    "passwd", "chpasswd", "visudo", "chattr", "chmod", "crontab", "nc", "netcat",
+    "passwd", "chpasswd", "visudo", "chattr", "crontab", "nc", "netcat",
     "ncat", "socat", "curl", "wget", "python", "python3", "perl", "ruby", "base64",
-    "iptables", "ip6tables", "ufw", "nft", "mount", "insmod", "modprobe", "systemctl",
-    "service", "docker", "kubectl", "ssh", "scp", "rsync", "at", "batch",
+    "iptables", "ip6tables", "ufw", "nft", "mount", "insmod", "modprobe",
+    "docker", "kubectl", "scp", "rsync", "nmap", "masscan", "hydra", "tcpdump",
 )
 SUSPICIOUS_SUDO_PHRASES = (
-    "/etc/sudoers", "chmod 777", "/etc/passwd", "/etc/shadow", "systemctl start",
-    "systemctl enable", "systemctl stop", "systemctl disable", "journalctl --vacuum",
+    "/etc/sudoers", "/etc/sudoers.d", "authorized_keys", "/etc/ssh/sshd_config",
+    "/etc/cron", "/etc/systemd/system", "chmod 777", "chmod +s", "chmod 4755",
+    "chmod u+s", "/etc/passwd", "/etc/shadow", "systemctl start", "systemctl enable",
+    "systemctl stop", "systemctl disable", "systemctl mask", "journalctl --vacuum",
     "rm -rf /var/log", "truncate -s 0", "dd if=", "openssl s_client", "> /var/log",
     "history -c", "> ~/.bash_history",
 )
@@ -1727,7 +1731,96 @@ DETECTORS = {
 }
 
 
-def read_new_lines(path: Path, state: AgentState, kind: str) -> list[str]:
+# ---------------------------------------------------------------------------
+# First run: do not replay the whole history
+# ---------------------------------------------------------------------------
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+RE_SYSLOG_TS = re.compile(r"^\s*(?P<mon>[A-Z][a-z]{2})\s+(?P<day>\d{1,2})\s+(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})")
+RE_ISO_TS = re.compile(r"(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})[T ](?P<h>\d{2}):(?P<mi>\d{2}):(?P<se>\d{2})")
+RE_BRACKET_TS = re.compile(r"\[(?P<day>\d{1,2})/(?P<mon>[A-Za-z]{3})/(?P<y>\d{4}):(?P<h>\d{2}):(?P<mi>\d{2}):(?P<se>\d{2})")
+
+
+def parse_log_time(line: str, now: float | None = None) -> float | None:
+    """Best-effort timestamp of a log line (syslog, ISO, nginx). None if unknown."""
+    import calendar
+    from datetime import datetime as _dt
+    now_dt = _dt.fromtimestamp(now or time.time())
+    m = RE_SYSLOG_TS.match(line or "")
+    if m:
+        try:
+            mon = MONTHS.get(m.group("mon").lower())
+            if not mon:
+                return None
+            year = now_dt.year
+            stamp = _dt(year, mon, int(m.group("day")), int(m.group("h")),
+                        int(m.group("m")), int(m.group("s")))
+            if stamp.timestamp() > time.time() + 86400:      # a line from next year
+                stamp = stamp.replace(year=year - 1)
+            return stamp.timestamp()
+        except ValueError:
+            return None
+    m = RE_ISO_TS.search(line or "")
+    if m:
+        try:
+            return _dt(int(m.group("y")), int(m.group("mo")), int(m.group("d")), int(m.group("h")),
+                       int(m.group("mi")), int(m.group("se"))).timestamp()
+        except ValueError:
+            return None
+    m = RE_BRACKET_TS.search(line or "")
+    if m:
+        try:
+            mon = MONTHS.get(m.group("mon")[:3].lower())
+            if not mon:
+                return None
+            return _dt(int(m.group("y")), mon, int(m.group("day")), int(m.group("h")),
+                       int(m.group("mi")), int(m.group("se"))).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def first_run_offset(path: Path, lookback_minutes: int) -> int:
+    """Byte offset to start from when this log has never been read before.
+
+    A fresh install (or a deleted state file) used to re-read the whole auth.log,
+    so weeks-old admin commands came back as new alerts. Instead, start at the
+    last line that is newer than `lookback_minutes`; if the file has no usable
+    timestamps, start at the last 128 KB.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0
+    if size == 0 or lookback_minutes <= 0:
+        return max(0, size - 128 * 1024)
+    cutoff = time.time() - lookback_minutes * 60
+    chunk = 64 * 1024
+    best = None
+    pos = size
+    try:
+        with path.open("rb") as fh:
+            while pos > 0 and best is None:
+                read_from = max(0, pos - chunk)
+                fh.seek(read_from)
+                data = fh.read(pos - read_from)
+                start_index = 0
+                for line in data.split(b"\n"):
+                    start_index += len(line) + 1
+                    stamp = parse_log_time(line.decode("utf-8", "replace"))
+                    if stamp is not None and stamp >= cutoff:
+                        best = read_from + start_index - len(line) - 1
+                        break
+                pos = read_from
+    except OSError:
+        return max(0, size - 128 * 1024)
+    if best is None:
+        # nothing recent found: only look at the very end of the file
+        return max(0, size - 128 * 1024)
+    return max(0, best)
+
+
+def read_new_lines(path: Path, state: AgentState, kind: str, st: Settings | None = None) -> list[str]:
     """Return lines added since the last run. Never writes to the file."""
     key = str(path)
     if not path.exists():
@@ -1740,6 +1833,14 @@ def read_new_lines(path: Path, state: AgentState, kind: str) -> list[str]:
     if start > size:                       # rotated / truncated -> start over
         start = 0
         log(f"{path} was rotated - reading from the beginning")
+    if (st is not None) and (key not in state.offsets or start == 0):
+        # never read before: start recent, never replay the whole history
+        fresh = first_run_offset(path, st.first_run_lookback_minutes)
+        if fresh > start:
+            log(f"first read of {path}: starting at the last "
+                f"{st.first_run_lookback_minutes} minute(s) of activity "
+                f"(use --replay {path} to analyse the whole file)")
+            start = fresh
     if start == size:
         return []
     try:
@@ -1842,7 +1943,7 @@ def run_once(st: Settings, state: AgentState, sender: Sender, trust: int,
 
     for kind, path in watched_logs(st):
         detector = DETECTORS.get(kind, detect_access_line)
-        for line in read_new_lines(Path(path), state, kind):
+        for line in read_new_lines(Path(path), state, kind, st):
             if not line.strip():
                 continue
             try:

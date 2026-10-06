@@ -75,6 +75,17 @@ if [ -z "$KEY" ]; then
   read -r KEY
 fi
 [ -n "$KEY" ] || KEY="dev-key-change-in-production"
+case "$KEY" in
+  YOUR-AGENT-KEY|YOUR-KEY|CHANGEME|changeme|API_KEY|"<key>"|"")
+    echo
+    echo "ERROR: '$KEY' is a placeholder, not a real key."
+    echo "Copy the real value of AGENT_API_KEY from backend/.env on the machine"
+    echo "running the AiBoO backend, or from an agent that already works:"
+    echo "    grep -E '^(remote_url|api_key)' ~/aiboo/linux-agent/config.ini"
+    echo "The agent will get HTTP 401 until the key is right, so nothing is installed."
+    exit 2
+    ;;
+esac
 
 INI="$DEST_DIR/config.ini"
 sed -e "s|^remote_url =.*|remote_url = $URL|" \
@@ -107,6 +118,26 @@ echo "--- server check ---------------------------------------------"
 if command -v curl >/dev/null 2>&1; then
   if curl -fsS --max-time 8 "$URL/health" >/dev/null 2>&1; then
     echo "[OK] $URL/health answered"
+    HB=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+         -X POST "$URL/api/agent/heartbeat" \
+         -H "Content-Type: application/json" -H "x-api-key: $KEY" -H "x-endpoint-id: $NAME" \
+         -d "{\"source\":\"$NAME\",\"platform\":\"linux\",\"status\":\"online\"}" 2>/dev/null)
+    case "$HB" in
+      200|201)
+        echo "[OK] the server ACCEPTED the API key (heartbeat sent as '$NAME')"
+        ;;
+      401|403)
+        echo "[!] The server REJECTED the API key (HTTP $HB)."
+        echo "    Nothing will reach the dashboard until this is fixed."
+        echo "    Get the right key, then run:"
+        echo "      grep -E '^(remote_url|api_key)' ~/aiboo/linux-agent/config.ini"
+        echo "      nano $INI      # set api_key = <that value>"
+        echo "      systemctl --user restart aiboo-linux-agent"
+        ;;
+      *)
+        echo "[?] heartbeat returned HTTP $HB - check the backend log"
+        ;;
+    esac
   else
     echo "[!] Cannot reach $URL/health - check the address, the security group"
     echo "    (port 4000 open?) and that the AiBoO backend is running."

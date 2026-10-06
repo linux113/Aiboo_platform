@@ -472,6 +472,78 @@ def test_new_suid_in_a_normal_directory_is_medium_and_advisory():
     assert agent.should_decide(found[0]) is False, "a normal-directory change is advisory"
 
 
+# --------------------------------------------------------------------------
+# first run must not replay history (this flooded the real dashboard)
+# --------------------------------------------------------------------------
+
+def _log_line(minutes_ago: float, text: str) -> str:
+    stamp = time.time() - minutes_ago * 60
+    return time.strftime("%b %d %H:%M:%S", time.localtime(stamp)) + " host " + text
+
+
+def test_syslog_timestamps_are_parsed():
+    now = time.time()
+    ts = agent.parse_log_time(_log_line(10, "sshd[1]: Failed password"))
+    assert ts is not None and abs(ts - (now - 600)) < 120, ts
+    assert agent.parse_log_time("2026-10-06T12:00:00+00:00 nothing") is not None
+    assert agent.parse_log_time("no timestamp here at all") is None
+
+
+def test_first_run_offset_skips_old_history():
+    work = Path(tempfile.mkdtemp()) / "auth.log"
+    old_lines = [_log_line(600, f"old admin command {i}") for i in range(50)]
+    work.write_text("\n".join(old_lines + [_log_line(1, "recent logon"),
+                                           _log_line(0.5, "recent sudo")]) + "\n",
+                    encoding="utf-8")
+    offset = agent.first_run_offset(work, 30)
+    tail = work.read_text(encoding="utf-8")[offset:]
+    assert "recent logon" in tail and "recent sudo" in tail, tail
+    assert "old admin command" not in tail, "old history was included"
+
+
+def test_first_run_with_no_timestamps_reads_only_the_tail():
+    work = Path(tempfile.mkdtemp()) / "weird.log"
+    work.write_text("\n".join(f"line {i} with no timestamp" for i in range(20000)) + "\n",
+                    encoding="utf-8")
+    offset = agent.first_run_offset(work, 30)
+    size = work.stat().st_size
+    assert 0 < offset < size, offset
+    assert size - offset <= 128 * 1024 + 4096, (size, offset)   # only the tail is read
+
+
+def test_read_new_lines_starts_recent_then_follows_normally():
+    work = Path(tempfile.mkdtemp()) / "auth.log"
+    old = "\n".join(_log_line(999, f"ancient {i}") for i in range(20))
+    work.write_text(old + "\n" + _log_line(1, "fresh event") + "\n", encoding="utf-8")
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    lines = agent.read_new_lines(work, state, "auth", st)
+    assert any("fresh event" in ln for ln in lines), lines
+    assert not any("ancient" in ln for ln in lines), lines
+    with work.open("a", encoding="utf-8") as fh:
+        fh.write(_log_line(0, "another fresh event") + "\n")
+    lines2 = agent.read_new_lines(work, state, "auth", st)
+    assert any("another fresh event" in ln for ln in lines2), lines2
+
+
+def test_admin_work_is_not_dangerous_sudo():
+    """Exact commands from the real Ubuntu run that should NOT alert."""
+    for cmd in ("/usr/bin/chmod 700 /root/.ssh",
+                "/usr/bin/chmod 600 /var/www/html/index.html",
+                "/usr/bin/systemctl restart ssh",
+                "/usr/bin/sed -i s/^#*Port.*/Port 22/ /etc/nsswitch.conf"):
+        assert agent.find_suspicious_sudo(cmd) == "", f"{cmd} -> {agent.find_suspicious_sudo(cmd)}"
+
+
+def test_security_relevant_sudo_is_still_caught():
+    for cmd, expect in (("/usr/sbin/useradd hacker", "useradd"),
+                        ("/usr/bin/tee -a /root/.ssh/authorized_keys", "authorized_keys"),
+                        ("sed -i s/x/y/ /etc/ssh/sshd_config", "/etc/ssh/sshd_config"),
+                        ("chmod 777 /var/www", "chmod 777"),
+                        ("/bin/bash -c whoami", "bash")):
+        assert agent.find_suspicious_sudo(cmd) == expect, (cmd, agent.find_suspicious_sudo(cmd))
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

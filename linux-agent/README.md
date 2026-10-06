@@ -285,3 +285,35 @@ Real events still raise alerts, by design: a **root shell** (`sudo bash …`),
 **Running `tests/prove_real.sh` creates real account events** (`useradd` →
 `userdel` → `chpasswd` for its test account) plus a `sudo bash` line. Those alerts
 are correct - close or acknowledge them after a test run.
+
+### A fresh install never replays old history
+
+On the first run of a new install (or after deleting `linux-agent-state.json`) the
+agent starts at the **last 30 minutes** of each log instead of the beginning. Before
+this, a new install re-read the whole `auth.log`, so weeks-old admin commands came
+back as brand-new alerts.
+
+    12:53:53 [INFO] first read of /var/log/auth.log: starting at the last 30
+                    minute(s) of activity (use --replay /var/log/auth.log to
+                    analyse the whole file)
+
+Change the window with `first_run_lookback_minutes = 30` in `config.ini`
+(`0` = never skip anything). To deliberately analyse an entire file, use
+`--replay /var/log/auth.log` - that mode always reads the whole file.
+
+### The installer checks your API key before it starts
+
+`install.sh` now refuses obvious placeholders (`YOUR-AGENT-KEY`, `CHANGEME`, ...)
+and, when the server answers, sends a real heartbeat to prove the key is accepted:
+
+    [OK] the server ACCEPTED the API key (heartbeat sent as 'aiboo-linux-01')
+
+    [!] The server REJECTED the API key (HTTP 401). Nothing will reach the
+        dashboard until this is fixed.
+
+If you installed with a wrong key, copy the working one and restart:
+
+    KEY=$(grep -m1 '^api_key' ~/aiboo/linux-agent/config.ini | cut -d= -f2- | sed 's/^ *//')
+    sed -i "s|^api_key =.*|api_key = $KEY|" ~/aiboo-linux-agent/config.ini
+    systemctl --user restart aiboo-linux-agent
+    journalctl --user -u aiboo-linux-agent -n 5 --no-pager

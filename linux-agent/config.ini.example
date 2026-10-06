@@ -100,4 +100,10 @@ edr_quarantine_on_sight = no
 ; dry_run = yes -> print findings and send NOTHING (safe first test)
 dry_run = no
 
+; On a FRESH state file (first ever run, or after --reset-state) the agent only
+; looks this many minutes back in each log. Without it, a new install would replay
+; weeks of old admin commands and raise alerts for things that happened long ago.
+; To analyse a whole log file on purpose, use: --replay /var/log/auth.log
+first_run_lookback_minutes = 30
+
 log_level = INFO
