@@ -400,11 +400,27 @@ def test_partial_last_line_is_not_lost(tmp_path):
 # --------------------------------------------------------------------------
 
 def test_suid_first_scan_only_records_a_baseline():
+    """In system folders the first scan only learns - it does not alert."""
     st = settings()
     state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
     state.counters.now = time.time()
-    first = agent.detect_suid_binaries(st, state)
-    assert first == [], f"first scan should stay quiet, got {len(first)} findings"
+    box = Path(tempfile.mkdtemp())
+    known = box / "passwd-like"
+    known.write_text("#!/bin/sh\n")
+    known.chmod(0o4755)
+    saved = (agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS)
+    agent.SUID_SCAN_DIRS = (str(box),)
+    agent.SUID_NORMAL_DIRS = (str(box),)
+    agent.SUID_WRITABLE_DIRS = ("/definitely-not-here",)
+    try:
+        first = agent.detect_suid_binaries(st, state)
+        again = agent.detect_suid_binaries(st, state)
+    finally:
+        agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS = saved
+        known.unlink(missing_ok=True)
+        box.rmdir()
+    assert first == [], f"first scan should stay quiet, got {first}"
+    assert again == [], f"a known system binary was reported again: {again}"
     assert state.suid_baseline, "baseline was not recorded"
 
 
@@ -412,8 +428,21 @@ def test_known_suid_binaries_are_not_reported_again():
     st = settings()
     state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
     state.counters.now = time.time()
-    agent.detect_suid_binaries(st, state)          # learns the baseline
-    again = agent.detect_suid_binaries(st, state)
+    box = Path(tempfile.mkdtemp())
+    known = box / "mount-like"
+    known.write_text("#!/bin/sh\n")
+    known.chmod(0o4755)
+    saved = (agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS)
+    agent.SUID_SCAN_DIRS = (str(box),)
+    agent.SUID_NORMAL_DIRS = (str(box),)
+    agent.SUID_WRITABLE_DIRS = ("/definitely-not-here",)
+    try:
+        agent.detect_suid_binaries(st, state)      # learns the baseline
+        again = agent.detect_suid_binaries(st, state)
+    finally:
+        agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS = saved
+        known.unlink(missing_ok=True)
+        box.rmdir()
     assert again == [], f"baseline binaries were reported again: {again[:2]}"
 
 
@@ -426,6 +455,7 @@ def test_a_suid_binary_in_tmp_is_high_severity():
     evil = drop / "rootme"
     evil.write_text("#!/bin/sh\n")
     evil.chmod(0o4755)
+    import atexit; atexit.register(lambda: (evil.unlink(missing_ok=True), drop.rmdir()))
     agent.SUID_SCAN_DIRS = (str(drop),)
     agent.SUID_WRITABLE_DIRS = (str(drop),)
     try:
@@ -574,6 +604,62 @@ def test_posture_findings_are_reported_once_a_day_not_hourly():
     next_day = what_run_once_would_send(agent.posture_findings(st, state))
     assert next_day, "the daily reminder should go out"
     assert {f.dedup_key for f in next_day}.isdisjoint({f.dedup_key for f in first}), "keys did not rotate"
+
+
+def test_suid_in_a_writable_folder_is_reported_even_on_the_first_scan():
+    """A set-uid binary in /tmp is never 'normal' - not even on a brand-new install."""
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+    box = Path(tempfile.mkdtemp())
+    planted = box / "rootme"
+    planted.write_text("#!/bin/sh\n")
+    planted.chmod(0o4755)
+
+    saved = (agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS)
+    agent.SUID_SCAN_DIRS = (str(box),)
+    agent.SUID_NORMAL_DIRS = ("/nowhere",)
+    agent.SUID_WRITABLE_DIRS = (str(box),)
+    try:
+        found = agent.detect_suid_binaries(st, state)          # very first scan, no baseline
+    finally:
+        agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS = saved
+    assert len(found) == 1, found
+    assert found[0].severity == "high", found[0].severity
+    assert str(planted) in found[0].summary
+    assert str(planted) not in state.suid_baseline, "a /tmp binary must never be baseline material"
+
+
+def test_a_new_web_shell_is_reported_and_not_marked_as_already_sent():
+    """Real bug: the collector remembered the key, so run_once dropped the finding."""
+    watch = Path(tempfile.mkdtemp())
+    shell = watch / "aiboo-testshell.php"
+    shell.write_text("<?php system($_GET['c']); ?>\n")
+    st = settings(watch_dirs=str(watch))
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+    try:
+        found = agent.detect_integrity(st, state)
+    finally:
+        shell.unlink(missing_ok=True)
+        watch.rmdir()
+    assert [f.pattern for f in found] == ["dropped_file"], found
+    assert found[0].extra["sha256"], "hash missing"
+    blocked = [f for f in found if f.dedup_key and state.already_sent(f.dedup_key)]
+    assert blocked == [], "run_once would skip this finding as 'already sent'"
+    # a harmless file is remembered (so it is not re-hashed) but produces no alert
+    watch2 = Path(tempfile.mkdtemp())
+    (watch2 / "notes.txt").write_text("hello\n")
+    st2 = settings(watch_dirs=str(watch2))
+    state2 = agent.AgentState(Path(tempfile.mkdtemp()) / "s2.json")
+    state2.counters.now = time.time()
+    try:
+        quiet = agent.detect_integrity(st2, state2)
+    finally:
+        (watch2 / "notes.txt").unlink(missing_ok=True)
+        watch2.rmdir()
+    assert quiet == [], quiet
+    assert state2.seen, "harmless files should be remembered"
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 AGENT_NAME = "AiBoO-Linux-Sentinel"
 
 try:
@@ -1614,10 +1614,14 @@ def detect_integrity(st: Settings, state: AgentState) -> list[Finding]:
             marker = f"{path}:{int(stat.st_mtime)}:{stat.st_size}"
             if state.already_sent(f"file:{marker}"):
                 continue
-            state.remember(f"file:{marker}")
             name = path.name.lower()
             dangerous = name.endswith(SCRIPT_EXTS)
             if not dangerous:
+                # remember harmless files here; the finding's own key is remembered
+                # by Sender.send_finding() AFTER it is sent. Remembering it here made
+                # run_once() drop the finding as "already sent" - which is why new
+                # files in watched folders (web shells) were never reported.
+                state.remember(f"file:{marker}")
                 continue
             digest = _file_hash(path)
             out.append(Finding(
@@ -1673,14 +1677,22 @@ def detect_suid_binaries(st: Settings, state: AgentState) -> list[Finding]:
             if mode & 0o4000:
                 current.add(str(path))
 
-    if not state.suid_baseline:
-        # First run on this server: learn what is normal and stay quiet about it.
-        state.suid_baseline = current
-        log(f"set-uid baseline recorded: {len(current)} known binaries (not reported)")
-        return []
+    # Binaries in writable places are NEVER "normal", even on the very first scan:
+    # a set-uid file in /tmp is the attacker's favourite and must always be reported.
+    writable_now = {p for p in current if _suid_location(p) == "writable"}
 
-    fresh = current - state.suid_baseline
-    state.suid_baseline = current
+    if not state.suid_baseline:
+        # First run on this server: learn what is normal and stay quiet about it -
+        # but keep writable-location binaries out of the baseline so they fire.
+        state.suid_baseline = current - writable_now
+        log(f"set-uid baseline recorded: {len(state.suid_baseline)} known binaries "
+            f"(not reported); {len(writable_now)} in writable folders reported instead")
+        current = writable_now
+    else:
+        current = current - state.suid_baseline
+        state.suid_baseline |= (current - writable_now)      # learn the harmless new ones
+    fresh = current
+
     if not fresh:
         return []
 

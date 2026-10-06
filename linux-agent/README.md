@@ -324,3 +324,22 @@ Things like "No fail2ban installed" or "SSH MaxAuthTries is not set" describe th
 state of the server, not an event. They are reported **once per day**, are always
 low/medium, and never create a HOLD or BLOCK. Fix one (install fail2ban, set
 MaxAuthTries) and the reminder simply stops.
+
+### Attack demo (prove the detections on a real server)
+
+    sudo bash tests/attack_demo.sh --config ~/aiboo-linux-agent/config.ini
+
+Phase 1 replays an attack log (nothing on the server is touched): SSH brute force,
+a login right after it, a `truncate -s 0 /var/log/auth.log`, a SQL injection and a
+`/.env` download. Phase 2 creates real events: a PHP web shell in the web root, a
+set-uid binary in /tmp, a reverse-shell process for 30 seconds, and a log-wipe
+command. Everything it creates is removed when it exits.
+
+Expected on the dashboard: HIGH `brute_force`, CRITICAL `login_after_brute_force`
+and `log_cleared` (BLOCK), HIGH `sql_injection` / `sensitive_file_hit` (BLOCK),
+HIGH `dropped_file` (the web shell), HIGH `suid_binary` (the /tmp binary) and
+CRITICAL `reverse_shell` (the process).
+
+Use `--phase1` to run only the harmless part. Re-running the demo shows nothing new
+because the events were already sent (that is the dedup working): run
+`python3 aiboo_linux_agent.py --config … --reset-state` first to see it again.

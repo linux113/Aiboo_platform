@@ -359,14 +359,26 @@ def test_integrity_finds_a_new_web_shell():
     assert found[0].extra["sha256"]
 
 
-def test_integrity_does_not_report_the_same_file_twice():
+def test_integrity_reports_until_the_finding_is_sent():
+    """The collector must NOT mark its own finding as sent (that hid web shells).
+
+    Sender.send_finding() remembers the key once the server accepts it, so the
+    scan keeps offering the finding until then and goes quiet afterwards.
+    """
     tmp = Path(tempfile.mkdtemp(prefix="aiboo-watch-"))
     (tmp / "x.sh").write_text("echo hi")
     st = settings(watch_dirs=str(tmp))
     state = agent.AgentState(tmp / "state.json")
     state.counters.now = time.time()
-    assert agent.detect_integrity(st, state)
-    assert agent.detect_integrity(st, state) == []
+
+    first = agent.detect_integrity(st, state)
+    assert [f.pattern for f in first] == ["dropped_file"], first
+    assert agent.detect_integrity(st, state), "still not sent - it must be offered again"
+
+    state.remember(first[0].dedup_key)          # what Sender.send_finding() does
+    assert agent.detect_integrity(st, state) == [], "already sent - must stay quiet"
+    (tmp / "x.sh").unlink(missing_ok=True)
+    tmp.rmdir()
 
 
 # --------------------------------------------------------------------------
