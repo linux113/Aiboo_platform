@@ -10,6 +10,7 @@ Run from the linux-agent folder:
 
 import importlib.util
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -392,6 +393,83 @@ def test_partial_last_line_is_not_lost(tmp_path):
     with log.open("a") as fh:
         fh.write(" line\n")
     assert agent.read_new_lines(log, state, "auth") == ["incomplete line"]
+
+
+# --------------------------------------------------------------------------
+# set-uid binaries: normal OS ones must never spam the dashboard
+# --------------------------------------------------------------------------
+
+def test_suid_first_scan_only_records_a_baseline():
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+    first = agent.detect_suid_binaries(st, state)
+    assert first == [], f"first scan should stay quiet, got {len(first)} findings"
+    assert state.suid_baseline, "baseline was not recorded"
+
+
+def test_known_suid_binaries_are_not_reported_again():
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+    agent.detect_suid_binaries(st, state)          # learns the baseline
+    again = agent.detect_suid_binaries(st, state)
+    assert again == [], f"baseline binaries were reported again: {again[:2]}"
+
+
+def test_a_suid_binary_in_tmp_is_high_severity():
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+    state.suid_baseline = {"/usr/bin/passwd"}      # pretend we already know the box
+    drop = Path(tempfile.mkdtemp())                # emulate /tmp without touching /tmp
+    evil = drop / "rootme"
+    evil.write_text("#!/bin/sh\n")
+    evil.chmod(0o4755)
+    agent.SUID_SCAN_DIRS = (str(drop),)
+    agent.SUID_WRITABLE_DIRS = (str(drop),)
+    try:
+        found = agent.detect_suid_binaries(st, state)
+    finally:
+        agent.SUID_SCAN_DIRS = ("/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
+                                "/usr/local/sbin", "/opt", "/srv", "/var/www", "/home", "/tmp", "/dev/shm")
+        agent.SUID_WRITABLE_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/home", "/srv", "/var/www", "/run")
+    assert len(found) == 1, found
+    assert found[0].severity == "high", found[0].severity
+    assert "New set-uid binary" in found[0].summary
+    assert agent.should_decide(found[0]) is True, "a writable-location set-uid binary should raise an approval"
+
+
+def test_new_suid_in_a_normal_directory_is_medium_and_advisory():
+    """A brand-new set-uid binary in /usr/bin: worth telling, not worth a HOLD."""
+    st = settings()
+    state = agent.AgentState(Path(tempfile.mkdtemp()) / "s.json")
+    state.counters.now = time.time()
+    box = Path(tempfile.mkdtemp())
+    (box / "known-tool").write_text("#!/bin/sh\n")
+    (box / "known-tool").chmod(0o4755)
+
+    saved = (agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS)
+    # the temp dir must look like a *system* directory for this test
+    agent.SUID_SCAN_DIRS = (str(box),)
+    agent.SUID_NORMAL_DIRS = (str(box),)
+    agent.SUID_WRITABLE_DIRS = ("/definitely-not-here",)
+    try:
+        assert agent.detect_suid_binaries(st, state) == []      # baseline only
+        state.counters.now += 3600
+        assert agent.detect_suid_binaries(st, state) == []      # nothing changed
+
+        (box / "another-tool").write_text("#!/bin/sh\n")
+        (box / "another-tool").chmod(0o4755)
+        state.counters.now += 3600
+        found = agent.detect_suid_binaries(st, state)
+    finally:
+        agent.SUID_SCAN_DIRS, agent.SUID_NORMAL_DIRS, agent.SUID_WRITABLE_DIRS = saved
+
+    assert len(found) == 1, found
+    assert found[0].severity == "medium", found[0].severity
+    assert "New set-uid binary" in found[0].summary
+    assert agent.should_decide(found[0]) is False, "a normal-directory change is advisory"
 
 
 if __name__ == "__main__":

@@ -229,3 +229,39 @@ refused before any command runs:
 Lock and unlock also **verify their own result** with `passwd -S`. An account with
 no password at all cannot be "unlocked" (that would allow login with an empty
 password) - AiBoO reports that honestly and tells you to run `passwd <user>` first.
+
+### Set-uid binaries: baseline first, alarms only for changes
+
+On a normal Linux server, set-uid binaries are everywhere (`/usr/bin/passwd`,
+`sudo`, `mount`, `fusermount3`, ...) - that is how Linux works. Reporting all of
+them drowns the real alerts, so the first scan only **records a baseline** (shown
+in the log as `set-uid baseline recorded: N known binaries`) and stays quiet.
+
+After that AiBoO speaks up only when a set-uid binary **appears**:
+
+| Where the new binary sits | Severity | Raises a HOLD? |
+|---|---|---|
+| `/tmp`, `/var/tmp`, `/dev/shm`, `/home`, `/srv`, `/var/www`, `/run` | **high** | yes - this is where attackers drop privesc binaries |
+| `/opt` or another non-system path | medium | no (advisory) |
+| `/usr/bin`, `/usr/sbin`, `/bin`, ... | medium, marked "new since the last scan" | no (advisory) |
+
+The baseline lives in `linux-agent-state.json`. Delete that file (or run with
+`--reset-state`) to make the agent learn the server from scratch again.
+
+### Troubleshooting: HTTP 502 from the server
+
+A 502 usually comes from the tunnel (ngrok free URLs go offline when the tunnel
+process stops, and ngrok answers 502 while it cannot reach your backend). AiBoO
+does **not** lose those findings: anything the server refuses goes into
+`linux-agent-queue.jsonl` and is re-sent automatically on the next run and on
+every poll afterwards. Check the queue with:
+
+    wc -l linux-agent-queue.jsonl
+
+If it keeps growing, the server address or key is wrong, or the backend is down.
+Check the tunnel itself from the server:
+
+    curl -s -o /dev/null -w '%{http_code}\n' https://YOUR-TUNNEL.ngrok-free.app/health
+
+`200` = the tunnel is fine; `502` = ngrok cannot reach your backend (restart the
+tunnel, or the backend); `000` = no connection at all.

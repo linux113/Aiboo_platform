@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 AGENT_NAME = "AiBoO-Linux-Sentinel"
 
 try:
@@ -379,6 +379,7 @@ class AgentState:
         self.offsets: dict[str, int] = {}
         self.counters = Counters()
         self.seen: deque = deque(maxlen=4000)      # dedup of what we already sent
+        self.suid_baseline: set[str] = set()       # set-uid binaries that are normal here
         self.load()
 
     def load(self) -> None:
@@ -392,6 +393,7 @@ class AgentState:
         self.offsets = {str(k): int(v) for k, v in (blob.get("offsets") or {}).items()}
         self.counters.load_json(blob.get("counters") or {})
         self.seen = deque((blob.get("seen") or [])[-4000:], maxlen=4000)
+        self.suid_baseline = {str(p) for p in (blob.get("suid_baseline") or []) if p}
 
     def save(self) -> None:
         self.counters.now = time.time()
@@ -402,6 +404,7 @@ class AgentState:
             "offsets": self.offsets,
             "counters": self.counters.to_json(),
             "seen": list(self.seen),
+            "suid_baseline": sorted(self.suid_baseline)[:2000],
         }
         tmp = self.path.with_suffix(".tmp")
         try:
@@ -1548,11 +1551,33 @@ def detect_integrity(st: Settings, state: AgentState) -> list[Finding]:
     return out
 
 
+# A set-uid binary under these paths is how a normal Linux server works
+# (/usr/bin/passwd, sudo, mount...). Reporting them buries the real alerts, so the
+# first scan only records a baseline; afterwards AiBoO speaks up when a set-uid
+# binary APPEARS or when one sits somewhere an attacker would drop it.
+SUID_NORMAL_DIRS = ("/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/lib",
+                    "/usr/libexec", "/usr/local/bin", "/usr/local/sbin")
+SUID_WRITABLE_DIRS = ("/tmp", "/var/tmp", "/dev/shm", "/home", "/srv", "/var/www", "/run")
+SUID_SCAN_DIRS = ("/bin", "/sbin", "/usr/bin", "/usr/sbin", "/usr/local/bin",
+                  "/usr/local/sbin", "/opt", "/srv", "/var/www", "/home", "/tmp", "/dev/shm")
+SUID_MAX_FINDINGS = 20
+
+
+def _suid_location(path: str) -> str:
+    """'normal' | 'writable' (attacker's favourite) | 'unusual'."""
+    for w in SUID_WRITABLE_DIRS:
+        if path == w or path.startswith(w + "/"):
+            return "writable"
+    for n in SUID_NORMAL_DIRS:
+        if path == n or path.startswith(n + "/"):
+            return "normal"
+    return "unusual"
+
+
 def detect_suid_binaries(st: Settings, state: AgentState) -> list[Finding]:
-    """Set-uid binaries - a classic privilege-escalation path (hourly scan)."""
-    out: list[Finding] = []
-    hour = int(state.counters.now // 3600)
-    for base in ("/usr/bin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin", "/opt"):
+    """Set-uid binaries (hourly): only new ones, or ones in odd places."""
+    current: set[str] = set()
+    for base in SUID_SCAN_DIRS:
         d = Path(base)
         if not d.is_dir():
             continue
@@ -1564,15 +1589,38 @@ def detect_suid_binaries(st: Settings, state: AgentState) -> list[Finding]:
             except OSError:
                 continue
             if mode & 0o4000:
-                out.append(Finding(
-                    pattern="suid_binary", severity="low",
-                    summary=f"Set-uid binary present: {path}",
-                    entity=str(path), confidence=0.4, source_file=str(path),
-                    dedup_key=f"suid:{path}:{hour}",
-                    description=f"{path} runs with the file owner's rights (set-uid). "
-                                f"Unexpected ones are a classic privilege-escalation path.",
-                    extra={"file_path": str(path)},
-                ))
+                current.add(str(path))
+
+    if not state.suid_baseline:
+        # First run on this server: learn what is normal and stay quiet about it.
+        state.suid_baseline = current
+        log(f"set-uid baseline recorded: {len(current)} known binaries (not reported)")
+        return []
+
+    fresh = current - state.suid_baseline
+    state.suid_baseline = current
+    if not fresh:
+        return []
+
+    out: list[Finding] = []
+    hour = int(state.counters.now // 3600)
+    for path in sorted(fresh)[:SUID_MAX_FINDINGS]:
+        where = _suid_location(path)
+        if where == "writable":
+            severity, note = "high", ("it sits in a directory that users and services can write to - "
+                                      "that is where attackers drop a privilege-escalation binary")
+        elif where == "unusual":
+            severity, note = "medium", "it is outside the normal system directories"
+        else:
+            severity, note = "medium", "it is new since the last scan (a package change or an intruder)"
+        out.append(Finding(
+            pattern="suid_binary", severity=severity,
+            summary=f"New set-uid binary: {path}",
+            entity=path, confidence=0.6, source_file=path,
+            dedup_key=f"suid:{path}:{hour}",
+            description=f"{path} runs with the file owner's rights (set-uid) and {note}.",
+            extra={"file_path": path, "location": where},
+        ))
     return out
 
 
