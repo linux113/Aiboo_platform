@@ -41,3 +41,6 @@ linux-agent/agent.log
 linux-agent/actions.jsonl
 linux-agent/quarantine/
 linux-agent/state/
+# Build output (linux-agent/build_dist.sh) - never commit
+linux-agent/dist/
+

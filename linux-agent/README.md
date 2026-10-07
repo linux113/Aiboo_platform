@@ -82,6 +82,86 @@ python3 aiboo_linux_agent.py --run-action restore_pseudo_lock --target <lock id>
 Remote actions from the dashboard also work in `--once` mode, which makes them
 easy to test: queue the action in the UI, then run `--once` on the server.
 
+## Everyday commands (the helper scripts)
+
+Same idea as the `.bat` files on Windows - one file per job, no arguments needed
+when you are in a hurry. They all work in the agent folder (`~/aiboo-linux-agent`
+after `install.sh`), and none of them need root.
+
+| Script | What it does | Windows equivalent |
+|---|---|---|
+| `./configure.sh` | asks the server address + API key, writes `config.ini`, then **tests** it (`/health` and a real heartbeat). Use it again any time the ngrok address changes | `configure.ps1` / `run_agent.bat /setup` |
+| `./run_agent.sh` | starts it in the background (first run sets it up first). `--foreground` to watch the log instead | `run_agent.bat` |
+| `./show_status.sh` | running? connected? last 15 log lines, capabilities, server reachable? `--brief` for one line | `show_status.bat` |
+| `./stop_agent.sh` | stops the background copy and/or the service (`--background` / `--service`) | `stop_agent.bat` |
+| `./install_service.sh` | always on: a systemd `--user` service that starts with the machine and restarts itself | `install_service.bat` |
+| `./uninstall_service.sh` | removes that service (`--purge` also deletes config/logs/state) | `uninstall_service.bat` |
+
+Typical use:
+
+```bash
+cd ~/aiboo-linux-agent
+./configure.sh            # once: address + key, and it proves the connection
+./run_agent.sh            # start now, in the background
+./show_status.sh          # is it alive and talking to the dashboard?
+./stop_agent.sh           # stop it
+```
+
+Always on (recommended on a real server):
+
+```bash
+./install_service.sh --linger     # --linger survives reboots/logouts (asks sudo once)
+systemctl --user status aiboo-linux-agent
+tail -f ~/aiboo-linux-agent/agent.log
+```
+
+`install.sh` copies these six scripts next to the agent automatically.
+
+## Build a package to hand to a client (build_dist.sh)
+
+On Windows the agent is compiled into `AiBoO-Agent.exe` + `dist.zip` with
+`build_agent.bat`. **On Linux there is nothing to compile**: the agent uses only
+the Python standard library (no pip packages), and every Linux server already has
+`python3`. So "building" means packing the files into one archive.
+
+```bash
+cd linux-agent
+./build_dist.sh                     # -> dist/aiboo-linux-agent-<version>.zip  (+ .tar.gz)
+./build_dist.sh --with-tests        # also ship the test suite inside the package
+./build_dist.sh --out /tmp/mystuff  # write it somewhere else
+```
+
+The script:
+
+1. copies an explicit list of files (server code, the six helper scripts,
+   `config.ini.example`, rules, blocklist, sudoers allowlist, auditd rules,
+   README) into `aiboo-linux-agent-<version>/`,
+2. **runs that copy with `--selftest`** so a broken build fails here, not on a
+   client's server,
+3. writes `BUILD_INFO.txt` (what it is, the 3 install commands, the fact that
+   nothing is downloaded during install),
+4. makes `.zip` (needs `zip`, falls back to Python) and `.tar.gz`, then tests
+   the archive and prints its size and sha256.
+
+It refuses to package `config.ini`, logs, saved state, the offline queue,
+`actions.jsonl`, `quarantine/` or `state/` — a package can never leak one
+server's settings or history.
+
+On the new server (this is the whole deployment):
+
+```bash
+unzip aiboo-linux-agent-1.1.6.zip        # or:  tar xzf aiboo-linux-agent-1.1.6.tar.gz
+cd aiboo-linux-agent-1.1.6
+bash install.sh                          # asks for the dashboard address + API key
+cd ~/aiboo-linux-agent
+./run_agent.sh                           # or ./install_service.sh for always-on
+```
+
+Nothing is downloaded during install, so it also works on a server with no
+internet access (copy the file over with `scp`, or hand it to the client).
+`tar.gz` keeps the `+x` permission bits on every Linux; if you use the `.zip`
+made on Windows, run `chmod +x *.sh` after unpacking.
+
 ## Files it creates (all in its own folder)
 
 | File | Why |

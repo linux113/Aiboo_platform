@@ -62,6 +62,13 @@ mkdir -p "$DEST_DIR/sudoers" "$DEST_DIR/audit-rules"
 [ -f "$SRC_DIR/audit-rules/aiboo.rules" ] && cp -f "$SRC_DIR/audit-rules/aiboo.rules" "$DEST_DIR/audit-rules/"
 [ -f "$SRC_DIR/rules.json" ] && cp -f "$SRC_DIR/rules.json" "$DEST_DIR/"
 [ -f "$SRC_DIR/blocklist.txt" ] && [ ! -f "$DEST_DIR/blocklist.txt" ] && cp -f "$SRC_DIR/blocklist.txt" "$DEST_DIR/"
+# the everyday helper scripts (same idea as the Windows .bat files)
+for helper in configure.sh run_agent.sh show_status.sh stop_agent.sh install_service.sh uninstall_service.sh; do
+  if [ -f "$SRC_DIR/$helper" ]; then
+    cp -f "$SRC_DIR/$helper" "$DEST_DIR/"
+    chmod +x "$DEST_DIR/$helper"
+  fi
+done
 echo "Files copied to $DEST_DIR"
 
 # ---- 3. settings -----------------------------------------------------------
@@ -197,5 +204,12 @@ if [ -f "$DEST_DIR/audit-rules/aiboo.rules" ]; then
     echo "own process record. Rules are in $DEST_DIR/audit-rules/aiboo.rules"
   fi
 fi
+echo
+echo "Everyday commands (in $DEST_DIR):"
+echo "    ./show_status.sh        is it running / connected?"
+echo "    ./run_agent.sh          start it in the background"
+echo "    ./stop_agent.sh         stop it"
+echo "    ./configure.sh          change the server address or API key"
+echo "    ./install_service.sh    always on (starts with the machine)"
 echo
 echo "Done. On the dashboard open Endpoints - '$NAME' should appear as Online (Linux)."
