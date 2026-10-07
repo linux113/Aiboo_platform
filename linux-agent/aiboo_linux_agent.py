@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.1.6"
+VERSION = "1.1.7"
 AGENT_NAME = "AiBoO-Linux-Sentinel"
 
 try:
@@ -1173,10 +1173,30 @@ class Sender:
             return False, {"error": str(exc)}
 
     def _get(self, path: str, timeout: int = 10) -> dict | None:
+        """GET + the same credentials _post uses.
+
+        Without x-api-key / x-endpoint-id the backend answers 401 and the agent
+        would silently never receive a dashboard command - the Approve button
+        would look like it worked and nothing would happen on the server.
+        """
         req = urllib.request.Request(f"{self.st.remote_url}{path}", method="GET")
+        req.add_header("x-api-key", self.st.api_key)
+        req.add_header("x-endpoint-id", self.st.endpoint_name)
+        req.add_header("Accept", "application/json")
+        ctx = None
+        if not self.st.verify_tls:
+            import ssl
+            ctx = ssl._create_unverified_context()
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
                 return json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                log(f"server refused the API key for {path} (HTTP {exc.code}) - "
+                    f"check api_key in config.ini against AGENT_API_KEY on the server", "WARN")
+            else:
+                log(f"server said HTTP {exc.code} for {path}", "WARN")
+            return None
         except Exception:
             return None
 
@@ -2011,6 +2031,8 @@ def run_once(st: Settings, state: AgentState, sender: Sender, trust: int,
         for user in engine.restrictions_due():
             res = engine.unlock_user(user)
             log(f"auto-unlock {user}: {res.get('message')}")
+        for done in engine.expire_throttles():
+            log(f"rate limit expired - {done}")
         if engine.isolation_due():
             engine.release_isolation()
             log("full isolation auto-released after its timer")

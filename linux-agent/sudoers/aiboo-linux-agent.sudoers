@@ -29,6 +29,12 @@ SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT -s * -j ACCEPT
 SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT 1 -j DROP
 SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -D INPUT -j DROP
 
+# --- throttling (slow an IP down instead of blocking it) -----------------
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT -s * -m comment --comment aiboo_throttle_* -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -D INPUT -s * -m comment --comment aiboo_throttle_* -j DROP
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -I INPUT -s * -m hashlimit * -j ACCEPT
+SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/iptables -D INPUT -s * -m hashlimit * -j ACCEPT
+
 # --- processes (kill a reverse shell / attack tool) ----------------------
 SERVICE_USER ALL=(root) NOPASSWD: /bin/kill -9 *
 

@@ -34,21 +34,50 @@ const ACTION_FILTERS: {
 ];
 
 // ---- Remote dispatch action catalogue ----
-const DISPATCH_ACTIONS: { value: string; label: string; placeholder: string }[] = [
-  { value: "terminate_process", label: "Terminate process", placeholder: "PID or process name (e.g. 1234 or notepad.exe)" },
-  { value: "isolate_asset", label: "Isolate IP (inbound)", placeholder: "IP (e.g. 203.0.113.100)" },
-  { value: "block_access", label: "Block IP (inbound)", placeholder: "IP (e.g. 10.0.0.45)" },
-  { value: "quarantine_device", label: "Quarantine device", placeholder: "Device ID (e.g. DEV-ABC123)" },
-  { value: "force_logout", label: "Force logout", placeholder: "User ID" },
-  { value: "revoke_identity", label: "Revoke identity", placeholder: "User ID" },
-  { value: "pseudo_lock", label: "Pseudo-lock", placeholder: "User ID or IP" },
-  // dynamic access control - real Windows changes, undone automatically
-  { value: "restrict_identity", label: "Restrict account 30 min (auto re-enable)", placeholder: "Windows user name" },
-  { value: "lift_restriction", label: "Lift account restriction now", placeholder: "Windows user name" },
-  { value: "throttle_segment", label: "Throttle IP / range 256 kbps, 30 min", placeholder: "IP or range (e.g. 45.95.147.3 or 192.168.1.0/24)" },
-  { value: "remove_throttle", label: "Remove throttle", placeholder: "Same IP or range as before" },
-  { value: "step_up_auth", label: "Lock screen (user must sign in again)", placeholder: "Windows user name" },
+// Windows (the socket agent) and Linux (the REST Sentinel) do not support the
+// same list, so each entry says which platform(s) it belongs to. A Linux server
+// must never be offered "Lock screen" or be told a device will be quarantined.
+type DispatchAction = {
+  value: string;
+  label: string;
+  placeholder: string;
+  linuxLabel?: string;
+  linuxPlaceholder?: string;
+  platforms: Array<"windows" | "linux">;
+};
+
+const DISPATCH_ACTIONS: DispatchAction[] = [
+  { value: "terminate_process", label: "Terminate process", placeholder: "PID or process name (e.g. 1234 or notepad.exe)",
+    linuxLabel: "Stop a process", linuxPlaceholder: "PID or process name (e.g. 9881 or python3)", platforms: ["windows", "linux"] },
+  { value: "isolate_asset", label: "Isolate IP (inbound)", placeholder: "IP (e.g. 203.0.113.100)",
+    linuxPlaceholder: "IP to cut off (e.g. 45.95.147.3)", platforms: ["windows", "linux"] },
+  { value: "block_access", label: "Block IP (inbound)", placeholder: "IP (e.g. 10.0.0.45)",
+    linuxLabel: "Block IP (iptables / ufw)", platforms: ["windows", "linux"] },
+  { value: "quarantine_device", label: "Quarantine device", placeholder: "Device ID (e.g. DEV-ABC123)",
+    platforms: ["windows"] },
+  { value: "force_logout", label: "Force logout", placeholder: "Windows user name",
+    linuxLabel: "Log the user out of their sessions", linuxPlaceholder: "Linux user name (e.g. deploy)", platforms: ["windows", "linux"] },
+  { value: "revoke_identity", label: "Revoke identity", placeholder: "Windows user name",
+    linuxLabel: "Lock the account (until an admin unlocks it)", linuxPlaceholder: "Linux user name (e.g. deploy)", platforms: ["windows", "linux"] },
+  { value: "pseudo_lock", label: "Pseudo-lock", placeholder: "Label (optional, e.g. suspicious-host)",
+    linuxLabel: "Open decoy port (honeypot listener)", platforms: ["windows", "linux"] },
+  { value: "restrict_identity", label: "Restrict account 30 min (auto re-enable)", placeholder: "Windows user name",
+    linuxLabel: "Lock the account for 30 min (auto unlock)", linuxPlaceholder: "Linux user name (e.g. deploy)", platforms: ["windows", "linux"] },
+  { value: "lift_restriction", label: "Lift account restriction now", placeholder: "Windows user name",
+    linuxLabel: "Unlock the account now", linuxPlaceholder: "Linux user name (e.g. deploy)", platforms: ["windows", "linux"] },
+  { value: "throttle_segment", label: "Throttle IP / range 256 kbps, 30 min", placeholder: "IP or range (e.g. 45.95.147.3 or 192.168.1.0/24)",
+    linuxLabel: "Rate-limit an IP (iptables hashlimit, approx.)", platforms: ["windows", "linux"] },
+  { value: "remove_throttle", label: "Remove throttle", placeholder: "Same IP or range as before",
+    linuxLabel: "Remove the rate limit", platforms: ["windows", "linux"] },
+  { value: "step_up_auth", label: "Lock screen (user must sign in again)", placeholder: "Windows user name",
+    linuxLabel: "Close the sessions (they must sign in again)", linuxPlaceholder: "Linux user name (e.g. deploy)", platforms: ["windows", "linux"] },
 ];
+
+const isLinuxEndpoint = (platform?: string) => String(platform || "").toLowerCase().startsWith("linux");
+const actionsFor = (platform?: string) => {
+  const want = isLinuxEndpoint(platform) ? "linux" : "windows";
+  return DISPATCH_ACTIONS.filter((a) => a.platforms.includes(want));
+};
 
 // ---- Status badge styles ----
 const STATUS_STYLES: Record<
@@ -116,6 +145,8 @@ interface OnlineAgent {
   endpointId: string;
   hostname: string;
   lastSeen: string;
+  platform?: string;              // 'windows' | 'linux' | ...
+  channel?: 'socket' | 'rest';    // rest = the Linux Sentinel polling over HTTPS
 }
 
 export default function AgentConsole({
@@ -418,9 +449,22 @@ export default function AgentConsole({
     { k: "send" as const, label: "Send Event" },
   ];
 
+  // The endpoint currently chosen in the dispatch form decides the wording and
+  // the list of actions (a Linux server has no "lock screen").
+  const selectedAgent = onlineAgents.find((a) => a.endpointId === dispatchEndpoint);
+  const selectedIsLinux = isLinuxEndpoint(selectedAgent?.platform);
+  const availableActions = actionsFor(selectedAgent?.platform);
+  const dispatchActionDef = availableActions.find((a) => a.value === dispatchAction);
   const dispatchPlaceholder =
-    DISPATCH_ACTIONS.find((a) => a.value === dispatchAction)?.placeholder ||
+    (selectedIsLinux ? dispatchActionDef?.linuxPlaceholder : undefined) ||
+    dispatchActionDef?.placeholder ||
     "target";
+
+  // if the endpoint changes to one that cannot run the chosen action, pick the first
+  useEffect(() => {
+    if (!dispatchActionDef) setDispatchAction(availableActions[0]?.value || "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dispatchEndpoint, selectedAgent?.platform]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -785,6 +829,7 @@ export default function AgentConsole({
                         {a.hostname && a.hostname !== a.endpointId
                           ? ` (${a.hostname})`
                           : ""}
+                        {isLinuxEndpoint(a.platform) ? " - Linux" : " - Windows"}
                       </option>
                     ))}
                   </select>
@@ -794,9 +839,9 @@ export default function AgentConsole({
                     onChange={(e) => setDispatchAction(e.target.value)}
                     className="rounded-lg border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-100 focus:border-cyan-500/50 focus:outline-none"
                   >
-                    {DISPATCH_ACTIONS.map((a) => (
+                    {availableActions.map((a) => (
                       <option key={a.value} value={a.value}>
-                        {a.label}
+                        {selectedIsLinux && a.linuxLabel ? a.linuxLabel : a.label}
                       </option>
                     ))}
                   </select>

@@ -29,6 +29,9 @@ type Playbook = {
   placeholder?: string;
   optionalTarget?: boolean;
   explain: string;
+  linuxTargetLabel?: string;
+  linuxPlaceholder?: string;
+  linuxExplain?: string;
 };
 
 const PLAYBOOKS: Playbook[] = [
@@ -36,22 +39,28 @@ const PLAYBOOKS: Playbook[] = [
     id: "isolate", label: "Isolate Host", critical: true, kind: "dispatch", action: "isolate_asset",
     targetLabel: "IP address to cut off", placeholder: "e.g. 203.0.113.50",
     explain: "Adds a Windows Firewall rule on the selected PC that blocks incoming traffic from this IP. (Remove the rule in Windows Firewall to undo.)",
+    linuxExplain: "Adds an iptables/ufw rule on the selected Linux server that blocks incoming and outgoing traffic to this IP. Undo with Agent Console -> dispatch 'Unblock IP'.",
   },
   {
     id: "lock", label: "Lock Perimeter", kind: "dispatch", action: "pseudo_lock",
     targetLabel: "Label (optional)", placeholder: "e.g. suspicious-host", optionalTarget: true,
     explain: "Opens a decoy (honeypot) port on the selected PC and logs anyone who connects. Undo with Agent Console -> Locks -> Restore.",
+    linuxExplain: "Opens a decoy (honeypot) port on the selected Linux server and logs anyone who connects. Undo with Agent Console -> Locks -> Restore.",
   },
   {
     id: "quarantine", label: "Quarantine Identity", kind: "dispatch", action: "revoke_identity",
     targetLabel: "Windows user name", placeholder: "e.g. guest",
     explain: "Disables this local Windows account on the selected PC (net user <name> /active:no). The account the agent runs as is refused.",
+    linuxTargetLabel: "Linux user name", linuxPlaceholder: "e.g. deploy",
+    linuxExplain: "Locks this account on the selected Linux server (usermod -L) and closes its sessions. Root, system accounts and the account the agent runs as are refused.",
   },
   {
     id: "restrict", label: "Restrict Account", kind: "dispatch", action: "restrict_identity",
     targetLabel: "Windows user name", placeholder: "e.g. guest",
     extras: [{ key: "minutes", label: "Minutes", def: 30, min: 1, max: 1440 }],
     explain: "Temporarily disables this Windows account and logs off its sessions. The agent turns it back on automatically when the time is up (or use Agent Console -> Lift restriction).",
+    linuxTargetLabel: "Linux user name", linuxPlaceholder: "e.g. deploy",
+    linuxExplain: "Locks this account on the selected Linux server for the chosen minutes and closes its sessions; the agent unlocks it automatically when the time is up (or dispatch 'Unlock the account now').",
   },
   {
     id: "throttle", label: "Throttle Segment", kind: "dispatch", action: "throttle_segment",
@@ -61,6 +70,7 @@ const PLAYBOOKS: Playbook[] = [
       { key: "minutes", label: "Minutes", def: 30, min: 1, max: 1440 },
     ],
     explain: "Limits the speed of traffic the selected PC sends to this IP / range (uploads, downloads it asks for, malware call-backs) with a Windows QoS policy - no extra hardware needed. Removed automatically when the time is up.",
+    linuxExplain: "Rate-limits this IP on the selected Linux server with an iptables hashlimit rule (packets above the limit are dropped) - the kbit/s figure is converted assuming 1500-byte packets, so it is approximate. Removed automatically when the time is up.",
   },
   {
     id: "badge", label: "Freeze Badge", kind: "badge",
@@ -77,7 +87,11 @@ const PLAYBOOKS: Playbook[] = [
 interface OnlineAgent {
   endpointId: string;
   hostname: string;
+  platform?: string;          // 'windows' | 'linux' | ...
+  channel?: "socket" | "rest";
 }
+
+const isLinux = (platform?: string) => String(platform || "").toLowerCase().startsWith("linux");
 
 const THREAT_ACTIONS = [
   { label: "Isolate", endpoint: "/respond/isolate", color: "border-cyan-400/80 hover:text-cyan-100" },
@@ -116,6 +130,8 @@ export default function DashboardModule({
   const [pbResult, setPbResult] = useState<{ ok: boolean | null; text: string } | null>(null);
   const [pbExtras, setPbExtras] = useState<Record<string, number>>({});
   const [badgeReady, setBadgeReady] = useState<boolean | null>(null);
+  // the wording of the playbook modal depends on the endpoint that is selected
+  const pbIsLinux = isLinux(pbAgents.find((a) => a.endpointId === pbEndpoint)?.platform);
 
   useEffect(() => {
     api.get("/agent/playbooks/status")
@@ -598,7 +614,9 @@ export default function DashboardModule({
                   ✕
                 </button>
               </div>
-              <p className="text-slate-400">{openPlaybook.explain}</p>
+              <p className="text-slate-400">
+                {pbIsLinux && openPlaybook.linuxExplain ? openPlaybook.linuxExplain : openPlaybook.explain}
+              </p>
 
               {openPlaybook.kind !== "unavailable" && (
                 <>
@@ -614,6 +632,7 @@ export default function DashboardModule({
                         {pbAgents.map((a) => (
                           <option key={a.endpointId} value={a.endpointId}>
                             {a.endpointId}{a.hostname && a.hostname !== a.endpointId ? ` (${a.hostname})` : ""}
+                            {isLinux(a.platform) ? " - Linux" : a.platform ? " - Windows" : ""}
                           </option>
                         ))}
                       </select>
@@ -621,13 +640,17 @@ export default function DashboardModule({
                   )}
                   <div>
                     <label className="mb-1 block text-[10px] uppercase tracking-[0.15em] text-slate-500">
-                      {openPlaybook.targetLabel}
+                      {pbIsLinux && openPlaybook.linuxTargetLabel
+                        ? openPlaybook.linuxTargetLabel
+                        : openPlaybook.targetLabel}
                     </label>
                     <input
                       value={pbTarget}
                       onChange={(e) => setPbTarget(e.target.value)}
                       onKeyDown={(e) => { if (e.key === "Enter") runPlaybook(); }}
-                      placeholder={openPlaybook.placeholder}
+                      placeholder={pbIsLinux && openPlaybook.linuxPlaceholder
+                        ? openPlaybook.linuxPlaceholder
+                        : openPlaybook.placeholder}
                       className="w-full rounded border border-slate-700 bg-slate-950 px-2 py-1.5 text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none"
                     />
                   </div>

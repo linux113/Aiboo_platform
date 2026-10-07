@@ -650,16 +650,29 @@ router.get('/commands/history', protect, (req, res) => {
   res.json({ ok: true, count: list.length, commands: list.slice(0, 100) });
 });
 
-// GET /api/agent/agents-online – list agents currently connected via WebSocket
+// GET /api/agent/agents-online – every agent you can send an action to:
+//   * socket agents (the Windows agent) straight from the command channel,
+//   * REST-polling agents (the Linux Sentinel) from the endpoint store, as long
+//     as they checked in recently. Without them a Linux server could never be
+//     chosen in Agent Console, even though the command queue can reach it.
 router.get('/agents-online', protect, (req, res) => {
   try {
     const channel = req.app.get('agentChannel');
-    if (!channel) {
-      return res
-        .status(503)
-        .json({ ok: false, error: 'Agent channel not initialized' });
-    }
-    const agents = channel.listAgents();
+    const socketAgents = channel ? channel.listAgents() : [];
+    const seen = new Set(socketAgents.map((a) => a.endpointId || a.endpoint_id));
+
+    const restAgents = Object.values(store.endpoints || {})
+      .filter((ep) => ep && ep.source && isActive(ep.lastSeen) && !seen.has(ep.source))
+      .map((ep) => ({
+        endpointId: ep.source,
+        hostname: ep.hostname || ep.source,
+        lastSeen: ep.lastSeen,
+        platform: ep.platform || 'linux',       // only REST agents today are Linux
+        channel: 'rest',
+        importance: store.importance[ep.source] || null,
+      }));
+
+    const agents = [...socketAgents, ...restAgents];
     res.json({ ok: true, count: agents.length, agents });
   } catch (error) {
     logger.error(`Error listing online agents: ${error.message}`);

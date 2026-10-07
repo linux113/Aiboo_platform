@@ -63,7 +63,7 @@ def _norm_cmd(cmd: str) -> str:
     return os.path.basename(parts[0]) + (" " + " ".join(parts[1:]) if len(parts) > 1 else "")
 
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # ---------------------------------------------------------------- guard rails
 PROTECTED_PIDS = {0, 1}
@@ -358,6 +358,211 @@ class ResponseEngine:
         return {"status": status, "message": message, "details": out,
                 "metadata": {"ip": ip, "tool": tool, "dry_run": self.dry, "enforced": not warn}}
 
+    # ------------------------------------------------------------- throttling
+    def _throttle_tag(self, ip: str) -> str:
+        """A short, unique, iptables-safe name for this IP's rate limiter."""
+        return "AIBOO_THR_" + re.sub(r"[^0-9a-zA-Z]", "_", ip)[:24]
+
+    @staticmethod
+    def _kbps_to_pps(kbps: int) -> int:
+        """kbit/s -> packets per second, assuming full 1500-byte packets.
+
+        An approximation, and the answer says so: iptables hashlimit counts
+        PACKETS, not bits, so there is no exact conversion.
+        """
+        return max(1, int(round(max(1, kbps) * 1000 / 8 / 1500)))
+
+    def _throttle_rules(self, ip: str, kbps: int) -> tuple[list[list[str]], int]:
+        pps = self._kbps_to_pps(kbps)
+        burst = max(2, pps * 2)
+        tag = self._throttle_tag(ip)
+        comment = f"aiboo_throttle_{tag}"
+        return [
+            ["iptables", "-I", "INPUT", "-s", ip, "-m", "comment",
+             "--comment", comment, "-j", "DROP"],
+            ["iptables", "-I", "INPUT", "-s", ip, "-m", "hashlimit",
+             "--hashlimit-upto", f"{pps}/sec", "--hashlimit-burst", str(burst),
+             "--hashlimit-mode", "srcip", "--hashlimit-name", tag,
+             "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+        ], pps
+
+    def throttle_ip(self, ip: str, kbps: int = 256, minutes: int = 30) -> dict:
+        """Slow an IP down instead of blocking it completely (iptables hashlimit).
+
+        Packets inside the limit are accepted, packets above it are dropped.
+        kbit/s -> packets/s assumes 1500-byte packets, and the answer says it is
+        approximate. If hashlimit is missing we never pretend: we block the IP
+        and the message says so.
+        """
+        ip = (ip or "").strip()
+        why = self._ip_guard(ip)
+        if why:
+            return {"status": "failed",
+                    "message": why.replace("refused to block", "refused to throttle")}
+        if not self.enabled:
+            return {"status": "failed",
+                    "message": "local response is OFF on this server (allow_response = no in config.ini)"}
+        if ":" in ip:
+            return {"status": "failed",
+                    "message": "throttling IPv6 needs tc/ifb, which is not implemented - block it instead"}
+        try:
+            kbps = max(8, min(100000, int(kbps or 256)))
+            minutes = max(0, min(1440, int(minutes or 30)))
+        except (TypeError, ValueError):
+            kbps, minutes = 256, 30
+
+        rules, pps = self._throttle_rules(ip, kbps)
+        tag = self._throttle_tag(ip)
+        comment = f"aiboo_throttle_{tag}"
+
+        if self.dry:
+            self._audit("throttle_segment", ip, "executed",
+                        f"(dry-run) would rate-limit {ip}", {"kbps": kbps})
+            return {"status": "executed",
+                    "message": f"(dry-run) would rate-limit {ip} to ~{kbps} kbit/s",
+                    "details": "(dry-run) " + " ; ".join(" ".join(r) for r in rules),
+                    "metadata": {"ip": ip, "kbps": kbps, "pps": pps, "mode": "hashlimit",
+                                 "approx": True, "dry_run": True}}
+
+        if not shutil.which("iptables"):
+            fallback = self.block_ip(ip, reason="throttle requested, no iptables - blocked instead")
+            fallback["message"] = ("throttling needs iptables (not installed) - "
+                                   + str(fallback.get("message", "")))
+            fallback.setdefault("metadata", {})["fell_back_to_block"] = True
+            return fallback
+
+        # DROP first, ACCEPT second: -I puts each new rule on top, so the ACCEPT
+        # ends up above the DROP and only the excess packets reach the DROP.
+        for argv in rules:
+            code, out = self._run(argv)
+            if code != 0:
+                self._run(["iptables", "-D", "INPUT", "-s", ip, "-m", "comment",
+                           "--comment", comment, "-j", "DROP"])
+                low = out.lower()
+                if "hashlimit" in low or "no chain/target/match" in low or "unknown option" in low:
+                    fallback = self.block_ip(ip, reason="throttle requested, hashlimit unavailable - blocked")
+                    fallback["message"] = ("iptables hashlimit is not available on this kernel - "
+                                           + str(fallback.get("message", "")))
+                    fallback.setdefault("metadata", {})["fell_back_to_block"] = True
+                    return fallback
+                self._audit("throttle_segment", ip, "failed", out, {"kbps": kbps})
+                return {"status": "failed", "message": f"iptables refused the rate limit: {out}"}
+
+        if minutes > 0:
+            self._schedule_throttle_removal(ip, minutes, pps)
+        message = f"traffic from {ip} limited to ~{kbps} kbit/s (about {pps} packets/s)"
+        if minutes > 0:
+            message += f" for {minutes} minutes (removed automatically)"
+        self._audit("throttle_segment", ip, "executed", message,
+                    {"kbps": kbps, "pps": pps, "minutes": minutes, "mode": "hashlimit"})
+        return {"status": "executed", "message": message,
+                "details": f"iptables hashlimit: packets above {pps}/s are dropped",
+                "metadata": {"ip": ip, "kbps": kbps, "pps": pps, "mode": "hashlimit",
+                             "approx": True, "enforced": True, "minutes": minutes}}
+
+    def remove_throttle_ip(self, ip: str) -> dict:
+        """Remove exactly the rules throttle_ip added (matched by their comment)."""
+        ip = (ip or "").strip()
+        why = self._ip_guard(ip)
+        if why:
+            return {"status": "failed",
+                    "message": why.replace("refused to block", "refused to unthrottle")}
+        tag = self._throttle_tag(ip)
+        comment = f"aiboo_throttle_{tag}"
+        removed, errors = 0, []
+        attempts = [
+            # the two rules as they were installed (newest first: -I puts them on top)
+            ["iptables", "-D", "INPUT", "-s", ip, "-m", "hashlimit",
+             "--hashlimit-upto", self._delete_any_rate(tag), "--hashlimit-burst", "1",
+             "--hashlimit-mode", "srcip", "--hashlimit-name", tag,
+             "-m", "comment", "--comment", comment, "-j", "ACCEPT"],
+            ["iptables", "-D", "INPUT", "-s", ip, "-m", "comment", "--comment", comment, "-j", "DROP"],
+        ]
+        for argv in attempts:
+            code, out = self._run(argv)
+            if code == 0:
+                removed += 1
+            elif "bad rule" in out.lower() or "does not exist" in out.lower() or "no chain" in out.lower():
+                pass                                  # already gone - that is fine
+            else:
+                errors.append(out)
+        status = "executed" if removed or not errors else "failed"
+        message = (f"rate limit removed for {ip} ({removed} rule(s))" if status == "executed"
+                   else f"could not remove the rate limit: {errors[0]}")
+        self._audit("remove_throttle", ip, status, message)
+        return {"status": status, "message": message, "metadata": {"ip": ip, "mode": "hashlimit"}}
+
+    def _delete_any_rate(self, tag: str) -> str:
+        """The rate that was used when the rule was added (from state), else 1/sec."""
+        path = self.state_dir / "throttles.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            item = data.get(tag) or {}
+            if item.get("pps"):
+                return f"{int(item['pps'])}/sec"
+        except Exception:                                      # noqa: BLE001
+            pass
+        return "1/sec"
+
+    def _schedule_throttle_removal(self, ip: str, minutes: int, pps: int = 0) -> None:
+        """Auto-removal timer, the same pattern as the account auto-unlock."""
+        path = self.state_dir / "throttles.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:                                      # noqa: BLE001
+            data = {}
+        data[self._throttle_tag(ip)] = {"ip": ip, "pps": pps,
+                                        "until": time.time() + minutes * 60}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def expire_throttles(self) -> list[str]:
+        """Remove rate limits whose time is up (call once per loop)."""
+        path = self.state_dir / "throttles.json"
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:                                      # noqa: BLE001
+            return []
+        now, done = time.time(), []
+        for tag, item in list(data.items()):
+            if not isinstance(item, dict) or item.get("until", 0) > now:
+                continue
+            res = self.remove_throttle_ip(str(item.get("ip", "")))
+            done.append(f"{item.get('ip')}: {res.get('message')}")
+            data.pop(tag, None)
+        try:
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+        return done
+
+    # ------------------------------------------------------- log the user out
+    def force_logout(self, user: str) -> dict:
+        """Close every session of a user (loginctl, pkill as the fallback)."""
+        why = self._refuse_user(user, verb="log out")
+        if why:
+            return {"status": "failed", "message": why}
+        if shutil.which("loginctl"):
+            code, out = self._run(["loginctl", "terminate-user", user])
+            used = "loginctl terminate-user"
+        else:
+            code, out = self._run(["pkill", "-KILL", "-u", user])
+            used = "pkill -KILL -u"
+        if code == 0 and shutil.which("pkill"):
+            # a session without logind survives terminate-user
+            self._run(["pkill", "-KILL", "-u", user])
+        status = "executed" if code == 0 else "failed"
+        message = (f"all sessions of '{user}' closed ({used})" if status == "executed"
+                   else f"could not close the sessions of '{user}': {out}")
+        self._audit("force_logout", user, status, message)
+        return {"status": status, "message": message,
+                "metadata": {"user": user, "tool": used.split()[0]}}
+
     def unblock_ip(self, ip: str) -> dict:
         ip = (ip or "").strip()
         why = self._ip_guard(ip)
@@ -528,7 +733,7 @@ class ResponseEngine:
         except (ImportError, KeyError):
             return None
 
-    def _refuse_user(self, user: str) -> str:
+    def _refuse_user(self, user: str, verb: str = "lock") -> str:
         if not user:
             return "no user name given"
         if user in ("root", "daemon", "bin", "sys", "sync", "systemd-network"):
@@ -539,7 +744,7 @@ class ResponseEngine:
         if uid < 1000:
             return f"'{user}' is a system account (uid {uid}) - refused"
         if uid == os.geteuid():
-            return "refusing to lock the account the agent itself is running as"
+            return f"refusing to {verb} the account the agent itself is running as"
         return ""
 
     def lock_user(self, user: str, minutes: int = 0, reason: str = "") -> dict:
@@ -810,9 +1015,10 @@ class ResponseEngine:
             "block_access": lambda: self.block_ip(target, params.get("reason", "")),
             "isolate_asset": lambda: self.block_ip(target, params.get("reason", "isolate_asset")),
             "quarantine_device": lambda: self.block_ip(target, params.get("reason", "quarantine_device")),
-            "throttle_segment": lambda: self.block_ip(target, params.get("reason", "throttle_segment")),
+            "throttle_segment": lambda: self.throttle_ip(target, params.get("kbps", 256),
+                                                         params.get("minutes", 30)),
             "unblock_access": lambda: self.unblock_ip(target),
-            "remove_throttle": lambda: self.unblock_ip(target),
+            "remove_throttle": lambda: self.remove_throttle_ip(target),
             "terminate_process": lambda: self.terminate_process(target, params.get("reason", "")),
             "quarantine_file": lambda: self.quarantine_file(target, params.get("reason", "")),
             "restore_file": lambda: self.restore_file(target),
@@ -821,6 +1027,7 @@ class ResponseEngine:
                                                         params.get("reason", "")),
             "lift_restriction": lambda: self.unlock_user(target),
             "step_up_auth": lambda: self.step_up_auth(target),
+            "force_logout": lambda: self.force_logout(target),
             "pseudo_lock": lambda: self.pseudo_lock(target),
             "restore_pseudo_lock": lambda: self.restore_pseudo_lock(target),
             "full_isolation": lambda: self.full_isolation(int(params.get("minutes") or 15)),
@@ -831,9 +1038,10 @@ class ResponseEngine:
         if not handler:
             return {"status": "failed",
                     "message": f"action '{action}' is not supported by the Linux agent "
-                               f"(supported: block_access, unblock_access, terminate_process, quarantine_file, "
-                               f"restore_file, revoke_identity, restrict_identity, lift_restriction, "
-                               f"step_up_auth, pseudo_lock, restore_pseudo_lock, full_isolation)"}
+                               f"(supported: block_access, unblock_access, throttle_segment, remove_throttle, "
+                               f"terminate_process, quarantine_file, restore_file, revoke_identity, "
+                               f"restrict_identity, lift_restriction, force_logout, step_up_auth, pseudo_lock, "
+                               f"restore_pseudo_lock, full_isolation)"}
         started = time.time()
         try:
             result = handler()

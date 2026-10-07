@@ -662,6 +662,73 @@ def test_a_new_web_shell_is_reported_and_not_marked_as_already_sent():
     assert state2.seen, "harmless files should be remembered"
 
 
+# --------------------------------------------------------------------------
+# the REST command channel must authenticate (this bug hid every dashboard
+# command: the backend answers 401 without the key, and the agent just saw
+# "no commands")
+# --------------------------------------------------------------------------
+
+def test_fetch_commands_sends_the_api_key_and_the_endpoint_id():
+    import json as _json
+    import tempfile as _tempfile
+
+    st = agent.Settings(dry_run=False, endpoint_name="aiboo-linux-01",
+                        api_key="secret-key-123", remote_url="http://server:4000")
+    with _tempfile.TemporaryDirectory() as tmp:
+        state = agent.AgentState(Path(tmp) / "state.json")
+        sender = agent.Sender(st, state)
+        seen = {}
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return _json.dumps({"ok": True, "commands": [
+                    {"cmd_id": "c1", "action": "block_access", "target": "1.2.3.4"}]}).encode()
+
+        real = agent.urllib.request.urlopen
+        agent.urllib.request.urlopen = lambda req, **kw: (seen.update(
+            url=req.full_url, headers={k.lower(): v for k, v in req.header_items()}), FakeResp())[1]
+        try:
+            cmds = sender.fetch_commands()
+        finally:
+            agent.urllib.request.urlopen = real
+
+        assert seen["url"].endswith("/api/agent/commands/pending"), seen
+        assert seen["headers"].get("x-api-key") == "secret-key-123", seen["headers"]
+        assert seen["headers"].get("x-endpoint-id") == "aiboo-linux-01", seen["headers"]
+        assert cmds and cmds[0]["cmd_id"] == "c1", cmds
+
+
+def test_a_401_is_logged_instead_of_silently_returning_nothing():
+    import tempfile as _tempfile
+    import urllib.error
+
+    st = agent.Settings(dry_run=False, endpoint_name="aiboo-linux-01",
+                        api_key="wrong", remote_url="http://server:4000")
+    with _tempfile.TemporaryDirectory() as tmp:
+        sender = agent.Sender(st, agent.AgentState(Path(tmp) / "state.json"))
+        real = agent.urllib.request.urlopen
+
+        def boom(req, **kw):
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+        agent.urllib.request.urlopen = boom
+        lines = []
+        real_log = agent.log
+        agent.log = lambda msg, level="INFO": lines.append(f"{level}:{msg}")
+        try:
+            assert sender.fetch_commands() == []
+        finally:
+            agent.urllib.request.urlopen = real
+            agent.log = real_log
+        assert any("API key" in l and "WARN" in l for l in lines), lines
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

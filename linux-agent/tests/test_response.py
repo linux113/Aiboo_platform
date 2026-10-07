@@ -578,6 +578,141 @@ def test_unblock_also_refuses_junk_targets():
         assert out["status"] == "failed", f"{t!r} was not refused: {out}"
 
 
+# --------------------------------------------------------------------------
+# throttling (throttle_segment / remove_throttle) - really rate-limits on Linux
+# --------------------------------------------------------------------------
+
+def test_throttle_installs_a_hashlimit_rule_pair_not_a_full_block():
+    """DROP goes in first, then the limited ACCEPT above it: excess packets drop."""
+    eng, tmp = engine(allow_response=True, response_dry_run=False)
+    ran = []
+    eng._run = lambda cmd, timeout=20: (ran.append(list(cmd)), (0, ""))[1]
+    real_which = resp.shutil.which
+    resp.shutil.which = lambda n: "/usr/sbin/iptables" if n == "iptables" else (
+        real_which(n) if n != "pkill" else None)
+    try:
+        out = eng.throttle_ip("45.95.147.3", kbps=256, minutes=0)
+    finally:
+        resp.shutil.which = real_which
+    assert out["status"] == "executed", out
+    assert out["metadata"]["mode"] == "hashlimit", out
+    assert out["metadata"]["approx"] is True, out
+    joined = [" ".join(c) for c in ran]
+    assert any("hashlimit" in j and "--hashlimit-upto" in j and "-j ACCEPT" in j for j in joined), joined
+    assert any("comment" in j and "aiboo_throttle_" in j and "-j DROP" in j for j in joined), joined
+    # the ACCEPT must be inserted after the DROP, so it ends up above it
+    assert "hashlimit" in joined[-1], f"wrong rule order: {joined}"
+
+
+def test_throttle_converts_kbps_to_packets_and_says_it_is_approximate():
+    eng, _ = engine(allow_response=True, response_dry_run=True)
+    out = eng.throttle_ip("45.95.147.3", kbps=1200, minutes=5)
+    assert out["status"] == "executed", out
+    # 1200 kbit/s at 1500-byte packets = 100 packets/s
+    assert out["metadata"]["pps"] == 100, out["metadata"]
+    assert "would rate-limit" in out["message"] and "dry-run" in out["message"], out
+
+
+def test_throttle_refuses_localhost_and_the_aiboo_server():
+    eng, _ = engine(allow_response=True, response_dry_run=True)
+    for ip in ("127.0.0.1", "0.0.0.0/0", "localhost"):
+        out = eng.throttle_ip(ip)
+        assert out["status"] == "failed", f"{ip} was not refused: {out}"
+        assert "refused to throttle" in out["message"], out["message"]
+
+
+def test_throttle_falls_back_to_a_block_when_hashlimit_is_missing_and_says_so():
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+    calls = []
+
+    def fake_run(cmd, timeout=20):
+        calls.append(list(cmd))
+        if "hashlimit" in cmd:
+            return 2, "iptables: No chain/target/match by that name."
+        return 0, ""
+
+    eng._run = fake_run
+    real_which = resp.shutil.which
+    resp.shutil.which = lambda n: "/usr/sbin/iptables" if n == "iptables" else None
+    try:
+        out = eng.throttle_ip("45.95.147.3", kbps=256, minutes=0)
+    finally:
+        resp.shutil.which = real_which
+    assert out["status"] == "executed", out
+    assert out["metadata"].get("fell_back_to_block") is True, out
+    assert "hashlimit is not available" in out["message"], out["message"]
+    joined = [" ".join(c) for c in calls]
+    assert any("-j DROP" in j and "hashlimit" not in j for j in joined), joined
+
+
+def test_remove_throttle_deletes_by_comment_so_a_real_block_survives():
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+    ran = []
+    eng._run = lambda cmd, timeout=20: (ran.append(list(cmd)), (0, ""))[1]
+    out = eng.remove_throttle_ip("45.95.147.3")
+    assert out["status"] == "executed", out
+    joined = [" ".join(c) for c in ran]
+    assert all("aiboo_throttle_" in j for j in joined), f"an untagged rule was deleted: {joined}"
+    assert not any(j.startswith("iptables -D INPUT -s 45.95.147.3 -j DROP") for j in joined), joined
+
+
+def test_expired_throttle_is_removed_by_the_agent_timer():
+    eng, tmp = engine(allow_response=True, response_dry_run=False)
+    ran = []
+    eng._run = lambda cmd, timeout=20: (ran.append(list(cmd)), (0, ""))[1]
+    eng._schedule_throttle_removal("45.95.147.3", minutes=-1, pps=21)   # already due
+    done = eng.expire_throttles()
+    assert done and "45.95.147.3" in done[0], done
+    assert ran, "no iptables command was run to remove the expired limit"
+
+
+def test_throttle_is_off_in_read_only_mode():
+    eng, _ = engine(allow_response=False, response_dry_run=True)
+    out = eng.throttle_ip("45.95.147.3")
+    assert out["status"] == "failed", out
+    assert "allow_response = no" in out["message"], out["message"]
+
+
+# --------------------------------------------------------------------------
+# force_logout - the Windows "log off user" equivalent
+# --------------------------------------------------------------------------
+
+def test_force_logout_closes_the_sessions_of_a_normal_user():
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+    ran = []
+    eng._run = lambda cmd, timeout=20: (ran.append(list(cmd)), (0, ""))[1]
+    real_which, real_uid = resp.shutil.which, eng._user_uid
+    other_uid = os.geteuid() + 7          # a normal user, never this process
+    eng._user_uid = lambda u: other_uid
+    resp.shutil.which = lambda n: f"/usr/bin/{n}" if n in ("loginctl", "pkill") else None
+    try:
+        out = eng.force_logout("deploy")
+    finally:
+        resp.shutil.which, eng._user_uid = real_which, real_uid
+    assert out["status"] == "executed", out
+    joined = [" ".join(c) for c in ran]
+    assert any(c[0] == "loginctl" and "terminate-user" in c for c in ran), joined
+    assert any(c[0] == "pkill" and "-u" in c for c in ran), joined
+
+
+def test_force_logout_refuses_root_system_accounts_and_the_agent_user():
+    eng, _ = engine(allow_response=True, response_dry_run=False)
+    real_uid = eng._user_uid
+    try:
+        eng._user_uid = lambda u: {"root": 0, "sshd": 105}.get(u, 1002)
+        for user in ("root", "sshd", ""):
+            out = eng.force_logout(user)
+            assert out["status"] == "failed", f"{user!r} was not refused: {out}"
+        # the account the agent itself runs as
+        uid = os.geteuid()
+        eng._user_uid = lambda u: uid
+        out = eng.force_logout("ubuntu")
+        assert out["status"] == "failed", out
+        assert "agent itself" in out["message"], out["message"]
+    finally:
+        eng._user_uid = real_uid
+
+
 if __name__ == "__main__":
     passed = failed = 0
     for name, fn in sorted(globals().items()):

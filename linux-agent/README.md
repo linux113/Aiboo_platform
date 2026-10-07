@@ -192,13 +192,16 @@ python3 aiboo_linux_agent.py --capabilities
 | Action the dashboard can send | What it does on Linux | Privilege needed |
 |---|---|---|
 | `block_access` / `isolate_asset` / `quarantine_device` | block that IP (`ufw deny` / `iptables -I INPUT -D DROP`, inbound **and** outbound) | root or sudo |
-| `unblock_access` / `remove_throttle` | removes the rule again | root or sudo |
+| `unblock_access` | removes the block rule again | root or sudo |
+| `throttle_segment` | **really rate-limits** that IP with an iptables `hashlimit` rule (packets above the limit are dropped) instead of blocking it; `kbps` is converted to packets/s assuming 1500-byte packets, so it is approximate and the answer says so. Auto-removed when the time is up | root or sudo |
+| `remove_throttle` | deletes exactly the two rules the throttle added (matched by their `aiboo_throttle_*` comment, so a real block is never removed by accident) | root or sudo |
 | `terminate_process` | `kill -9` by PID or exact name | root or sudo |
 | `quarantine_file` | moves the file to `quarantine/<date>/…`, `chmod 000`, keeps sha256 + metadata | folder write access only |
 | `restore_file` | puts it back (by path or sha256) | folder write access only |
 | `revoke_identity` / `restrict_identity` | `usermod -L` + closes the user's sessions; `restrict` re-enables automatically after N minutes | root or sudo |
 | `lift_restriction` | `usermod -U` | root or sudo |
 | `step_up_auth` | closes the user's sessions so they must sign in again | root or sudo |
+| `force_logout` | same as `step_up_auth` but worded for "log this person out now" (`loginctl terminate-user`, `pkill -KILL -u` as a fallback) | root or sudo |
 | `pseudo_lock` / `restore_pseudo_lock` | opens a **real decoy TCP port** (banner + payload capture) and closes it | none |
 | `full_isolation` / `release_isolation` | only the AiBoO server can reach the host; auto-released (needs `allow_full_isolation = yes`) | root or sudo |
 
@@ -209,7 +212,10 @@ python3 aiboo_linux_agent.py --capabilities
 * Never blocks `127.0.0.1`, `::1` or the **AiBoO server itself**.
 * Never kills PID 1, `systemd*`, `sshd*`, `auditd`, `cron`, `rsyslogd` or the
   agent itself; a Python process can only be killed by explicit PID.
-* Never locks `root`, system accounts (uid < 1000) or the account the agent runs as.
+* Never locks, logs out or throttles `root`, system accounts (uid < 1000), or the
+  account the agent itself runs as.
+* If the kernel has no `hashlimit` support, throttling is **never faked**: the
+  agent blocks the IP instead and the message says exactly that.
 * Quarantine only touches `watch_dirs`, `/tmp`, `/var/tmp`, `/dev/shm`; symlinks
   and files > 100 MB are refused.
 * Nothing runs through a shell, and every action is appended to `actions.jsonl`.

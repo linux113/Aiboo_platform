@@ -215,6 +215,8 @@ export function registerAgentChannel(io) {
         endpointId: a.endpointId,
         hostname: a.hostname,
         lastSeen: a.lastSeen,
+        platform: a.platform || 'windows',      // the socket protocol is the Windows agent
+        channel: 'socket',
         importance: a.importance || null,
         trigate: a.trigate || null,
       }));
