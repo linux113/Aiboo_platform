@@ -5,7 +5,7 @@
 //   Rules     - WHEN this happens -> THEN run this playbook (ResponseRules.tsx)
 import { useCallback, useEffect, useMemo, useState } from "react";
 import RulesTab from "./ResponseRules";
-import api, { API, apiErrorMessage } from "../utils/api";
+import api, { apiErrorMessage } from "../utils/api";
 import { cn } from "../utils/cn";
 
 // ------------------------------------------------------------------ types
@@ -90,7 +90,7 @@ export interface RunPrefill { endpoint?: string; vars?: Record<string, string>; 
 type Notify = (type: "critical" | "warning" | "info", title: string, body: string) => void;
 
 // ------------------------------------------------------------------ helpers
-const P = `${API}/pseudolock`;
+const P = `/pseudolock`;
 const STATUS_CLS: Record<string, string> = {
   pending: "bg-amber-500/15 text-amber-300 ring-amber-500/40",
   waiting: "bg-amber-500/15 text-amber-300 ring-amber-500/40",
@@ -143,7 +143,7 @@ function useOnlinePcs(open = true) {
   const [pcs, setPcs] = useState<string[]>([]);
   useEffect(() => {
     if (!open) return;
-    api.get(`${API}/agent/agents-online`, { timeout: 5000 })
+    api.get(`/agent/agents-online`, { timeout: 5000 })
       .then((r) => setPcs((Array.isArray(r.data?.agents) ? r.data.agents : []).map((a: { endpointId?: string }) => a.endpointId || "").filter(Boolean)))
       .catch(() => setPcs([]));
   }, [open]);

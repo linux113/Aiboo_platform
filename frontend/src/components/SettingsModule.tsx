@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { cn } from "../utils/cn";
-import api, { authH, API } from "../utils/api";
+import api, { authH } from "../utils/api";
 import { initials } from "../utils/helpers";
 
 const SECTIONS = [
@@ -48,7 +48,7 @@ export default function SettingsModule({
     setPwBusy(true);
     try {
       await api.post(
-        `${API}/auth/change-password`,
+        `/auth/change-password`,
         { currentPassword: pw.current, newPassword: pw.next },
         authH()
       );
@@ -116,7 +116,7 @@ export default function SettingsModule({
 
   const saveToBackend = async (section: string, data: unknown) => {
     try {
-      await api.post(`${API}/settings/${section}`, data, authH());
+      await api.post(`/settings/${section}`, data, authH());
     } catch {
       /* settings save to backend is best-effort */
     }
@@ -125,7 +125,7 @@ export default function SettingsModule({
   const save = async () => {
     setSaving(true);
     try {
-      await api.put(`${API}/settings/profile`, profile, authH());
+      await api.put(`/settings/profile`, profile, authH());
       localStorage.setItem("aiboo_settings_urls", JSON.stringify(urls));
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);

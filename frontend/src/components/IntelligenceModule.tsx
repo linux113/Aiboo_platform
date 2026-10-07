@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { cn } from "../utils/cn";
-import api, { authH, API } from "../utils/api";
+import api, { authH } from "../utils/api";
 import { detIcon } from "../utils/helpers";
 import { logger } from "../utils/logger";
 import type { Detection, Camera, AgentFinding } from "../types";
@@ -30,7 +30,7 @@ export default function IntelligenceModule({
     const fetchIdentities = async () => {
       setLoadingIdentity(true);
       try {
-        const res = await api.get(`${API}/agent/identities`, authH());
+        const res = await api.get(`/agent/identities`, authH());
         if (Array.isArray(res.data)) {
           setIdentityRows(res.data);
         }

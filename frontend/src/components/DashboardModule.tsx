@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { cn } from "../utils/cn";
 import { sevCls, detIcon, threatIcon } from "../utils/helpers";
-import api, { authH, API, waitForCommand, apiErrorMessage } from "../utils/api";
+import api, { authH, waitForCommand, apiErrorMessage } from "../utils/api";
 import { logger } from "../utils/logger";
 import KPI from "./KPI";
 import type { Threat, Detection, Camera, AgentFinding, CorrelatedAlert, GateDecision } from "../types";
@@ -184,7 +184,7 @@ export default function DashboardModule({
     try {
       const meta = (threat.metadata || {}) as Record<string, unknown>;
       const ip = meta.ip || meta.src_ip || meta.source_ip;
-      await api.post(`${API}${action}`, { threatId: threat._id, title: threat.title, ...(ip ? { ip } : {}) }, authH());
+      await api.post(`${action}`, { threatId: threat._id, title: threat.title, ...(ip ? { ip } : {}) }, authH());
       onNotify?.("info", "Response recorded", `${action.split("/").pop()} -> ${threat.title}`);
     } catch (e) {
       logger.error(`Failed to ${action} on ${threat.title}`);

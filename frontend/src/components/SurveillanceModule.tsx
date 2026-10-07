@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { cn } from "../utils/cn";
-import api, { authH, API, CV_URL } from "../utils/api";
+import api, { authH, CV_URL } from "../utils/api";
 import { sevCls, detIcon } from "../utils/helpers";
 import CamTile from "./CamTile";
 import type { Camera, Detection } from "../types";
@@ -50,7 +50,7 @@ export default function SurveillanceModule({
     if (!nc.name || !nc.streamUrl) return;
     setAddingCam(true);
     try {
-      const r = await api.post(`${API}/cameras`, nc, authH());
+      const r = await api.post(`/cameras`, nc, authH());
       onCamsChange([r.data, ...cameras]);
       await regCV(r.data);
       setAddModal(false);
@@ -64,7 +64,7 @@ export default function SurveillanceModule({
 
   const deleteCam = async (id: string) => {
     try {
-      await api.delete(`${API}/cameras/${id}`, authH());
+      await api.delete(`/cameras/${id}`, authH());
       try {
         await api.delete(`${CV_URL}/cameras/${id}`);
       } catch {
@@ -80,7 +80,7 @@ export default function SurveillanceModule({
   const toggleCam = async (cam: Camera) => {
     try {
       const r = await api.patch(
-        `${API}/cameras/${cam._id}/toggle`,
+        `/cameras/${cam._id}/toggle`,
         { enabled: !cam.enabled },
         authH()
       );

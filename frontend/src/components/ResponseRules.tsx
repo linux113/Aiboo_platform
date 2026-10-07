@@ -4,7 +4,7 @@
 // that matches is used. Safety: cooldown, max runs per hour, test mode and
 // "Test against old alerts".
 import { useCallback, useEffect, useMemo, useState } from "react";
-import api, { API, apiErrorMessage } from "../utils/api";
+import api, { apiErrorMessage } from "../utils/api";
 import { cn } from "../utils/cn";
 import type { Playbook } from "./ResponseModule";
 
@@ -33,7 +33,7 @@ interface Preview {
   notMatchedBecause: { reason: string; count: number }[];
 }
 
-const P = `${API}/pseudolock`;
+const P = `/pseudolock`;
 const inputCls = "w-full rounded border border-slate-700 bg-slate-950 px-2 py-1 text-[11px] text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/60 focus:outline-none";
 const fmt = (d?: string | null) => (d ? new Date(d).toLocaleString() : "—");
 const MODE: Record<Mode, { label: string; help: string; cls: string }> = {
@@ -291,7 +291,7 @@ function RuleEditor({ cat, playbooks, initial, onCancel, onSaved, preview, onPre
   const [saving, setSaving] = useState(false);
   const [onlinePcs, setOnlinePcs] = useState<string[]>([]);
   useEffect(() => {
-    api.get(`${API}/agent/agents-online`, { timeout: 5000 })
+    api.get(`/agent/agents-online`, { timeout: 5000 })
       .then((x) => setOnlinePcs((Array.isArray(x.data?.agents) ? x.data.agents : []).map((a: { endpointId?: string }) => a.endpointId || "").filter(Boolean)))
       .catch(() => setOnlinePcs([]));
   }, []);

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { cn } from "../utils/cn";
-import api, { authH, API } from "../utils/api";
+import api, { authH } from "../utils/api";
 import type { Detection, Threat, AgentFinding, CorrelatedAlert, ChatMsg } from "../types";
 
 interface SpeechRecognitionErrorEvent {
@@ -133,7 +133,7 @@ export default function AIPanel({
         content: m.content,
       }));
       const res = await api.post(
-        `${API}/ai/chat`,
+        `/ai/chat`,
         { message: content, history: hist },
         authH()
       );

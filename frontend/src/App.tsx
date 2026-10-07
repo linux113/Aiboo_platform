@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react";
 import { io, Socket } from "socket.io-client";
 import { cn } from "./utils/cn";
-import api, { authH, setToken as storeToken, getToken, clearToken, API, SOCKET_URL, waitForCommand, apiErrorMessage } from "./utils/api";
+import api, { authH, setToken as storeToken, getToken, clearToken, SOCKET_URL, waitForCommand, apiErrorMessage } from "./utils/api";
 import { logger } from "./utils/logger";
 import Login from "./Login";
 import TopBar from "./components/TopBar";
@@ -157,17 +157,17 @@ export default function App() {
       console.log("📊 Fetching initial data (staggered)...");
 
       const requestConfigs = [
-        { name: "cameras", fn: () => api.get(`${API}/cameras`).catch(() => ({ data: [] })) },
-        { name: "detections", fn: () => api.get(`${API}/cameras/detections`).catch(() => ({ data: [] })) },
-        { name: "threats", fn: () => api.get(`${API}/threats`).catch(() => ({ data: [] })) },
-        { name: "findings", fn: () => api.get(`${API}/agent/findings`).catch(() => ({ data: [] })) },
-        { name: "correlated", fn: () => api.get(`${API}/agent/correlated`).catch(() => ({ data: [] })) },
-        { name: "gates", fn: () => api.get(`${API}/agent/gate-decisions`).catch(() => ({ data: [] })) },
-        { name: "locks", fn: () => api.get(`${API}/agent/pseudo-locks`).catch(() => ({ data: [] })) },
+        { name: "cameras", fn: () => api.get(`/cameras`).catch(() => ({ data: [] })) },
+        { name: "detections", fn: () => api.get(`/cameras/detections`).catch(() => ({ data: [] })) },
+        { name: "threats", fn: () => api.get(`/threats`).catch(() => ({ data: [] })) },
+        { name: "findings", fn: () => api.get(`/agent/findings`).catch(() => ({ data: [] })) },
+        { name: "correlated", fn: () => api.get(`/agent/correlated`).catch(() => ({ data: [] })) },
+        { name: "gates", fn: () => api.get(`/agent/gate-decisions`).catch(() => ({ data: [] })) },
+        { name: "locks", fn: () => api.get(`/agent/pseudo-locks`).catch(() => ({ data: [] })) },
         // ---- CHANGED: fetch /endpoints instead of /sources ----
-        { name: "endpoints", fn: () => api.get(`${API}/agent/endpoints`).catch(() => ({ data: [] })) },
+        { name: "endpoints", fn: () => api.get(`/agent/endpoints`).catch(() => ({ data: [] })) },
         // ---- NEW: fetch response actions ----
-        { name: "actions", fn: () => api.get(`${API}/agent/actions?limit=500`).catch(() => ({ data: { actions: [] } })) },
+        { name: "actions", fn: () => api.get(`/agent/actions?limit=500`).catch(() => ({ data: { actions: [] } })) },
       ];
 
       const results = [];
@@ -232,7 +232,7 @@ export default function App() {
     if (!token) return;
     setActionsLoading(true);
     try {
-      const res = await api.get(`${API}/agent/actions?limit=500`);
+      const res = await api.get(`/agent/actions?limit=500`);
       const fetched: ActionRecord[] = Array.isArray(res?.data?.actions)
         ? res.data.actions
         : Array.isArray(res?.data)
@@ -259,7 +259,7 @@ export default function App() {
     if (meta.pid !== undefined) params.pid = meta.pid;
 
     try {
-      const res = await api.post(`${API}/agent/commands`, {
+      const res = await api.post(`/agent/commands`, {
         endpoint_id: endpoint,
         action: record.action,
         target,
@@ -441,7 +441,7 @@ export default function App() {
     if (!token) return;
     const refresh = async () => {
       try {
-        const resp = await api.get(`${API}/agent/endpoints`).catch(() => ({ data: [] }));
+        const resp = await api.get(`/agent/endpoints`).catch(() => ({ data: [] }));
         const endpointList: EndpointInfo[] = Array.isArray(resp.data) ? resp.data : [];
         setSources(endpointList);
       } catch (e) {
@@ -458,7 +458,7 @@ export default function App() {
     let stop = false;
     const t = setTimeout(async () => {
       try {
-        const r = await api.get(`${API}/alerts`, { params: { status: "open,acknowledged", limit: 1, days: 365 } });
+        const r = await api.get(`/alerts`, { params: { status: "open,acknowledged", limit: 1, days: 365 } });
         if (!stop) setOpenAlertCount(Number(r.data?.total) || 0);
       } catch { /* backend without alert routes - keep 0 */ }
     }, 800);
@@ -471,7 +471,7 @@ export default function App() {
     let stop = false;
     const get = async () => {
       try {
-        const r = await api.get(`${API}/pseudolock/approvals/count`);
+        const r = await api.get(`/pseudolock/approvals/count`);
         if (!stop) setPendingApprovals(Number(r.data?.pending) || 0);
       } catch { /* older backend without PseudoLock routes */ }
     };
@@ -492,19 +492,19 @@ export default function App() {
   useEffect(() => {
     if (!token) return;
     const check = async () => {
-      try { await api.get(`${API}/agent/findings`); } catch { return; }
+      try { await api.get(`/agent/findings`); } catch { return; }
       // Ask the backend which agents are connected on the command channel.
       // (The old check called localhost:8001 from the browser, which is the
       // wrong port and never works when the agent is on another PC.)
       try {
-        const r = await api.get(`${API}/agent/agents-online`, { timeout: 4000 });
+        const r = await api.get(`/agent/agents-online`, { timeout: 4000 });
         const list: { endpointId?: string }[] = Array.isArray(r.data?.agents) ? r.data.agents : [];
         setAgentNames(list.map(a => a.endpointId || "?"));
         setAgentOnline(list.length > 0);
       } catch { setAgentNames([]); setAgentOnline(false); }
       // Camera service is optional; the backend checks it for us.
       try {
-        const r = await api.get(`${API}/dashboard/services`, { timeout: 5000 });
+        const r = await api.get(`/dashboard/services`, { timeout: 5000 });
         setCvOnline(!!r.data?.cv?.online);
       } catch { setCvOnline(false); }
     };
@@ -520,7 +520,7 @@ export default function App() {
       setPseudoLocks(p => p.map(l => l.lock_id === lockId ? { ...l, ...patch } : l));
     setLock({ restoring: true });
     try {
-      const res = await api.post(`${API}/agent/pseudo-locks/${lockId}/restore`, {}, authH());
+      const res = await api.post(`/agent/pseudo-locks/${lockId}/restore`, {}, authH());
       const data = res.data || {};
       if (data.already_restored) {
         setLock({ active: false, restoring: false });
