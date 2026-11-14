@@ -16,10 +16,22 @@ process.env.JWT_SECRET = 'test-secret';
 process.env.AGENT_API_KEY = 'test-agent-key';
 process.env.REPORT_TZ = 'Asia/Kolkata';
 
+const mongoose = (await import('mongoose')).default;
+const User = (await import('../models/User.js')).default;
+const Organization = (await import('../models/Organization.js')).default;
+const TEST_ORG = '650000000000000000000001';
+const queryDoc = (value) => {
+  const q = { select() { return q; }, then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); } };
+  return q;
+};
+User.findById = (id) => queryDoc({ _id: id, name: String(id), email: `${id}@test`, role: String(id) === 'a' ? 'admin' : String(id), active: true, organization: TEST_ORG });
+Organization.findById = (id) => queryDoc(String(id) === TEST_ORG ? { _id: TEST_ORG, name: 'Test tenant', slug: 'test-tenant', status: 'active', subscriptionExpiresAt: new Date(Date.now() + 365 * 86400000) } : null);
+
 const { default: agentRoutes } = await import('../routes/agent.routes.js');
 const { default: alertRoutes } = await import('../routes/alert.routes.js');
 const { default: reportRoutes } = await import('../routes/report.routes.js');
 const { useMemoryStore, fromFinding, isWindowsEventFinding, isOldNoiseAlert } = await import('../services/alertStore.js');
+Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurable: true, writable: true });
 
 let server;
 let base;
@@ -40,7 +52,7 @@ before(async () => {
   useMemoryStore();
   const app = express();
   app.use(express.json());
-  app.use('/api/agent', agentRoutes);
+  app.use('/api/agent', (req, _res, next) => { req.organizationId = TEST_ORG; next(); }, agentRoutes);
   app.use('/api/alerts', alertRoutes);
   app.use('/api/reports', reportRoutes);
   server = http.createServer(app);

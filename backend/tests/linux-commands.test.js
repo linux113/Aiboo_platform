@@ -15,7 +15,15 @@ process.env.ALERT_STORE = 'memory';
 process.env.JWT_SECRET = 'test-secret';
 process.env.AGENT_API_KEY = 'test-agent-key';
 
+const mongoose = (await import('mongoose')).default;
+const User = (await import('../models/User.js')).default;
+const Organization = (await import('../models/Organization.js')).default;
+const LEGACY_ORG = '650000000000000000000003';
 const { default: agentRoutes } = await import('../routes/agent.routes.js');
+Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurable: true, writable: true });
+const queryDoc = (value) => { const q = { select() { return q; }, then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); } }; return q; };
+User.findById = (id) => queryDoc({ _id: id, name: String(id), email: `${id}@test`, role: String(id), active: true, organization: LEGACY_ORG });
+Organization.findById = (id) => queryDoc(String(id) === LEGACY_ORG ? { _id: LEGACY_ORG, name: 'Internal Legacy Workspace', slug: 'legacy', status: 'legacy', isLegacy: true } : null);
 
 let server;
 let base;

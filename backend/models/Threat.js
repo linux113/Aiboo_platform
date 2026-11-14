@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 
 const threatSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     severity: { type: String, enum: ['critical', 'high', 'medium', 'low'], required: true },
     title: { type: String, required: true },
     description: { type: String },

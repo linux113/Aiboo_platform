@@ -1,11 +1,9 @@
 // backend/services/badge.service.js
-// Freeze Badge: AiBoO cannot reach a door / badge controller itself. If the
-// company's access-control system (or n8n / Zapier / Power Automate in front
-// of it) gives a webhook URL, put it in backend/.env:
-//   BADGE_WEBHOOK_URL=https://...      BADGE_WEBHOOK_TOKEN=optional-secret
-// and we POST {action:'freeze_badge', badge_id, reason, requested_by, requested_at}.
-// Used by the one-click playbook (routes/agent.routes.js) and by multi-step
-// playbooks (services/pseudolock.service.js).
+// Legacy single-workspace Freeze Badge webhook. BADGE_WEBHOOK_URL and its token
+// are process-wide and must not be treated as tenant-specific configuration.
+// Company-workspace calls are rejected in pseudolock.service.js until a
+// tenant-scoped integration model and secret-management flow are implemented.
+// Payload: {action:'freeze_badge', badge_id, reason, requested_by, requested_at}.
 export const badgeConfigured = () => Boolean(process.env.BADGE_WEBHOOK_URL);
 
 /** Returns { ok, httpStatus, notConfigured, error, message, detail, requestedAt }. */

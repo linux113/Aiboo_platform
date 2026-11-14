@@ -52,10 +52,12 @@ export const queueCommand = (endpoint_id, action, target, params, extra = {}) =>
   return { ok: true, cmd_id, queued: true, via: 'rest', entry };
 };
 
-// The agent asks for its work and takes the batch away.
-export const takePendingCommands = (endpoint_id) => {
-  const mine = state.commandQueue.filter((c) => c.endpoint_id === endpoint_id);
-  state.commandQueue = state.commandQueue.filter((c) => c.endpoint_id !== endpoint_id);
+// The agent asks for its work and takes the batch away. A null tenant means
+// legacy/unassigned commands only; it must never act as a cross-company wildcard.
+export const takePendingCommands = (endpoint_id, organizationId = null) => {
+  const belongs = (c) => c.endpoint_id === endpoint_id && String(c.organization || '') === String(organizationId || '');
+  const mine = state.commandQueue.filter(belongs);
+  state.commandQueue = state.commandQueue.filter((c) => !belongs(c));
   const now = new Date().toISOString();
   for (const entry of mine) {
     entry.status = 'sent';
@@ -65,8 +67,9 @@ export const takePendingCommands = (endpoint_id) => {
 };
 
 // Remember the outcome of a command (used by the socket path and the REST path).
-export const finishCommand = (cmd_id, status, error, result) => {
-  const entry = state.commandHistory.find((c) => c.cmd_id === cmd_id);
+// Null organization scope is restricted to unbound legacy commands, not any tenant.
+export const finishCommand = (cmd_id, status, error, result, organizationId = null, endpointId = null) => {
+  const entry = state.commandHistory.find((c) => c.cmd_id === cmd_id && String(c.organization || '') === String(organizationId || '') && (!endpointId || c.endpoint_id === endpointId));
   if (!entry) return null;
   entry.status = status || entry.status;
   entry.completed_at = new Date().toISOString();
@@ -76,7 +79,7 @@ export const finishCommand = (cmd_id, status, error, result) => {
 };
 
 // Find one command (either path).
-export const findCommand = (cmd_id) => state.commandHistory.find((c) => c.cmd_id === cmd_id) || null;
+export const findCommand = (cmd_id, organizationId = null) => state.commandHistory.find((c) => c.cmd_id === cmd_id && (!organizationId || String(c.organization || '') === String(organizationId))) || null;
 
 // Wait for the agent's answer to a queued command (used by approvals/playbooks).
 export async function waitForCommand(cmd_id, timeoutMs = 15000, stepMs = 400) {

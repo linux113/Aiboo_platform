@@ -191,6 +191,9 @@ class RealResponseEngine:
         self._auto_terminate_enabled = auto_response and os.getenv(
             "AIBOO_AUTO_TERMINATE", "1"
         ).lower() in ("1", "true", "yes", "on")
+        self._auto_terminate_enabled = self._configured_auto_terminate_enabled
+        self.license_active = True
+        self.response_actions_enabled = True
 
         self._auto_terminate_severities = {
             s.strip().lower()

@@ -3,6 +3,7 @@ import mongoose from 'mongoose';
 
 const findingSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     // Core finding fields (from AgentFinding)
     agent_name: {
       type: String,

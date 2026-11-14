@@ -52,6 +52,10 @@ export const IMPORTANCE_LEVELS = new Set(['low', 'normal', 'high', 'critical']);
 
 export function registerAgentChannel(io) {
   const nsp = io.of('/agent-channel');
+  const emitTenant = (organizationId, event, data) => {
+    if (!organizationId) return; // unbound legacy sockets never broadcast to all companies
+    io.to(`org:${organizationId}`).emit(event, data);
+  };
 
   // ---- Auth middleware ------------------------------------------------
   nsp.use((socket, next) => {
@@ -95,7 +99,7 @@ export function registerAgentChannel(io) {
     });
 
     // Broadcast updated online list to dashboard clients
-    io.emit('agents:online', Array.from(agents.keys()));
+    emitTenant(socket.organizationId, 'agents:online', Array.from(agents.keys()));
 
     // ---- agent:register -----------------------------------------------
     socket.on('agent:register', (data) => {
@@ -112,7 +116,7 @@ export function registerAgentChannel(io) {
       logger.info(
         `Agent registered: ${endpointId} (${data?.hostname || 'unknown'})`
       );
-      io.emit('agents:online', Array.from(agents.keys()));
+      emitTenant(socket.organizationId, 'agents:online', Array.from(agents.keys()));
     });
 
     // ---- agent:command-ack --------------------------------------------
@@ -135,10 +139,10 @@ export function registerAgentChannel(io) {
         if (cmd.action === 'set_importance' && data.status === 'executed' && entry &&
             IMPORTANCE_LEVELS.has(String(data.result?.importance || ''))) {
           entry.importance = String(data.result.importance);
-          io.emit('agent:importance', { endpointId, importance: entry.importance });
+          emitTenant(entry.organizationId, 'agent:importance', { endpointId, importance: entry.importance });
         }
       }
-      io.emit('command:ack', data);
+      emitTenant(cmd?.organizationId || socket.organizationId, 'command:ack', data);
       for (const fn of ackListeners) {
         try { fn(data, cmd || null); } catch (err) { logger.error(`Ack listener error: ${err.message}`); }
       }
@@ -157,7 +161,7 @@ export function registerAgentChannel(io) {
       const current = agents.get(endpointId);
       if (current && current.socket.id === socket.id) {
         agents.delete(endpointId);
-        io.emit('agents:online', Array.from(agents.keys()));
+        emitTenant(socket.organizationId, 'agents:online', Array.from(agents.keys()));
       }
     });
   });

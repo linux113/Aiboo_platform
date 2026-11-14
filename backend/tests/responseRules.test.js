@@ -13,11 +13,20 @@ process.env.APPROVAL_EXPIRY_MINUTES = '30';
 process.env.PLAYBOOK_ACTION_TIMEOUT_SECONDS = '5';
 process.env.OFFICE_HOURS = '9-18';
 
+const mongoose = (await import('mongoose')).default;
+const User = (await import('../models/User.js')).default;
+const Organization = (await import('../models/Organization.js')).default;
+const LEGACY_ORG = '650000000000000000000005';
 const { default: agentRoutes } = await import('../routes/agent.routes.js');
 const { default: plRoutes } = await import('../routes/pseudolock.routes.js');
 const { useMemoryStore } = await import('../services/alertStore.js');
 const svc = await import('../services/pseudolock.service.js');
 const rules = await import('../services/responseRules.service.js');
+Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurable: true, writable: true });
+const queryDoc = (value) => { const q = { select() { return q; }, then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); } }; return q; };
+User.findById = (id) => queryDoc({ _id: id, name: String(id), email: `${id}@test`, role: String(id), active: true, organization: LEGACY_ORG });
+Organization.findById = (id) => queryDoc(String(id) === LEGACY_ORG ? { _id: LEGACY_ORG, name: 'Internal Legacy Workspace', slug: 'legacy', status: 'legacy', isLegacy: true } : null);
+
 
 const sent = [];
 const listeners = new Set();
@@ -63,7 +72,7 @@ const gate = ({ verdict = 'BLOCK', ip = '45.95.147.3', user = 'lalit', pattern =
     ],
   } },
 });
-const send = async (opts) => { await call('POST', '/api/agent/gate-decision', { agent: true, body: gate(opts) }); await settle(); };
+const send = async (opts) => { await rules.onTriGateDecision(gate(opts), {}); await settle(); };
 const settle = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 const RULE = {
   name: 'Stop password guessing', mode: 'auto', playbookId: 'builtin_password_guessing',
@@ -262,9 +271,13 @@ test('old replayed decisions never trigger rules', async () => {
 
 test('"test against old alerts" counts the TriGate alerts the rule would have matched', async () => {
   useMemoryStore(); // empty alert list
-  await send({ ip: '45.95.147.50' });                          // brute force, risk 66
-  await send({ ip: '45.95.147.51', pattern: 'log_cleared' });  // other type
-  await send({ ip: '45.95.147.52', risk: 40, verdict: 'HOLD' });
+  // Ingest unbound decisions over HTTP: these create legacy alerts but must
+  // not trigger the globally scoped response-rules engine.
+  for (const opts of [
+    { ip: '45.95.147.50' },
+    { ip: '45.95.147.51', pattern: 'log_cleared' },
+    { ip: '45.95.147.52', risk: 40, verdict: 'HOLD' },
+  ]) await call('POST', '/api/agent/gate-decision', { agent: true, body: gate(opts) });
   let r = await call('POST', '/api/pseudolock/rules/preview', { role: 'viewer', body: { conditions: RULE.conditions, days: 7 } });
   assert.equal(r.status, 200);
   assert.equal(r.data.checked, 3);

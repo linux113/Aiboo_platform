@@ -97,14 +97,14 @@ export const postureScore = (openAlerts, avgCompliance) => {
 };
 
 // Everything the dashboards and reports need, for the last `days` days.
-export const buildAnalytics = async ({ days = 30, tz } = {}) => {
+export const buildAnalytics = async ({ days = 30, tz, organizationId = null } = {}) => {
   const d = clampDays(days);
   const zone = safeTz(tz);
   const since = new Date(Date.now() - d * DAY);
   const prevSince = new Date(Date.now() - 2 * d * DAY);
 
   const [all, compRows, latest] = await Promise.all([
-    alertsSince(prevSince), complianceSince(since), latestCompliance(),
+    alertsSince(prevSince, organizationId), complianceSince(since, organizationId), latestCompliance(organizationId),
   ]);
   const inWindow = all.filter((a) => new Date(a.firstSeen || a.lastSeen) >= since);
   const previous = all.filter((a) => {
@@ -112,9 +112,17 @@ export const buildAnalytics = async ({ days = 30, tz } = {}) => {
     return t >= prevSince && t < since;
   });
   // open alerts count regardless of age (an old unhandled alert is still a risk)
-  const openAll = (await alertsSince(new Date(Date.now() - 365 * DAY))).filter((a) => a.status !== 'closed');
+  const openAll = (await alertsSince(new Date(Date.now() - 365 * DAY), organizationId)).filter((a) => a.status !== 'closed');
 
-  const store = getAgentStore();
+  const rawStore = getAgentStore();
+  const inTenant = (row) => !organizationId || String(row?.organization || '') === String(organizationId);
+  const store = organizationId ? {
+    ...rawStore,
+    endpoints: Object.fromEntries(Object.entries(rawStore.endpoints || {}).filter(([, row]) => inTenant(row))),
+    compliance: Object.fromEntries(Object.entries(rawStore.compliance || {}).filter(([, row]) => inTenant(row))),
+    agentStatus: Object.fromEntries(Object.entries(rawStore.agentStatus || {}).filter(([, row]) => inTenant(row))),
+    gateDecisions: (rawStore.gateDecisions || []).filter(inTenant),
+  } : rawStore;
   // prefer the live copy (full detail), fall back to stored history
   const latestByEp = {};
   latest.forEach((r) => { latestByEp[r.endpoint] = r; });

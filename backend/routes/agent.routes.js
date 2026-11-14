@@ -1,20 +1,31 @@
 import express from 'express';
 import { getIO } from '../config/socket.js';
 import { protect, authorize } from '../middleware/auth.js';
+import { requireOrganization, requirePlanFeature } from '../middleware/tenant.js';
+import { validateTenantAgentCredential, validateTenantAgentCommand, validateTenantAgentHeartbeat } from '../middleware/agentTenantAuth.js';
+import { getAgentPlanFeatures } from '../services/agentCredential.service.js';
 import logger from '../utils/logger.js';
 import { IMPORTANCE_LEVELS } from '../sockets/agentChannel.js';
 import {
   ingest as ingestAlert, fromFinding, fromGateDecision, fromCorrelated,
   saveCompliance, latestCompliance, setAlertEmitter,
 } from '../services/alertStore.js';
-import { freezeBadge, badgeConfigured } from '../services/badge.service.js';
+import { badgeConfigured } from '../services/badge.service.js';
 import { onTriGateDecision } from '../services/responseRules.service.js';
+import { approvalsFromDecision, withResponseOrganization } from '../services/pseudolock.service.js';
 import {
   getCommandState, queueCommand as queueRestCommand,
   takePendingCommands, finishCommand as finishQueuedCommand, findCommand,
 } from '../services/commandQueue.service.js';
 
 const router = express.Router();
+const tenantUser = [protect, requireOrganization];
+const belongsToTenant = (row, organizationId, isLegacy = false) =>
+  String(row?.organization || '') === String(organizationId || '') || (isLegacy && !row?.organization);
+const tenantUnavailable = (req, res) => res.status(503).json({
+  ok: false,
+  error: 'This operation is not yet enabled for company endpoints',
+});
 
 // How long we consider an endpoint "live" after its last heartbeat (2 minutes)
 const ACTIVE_WINDOW_MS = 2 * 60 * 1000;
@@ -45,18 +56,23 @@ export const getAgentStore = () => store;
 const MAX = 200;
 const ACTIONS_MAX = 500; // Response actions accumulate faster than findings
 const push = (arr, item) => { arr.unshift(item); if (arr.length > MAX) arr.pop(); };
+const endpointKey = (source, organizationId = null) => organizationId ? `${organizationId}::${source}` : source;
 // Upsert by id: an action is reported several times as it progresses
 // (pending -> success/failed). Keep one row per action, newest state first.
 const pushAction = (item) => {
-  const idx = store.actions.findIndex((a) => a.id === item.id);
+  const idx = store.actions.findIndex((a) => a.id === item.id && String(a.organization || '') === String(item.organization || ''));
   if (idx !== -1) store.actions.splice(idx, 1);
   store.actions.unshift(item);
   if (store.actions.length > ACTIONS_MAX) store.actions.pop();
 };
 
-const emit = (ev, data) => {
+const emit = (ev, data, organizationId = null) => {
+  // Agent records without a verified tenant must not be broadcast to every
+  // company's dashboard. Legacy/unassigned ingestion is retained for review,
+  // but waits for tenant assignment before live delivery.
+  if (!organizationId) return;
   try {
-    getIO().emit(ev, data);
+    getIO().to(`org:${organizationId}`).emit(ev, data);
   } catch (err) {
     logger.error(`Socket emit error (${ev}): ${err.message}`);
   }
@@ -66,7 +82,7 @@ setAlertEmitter(emit);
 
 // ---- Helpers ----
 const getSource = (req) => {
-  return req.headers['x-endpoint-id'] || req.body?.source || 'unknown';
+  return req.endpointId || req.headers['x-endpoint-id'] || req.body?.source || 'unknown';
 };
 
 const isActive = (lastSeen) => {
@@ -106,19 +122,20 @@ const CONTAINMENT_ACTIONS = new Set([
 const VALID_ACTION_STATUSES = new Set(['pending', 'success', 'failed', 'active']);
 
 // ---- Normalise an incoming action record ----
-const normaliseAction = (raw, source) => {
+const normaliseAction = (raw, source, organizationId = null) => {
   const action = String(raw.action || raw.type || 'unknown').toLowerCase().trim();
   const status = VALID_ACTION_STATUSES.has(String(raw.status || '').toLowerCase())
     ? String(raw.status).toLowerCase()
     : 'pending';
 
   return {
-    id: String(raw.id || raw.action_id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    id: String(raw.metadata?.cmd_id ? `act_${raw.source || raw.endpoint || source || 'unknown'}_${raw.metadata.cmd_id}` : (raw.id || raw.action_id || `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`)),
     timestamp: raw.timestamp || new Date().toISOString(),
     received_at: new Date().toISOString(),
 
     endpoint: raw.endpoint || raw.source || source || 'unknown',
     source: raw.source || raw.endpoint || source || 'unknown',
+    ...(organizationId ? { organization: organizationId } : {}),
 
     action,
     action_label: raw.action_label || ACTION_LABELS[action] || action.replace(/_/g, ' '),
@@ -159,27 +176,40 @@ const validateAgentApiKey = (req, res, next) => {
 // the agent has an API key but no JWT.
 const validateAgentOrJWT = (req, res, next) => {
   const apiKey = req.headers['x-api-key'] || '';
+  if (String(apiKey).startsWith('aiboo1_')) return validateTenantAgentCredential(req, res, next);
   const expectedKey = process.env.AGENT_API_KEY || 'dev-key-change-in-production';
-
-  if (apiKey && apiKey === expectedKey) {
-    return next();  // Agent with API key → allow
-  }
-  // Fall back to JWT auth
+  if (apiKey && apiKey === expectedKey) return next();
   return protect(req, res, next);
+};
+
+// Old shared-key agents remain available for legacy migration. New company
+// endpoints authenticate only through their individual tenant-bound key.
+const validateAgentApiKeyOrTenant = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'] || '';
+  if (String(apiKey).startsWith('aiboo1_')) return validateTenantAgentCredential(req, res, next);
+  return validateAgentApiKey(req, res, next);
+};
+
+const validateAgentCommandKey = (req, res, next) => {
+  const apiKey = req.headers['x-api-key'] || '';
+  if (String(apiKey).startsWith('aiboo1_')) return validateTenantAgentCommand(req, res, next);
+  return validateAgentApiKey(req, res, next);
 };
 
 // ---- Record endpoint heartbeat ----
 // platform is optional ('windows' | 'linux' | 'darwin'); it is only replaced
 // when the agent sends one, so a Windows agent that never sends it keeps its
 // earlier value (or stays unknown).
-const updateEndpointHeartbeat = (source, platform) => {
+const updateEndpointHeartbeat = (source, platform, organizationId = null) => {
   if (source && source !== 'unknown') {
-    const prev = store.endpoints[source] || {};
+    const key = endpointKey(source, organizationId);
+    const prev = store.endpoints[key] || {};
     const pl = String(platform || '').toLowerCase().trim();
-    store.endpoints[source] = {
+    store.endpoints[key] = {
       ...prev,
       lastSeen: new Date().toISOString(),
       source,
+      ...(organizationId ? { organization: organizationId } : {}),
       platform: ['windows', 'linux', 'darwin', 'freebsd'].includes(pl) ? pl : (prev.platform || ''),
     };
   }
@@ -197,7 +227,7 @@ const validAgentTime = (value) => {
 // ============================================================
 
 // POST /api/agent/findings – Agent sends a detection
-router.post('/findings', validateAgentApiKey, async (req, res) => {
+router.post('/findings', validateAgentApiKeyOrTenant, async (req, res) => {
   try {
     const {
       agent_name,
@@ -211,7 +241,7 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
 
     const source = getSource(req);
     const platform = req.body.platform || metadata?.platform || metadata?.os;
-    updateEndpointHeartbeat(source, platform);
+    updateEndpointHeartbeat(source, platform, req.organizationId);
 
     // Keep the agent's own id and time when they look valid. Before, every
     // finding got a new random id + "now", so a finding re-sent from the
@@ -226,6 +256,7 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
 
     const finding = {
       id,
+      ...(req.organizationId ? { organization: req.organizationId } : {}),
       agent_name: agent_name || 'UnknownAgent',
       threat_type,
       severity,
@@ -233,15 +264,15 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
       summary: summary || 'No summary provided',
       actions: actions || [],
       metadata: metadata || {},
-      platform: store.endpoints[source]?.platform || '',
+      platform: store.endpoints[endpointKey(source, req.organizationId)]?.platform || '',
       source,
       timestamp: validAgentTime(req.body.timestamp),
     };
 
     push(store.findings, finding);
-    emit('agent:finding', finding);
+    emit('agent:finding', finding, req.organizationId);
     logger.info(`Agent finding from ${source}: ${threat_type} (${severity})`);
-    ingestAlert(fromFinding(finding)); // high/critical -> Alert Management
+    ingestAlert(fromFinding(finding), true, req.organizationId); // high/critical -> Alert Management
 
     res.status(201).json(finding);
   } catch (error) {
@@ -250,28 +281,49 @@ router.post('/findings', validateAgentApiKey, async (req, res) => {
   }
 });
 
-// POST /api/agent/heartbeat – Agent keeps alive
-router.post('/heartbeat', validateAgentApiKey, (req, res) => {
+// Minimal license heartbeat remains callable after expiry. It carries no finding
+// or command payload; agents must pause non-heartbeat work when active is false.
+router.post('/license-heartbeat', validateTenantAgentHeartbeat, (req, res) => {
+  updateEndpointHeartbeat(req.endpointId, req.body?.platform || req.agent.platform, req.organizationId);
+  res.status(200).json({
+    ok: true,
+    endpointId: req.endpointId,
+    organizationId: req.organizationId,
+    active: req.agent.subscriptionActive,
+    access: req.agent.subscriptionActive ? 'active' : 'restricted',
+    expiresAt: req.agent.subscriptionExpiresAt,
+    features: req.agent.features || {},
+    checkedAt: new Date().toISOString(),
+  });
+});
+
+// POST /api/agent/heartbeat – legacy/shared-key heartbeat
+router.post('/heartbeat', validateAgentApiKeyOrTenant, (req, res) => {
   const source = getSource(req);
   const platform = req.body?.platform || req.body?.os;
-  updateEndpointHeartbeat(source, platform);
+  updateEndpointHeartbeat(source, platform, req.organizationId);
   logger.debug(`Heartbeat from ${source}${platform ? ` (${platform})` : ''}`);
-  res.status(200).json({ ok: true, source, platform: store.endpoints[source]?.platform || '' });
+  res.status(200).json({
+    ok: true,
+    source,
+    platform: store.endpoints[endpointKey(source, req.organizationId)]?.platform || '',
+    ...(req.agent ? { active: req.agent.subscriptionActive, expiresAt: req.agent.subscriptionExpiresAt } : {}),
+  });
 });
 
 // GET /api/agent/sources – List only LIVE endpoints
-router.get('/sources', (req, res) => {
+router.get('/sources', ...tenantUser, (req, res) => {
   const liveSources = Object.values(store.endpoints)
-    .filter((ep) => isActive(ep.lastSeen))
+    .filter((ep) => belongsToTenant(ep, req.organizationId, req.organization?.isLegacy) && isActive(ep.lastSeen))
     .map((ep) => ep.source)
     .filter((s) => s !== 'unknown');
   res.json(liveSources);
 });
 
 // GET /api/agent/findings – Query findings (filter by source?)
-router.get('/findings', (req, res) => {
+router.get('/findings', ...tenantUser, (req, res) => {
   const { source, limit = 50 } = req.query;
-  let result = store.findings;
+  let result = store.findings.filter((finding) => belongsToTenant(finding, req.organizationId, req.organization?.isLegacy));
   if (source) {
     result = result.filter(f => f.source === source);
   }
@@ -281,12 +333,13 @@ router.get('/findings', (req, res) => {
 // GET /api/agent/endpoints – Detailed endpoint status
 // Includes agents connected over the command channel (even before their
 // first finding) and the TriGate importance of each PC.
-router.get('/endpoints', (req, res) => {
+router.get('/endpoints', ...tenantUser, (req, res) => {
   const byId = {};
-  for (const ep of Object.values(store.endpoints)) {
+  for (const ep of Object.values(store.endpoints).filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy))) {
     byId[ep.source] = { ...ep, active: isActive(ep.lastSeen) };
   }
-  const channel = req.app.get('agentChannel');
+  // Active company sockets are excluded until their handshake is tenant-bound.
+  const channel = req.organization?.isLegacy ? req.app.get('agentChannel') : null;
   const online = channel ? channel.listAgents() : [];
   for (const a of online) {
     const prev = byId[a.endpointId] || { source: a.endpointId, lastSeen: a.lastSeen };
@@ -296,14 +349,14 @@ router.get('/endpoints', (req, res) => {
       connected: true,
       active: true,
       lastSeen: new Date(a.lastSeen) > new Date(prev.lastSeen || 0) ? a.lastSeen : prev.lastSeen,
-      importance: a.importance || store.importance[a.endpointId] || null,
+      importance: a.importance || store.importance[endpointKey(a.endpointId, req.organizationId)] || null,
       trigate: a.trigate || null,
     };
   }
   const list = Object.values(byId).map((ep) => ({
     ...ep,
     connected: Boolean(ep.connected),
-    importance: ep.importance || store.importance[ep.source] || null,
+    importance: ep.importance || store.importance[endpointKey(ep.source, req.organizationId)] || null,
   }));
   list.sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
   res.json(list);
@@ -312,20 +365,7 @@ router.get('/endpoints', (req, res) => {
 // POST /api/agent/endpoints/:id/importance  { importance: low|normal|high|critical }
 // TriGate Gate 3 (Impact): how important is this PC? Sent to the agent,
 // which saves it on disk (trigate_memory.json) and uses it for Impact.
-router.post('/endpoints/:id/importance', protect, authorize('admin', 'analyst'), (req, res) => {
-  const endpointId = String(req.params.id);
-  const importance = String(req.body?.importance || '').toLowerCase().trim();
-  if (!IMPORTANCE_LEVELS.has(importance)) {
-    return res.status(400).json({ ok: false, error: 'importance must be low, normal, high or critical' });
-  }
-  const channel = req.app.get('agentChannel');
-  if (!channel) return res.status(503).json({ ok: false, error: 'Agent channel not initialized' });
-  const result = channel.dispatch(endpointId, 'set_importance', importance, { importance });
-  if (!result.ok) return res.status(404).json(result);
-  store.importance[endpointId] = importance;
-  logger.info(`TriGate importance of ${endpointId} -> ${importance} (${result.cmd_id})`);
-  res.status(202).json({ ...result, importance });
-});
+router.post('/endpoints/:id/importance', ...tenantUser, authorize('admin', 'analyst'), tenantUnavailable);
 
 // ============================================================
 //  RESPONSE ACTION ENDPOINTS (Isolation & Termination tab)
@@ -343,15 +383,15 @@ router.post('/actions', validateAgentOrJWT, (req, res) => {
         : [body];
 
     const source = getSource(req);
-    updateEndpointHeartbeat(source);
+    updateEndpointHeartbeat(source, undefined, req.organizationId);
 
     const stored = [];
     for (const raw of rawItems) {
       if (!raw || typeof raw !== 'object') continue;
-      const record = normaliseAction(raw, source);
+      const record = normaliseAction(raw, source, req.organizationId);
       pushAction(record);
       stored.push(record);
-      emit('agent:action', record);
+      emit('agent:action', record, req.organizationId);
     }
 
     logger.info(`Received ${stored.length} action(s) from ${source}`);
@@ -365,7 +405,7 @@ router.post('/actions', validateAgentOrJWT, (req, res) => {
 // GET /api/agent/actions – Query response actions
 // Query params: action, status, endpoint, source, severity, target,
 //               since, until, limit, offset, order
-router.get('/actions', protect, (req, res) => {
+router.get('/actions', ...tenantUser, (req, res) => {
   try {
     const {
       action,
@@ -381,7 +421,7 @@ router.get('/actions', protect, (req, res) => {
       order = 'desc',
     } = req.query;
 
-    let result = store.actions;
+    let result = store.actions.filter((actionRecord) => belongsToTenant(actionRecord, req.organizationId, req.organization?.isLegacy));
 
     if (action) {
       const wanted = String(action).split(',').map(s => s.trim().toLowerCase());
@@ -428,13 +468,13 @@ router.get('/actions', protect, (req, res) => {
 });
 
 // GET /api/agent/actions/stats – Aggregated stats for the actions tab
-router.get('/actions/stats', protect, (req, res) => {
+router.get('/actions/stats', ...tenantUser, (req, res) => {
   try {
     const windowHours = parseInt(req.query.window || '24', 10) || 24;
     const cutoff = Date.now() - windowHours * 3600 * 1000;
 
     const scoped = store.actions.filter(
-      r => new Date(r.timestamp).getTime() >= cutoff
+      r => belongsToTenant(r, req.organizationId, req.organization?.isLegacy) && new Date(r.timestamp).getTime() >= cutoff
     );
 
     const byAction = {};
@@ -494,87 +534,56 @@ router.get('/actions/stats', protect, (req, res) => {
 
 // Queue/dispatch helpers live in services/commandQueue.service.js so the response
 // engine (approvals, playbooks) can queue commands for REST agents as well.
-const queueCommand = (endpoint_id, action, target, params) => {
-  const queued = queueRestCommand(endpoint_id, action, target, params);
+const queueCommand = (endpoint_id, action, target, params, organizationId = null, isLegacy = false) => {
+  const scope = organizationId && !isLegacy ? { organization: organizationId } : {};
+  const queued = queueRestCommand(endpoint_id, action, target, params, scope);
   if (queued.ok) {
     emit('command:sent', {
       cmd_id: queued.cmd_id, endpoint_id, action,
-      target: target || '', sent_at: queued.entry.queued_at, queued: true,
-    });
+      target: target || '', sent_at: queued.entry.queued_at, queued: true, organization: organizationId,
+    }, organizationId);
   }
   return queued;
 };
 
-const finishCommand = (cmd_id, status, error, result) => finishQueuedCommand(cmd_id, status, error, result);
+const finishCommand = (cmd_id, status, error, result, organizationId = null, endpointId = null) => finishQueuedCommand(cmd_id, status, error, result, organizationId, endpointId);
 
 // POST /api/agent/commands – dispatch an action to a specific agent
 // Remote actions change the endpoint (kill processes, firewall rules), so
 // viewers are not allowed to dispatch them.
-router.post('/commands', protect, authorize('admin', 'analyst'), (req, res) => {
+router.post('/commands', ...tenantUser, authorize('admin', 'analyst'), requirePlanFeature('responseActions'), (req, res) => {
   try {
     const { endpoint_id, action, target, params } = req.body || {};
-
-    if (!endpoint_id || !action) {
-      return res
-        .status(400)
-        .json({ ok: false, error: 'endpoint_id and action are required' });
+    if (!endpoint_id || !action) return res.status(400).json({ ok: false, error: 'endpoint_id and action are required' });
+    const safeParams = params && typeof params === 'object' ? params : {};
+    // Company endpoints use tenant-bound REST polling. Never dispatch their
+    // commands through the legacy global Socket.IO channel.
+    if (!req.organization?.isLegacy) {
+      const queued = queueCommand(String(endpoint_id), String(action), target ? String(target) : '', safeParams, req.organizationId, !!req.organization?.isLegacy);
+      return res.status(202).json({ ...queued, note: 'Queued for this company endpoint to poll' });
     }
-
     const channel = req.app.get('agentChannel');
     if (!channel) {
-      // No live channel at all (e.g. a test, or the agent uses REST polling).
-      const queued = queueCommand(
-        String(endpoint_id),
-        String(action),
-        target ? String(target) : '',
-        params && typeof params === 'object' ? params : {}
-      );
-      return res.status(202).json({ ...queued, note: 'No live agent channel - queued for the endpoint\'s next poll' });
+      const queued = queueCommand(String(endpoint_id), String(action), target ? String(target) : '', safeParams, req.organizationId, !!req.organization?.isLegacy);
+      return res.status(202).json({ ...queued, note: 'No live agent channel - queued for the endpoint next poll' });
     }
-
-    const result = channel.dispatch(
-      String(endpoint_id),
-      String(action),
-      target ? String(target) : '',
-      params && typeof params === 'object' ? params : {}
-    );
-
+    const result = channel.dispatch(String(endpoint_id), String(action), target ? String(target) : '', safeParams);
     if (!result.ok) {
-      // The endpoint is not on the socket channel (a Linux Sentinel never is,
-      // and a Windows agent may be between reconnects). Queue it: the agent
-      // picks it up on its next poll. If nothing polls, the command simply
-      // stays 'queued' and the dashboard shows that.
-      const queued = queueCommand(
-        String(endpoint_id),
-        String(action),
-        target ? String(target) : '',
-        params && typeof params === 'object' ? params : {}
-      );
+      const queued = queueCommand(String(endpoint_id), String(action), target ? String(target) : '', safeParams, req.organizationId, !!req.organization?.isLegacy);
       return res.status(202).json({ ...queued, note: 'Endpoint not on the live channel - queued for its next poll' });
     }
-
-    logger.info(
-      `Remote command dispatched: ${action} → ${endpoint_id} (${result.cmd_id})`
-    );
-
-    // Broadcast so other dashboard tabs can show the pending command
-    emit('command:sent', {
-      cmd_id: result.cmd_id,
-      endpoint_id,
-      action,
-      target: target || '',
-      sent_at: new Date().toISOString(),
-    });
-
-    res.status(202).json(result);
+    logger.info(`Remote command dispatched: ${action} -> ${endpoint_id} (${result.cmd_id})`);
+    emit('command:sent', { cmd_id: result.cmd_id, endpoint_id, action, target: target || '', sent_at: new Date().toISOString(), organization: req.organizationId }, req.organizationId);
+    return res.status(202).json(result);
   } catch (error) {
     logger.error(`Error dispatching remote command: ${error.message}`);
-    res.status(500).json({ ok: false, error: 'Failed to dispatch command' });
+    return res.status(500).json({ ok: false, error: 'Failed to dispatch command' });
   }
 });
 
+
 // GET /api/agent/commands – list recent remote commands
-router.get('/commands', protect, (req, res) => {
+router.get('/commands', ...tenantUser, (req, res) => {
   try {
     const channel = req.app.get('agentChannel');
     if (!channel) {
@@ -582,7 +591,7 @@ router.get('/commands', protect, (req, res) => {
         .status(503)
         .json({ ok: false, error: 'Agent channel not initialized' });
     }
-    const commands = channel.listCommands();
+    const commands = channel.listCommands().filter((cmd) => belongsToTenant(cmd, req.organizationId, req.organization?.isLegacy));
     res.json({ ok: true, count: commands.length, commands });
   } catch (error) {
     logger.error(`Error listing commands: ${error.message}`);
@@ -594,11 +603,11 @@ router.get('/commands', protect, (req, res) => {
 // GET /api/agent/commands/pending  (agent, x-api-key + x-endpoint-id)
 //   Hands the endpoint its waiting commands and marks them 'sent'. The agent
 //   must ack each one; an unfinshed command stays 'sent' in the history.
-router.get('/commands/pending', validateAgentApiKey, (req, res) => {
-  const endpoint = String(req.headers['x-endpoint-id'] || req.query.endpoint_id || '').trim();
+router.get('/commands/pending', validateAgentCommandKey, (req, res) => {
+  const endpoint = String(req.endpointId || req.headers['x-endpoint-id'] || req.query.endpoint_id || '').trim();
   if (!endpoint) return res.status(400).json({ ok: false, error: 'x-endpoint-id header required' });
-
-  const mine = takePendingCommands(endpoint);
+  if (req.endpointId && endpoint !== req.endpointId) return res.status(403).json({ ok: false, error: 'Endpoint credential mismatch' });
+  const mine = takePendingCommands(endpoint, req.organizationId || null);
   if (mine.length) logger.info(`${endpoint} picked up ${mine.length} queued command(s)`);
   res.json({ ok: true, count: mine.length, commands: mine });
 });
@@ -607,22 +616,25 @@ router.get('/commands/pending', validateAgentApiKey, (req, res) => {
 //   Body: { status: executed|failed, error?, result?: {message, details, metadata} }
 //   Records the outcome, tells the dashboards and writes the ActionRecord the
 //   "Isolation & Termination" tab shows - the same shape the socket path uses.
-router.post('/commands/:cmdId/ack', validateAgentApiKey, (req, res) => {
+router.post('/commands/:cmdId/ack', validateAgentCommandKey, (req, res) => {
   const cmdId = String(req.params.cmdId || '');
   const status = String(req.body?.status || 'executed').toLowerCase();
+  if (!['executed', 'failed'].includes(status)) return res.status(400).json({ ok: false, error: 'status must be executed or failed' });
   const error = req.body?.error ? String(req.body.error).slice(0, 400) : null;
   const result = req.body?.result && typeof req.body.result === 'object' ? req.body.result : {};
 
-  const entry = finishCommand(cmdId, status, error, result);
-  emit('command:ack', { cmd_id: cmdId, status, error, result });
-
   const source = getSource(req);
-  updateEndpointHeartbeat(source, req.body?.platform || 'linux');
+  if (req.endpointId && source !== req.endpointId) return res.status(403).json({ ok: false, error: 'Endpoint credential mismatch' });
+  const entry = finishCommand(cmdId, status, error, result, req.organizationId || null, source);
+  if (!entry) return res.status(404).json({ ok: false, error: 'Command not found for this endpoint' });
+  emit('command:ack', { cmd_id: cmdId, status, error, result, organization: req.organizationId }, req.organizationId);
+
+  updateEndpointHeartbeat(source, req.body?.platform || 'linux', req.organizationId);
   // normaliseAction() maps 'summary'/'details' (there is no 'message' field),
   // so both are filled in - the Isolation & Termination tab shows details.
   const text = result.message || error || (status === 'executed' ? 'Done' : 'Failed');
   const actionRecord = normaliseAction({
-    id: `act_${cmdId}`,
+    id: `act_${source}_${cmdId}`,
     action: entry?.action || req.body?.action || 'unknown',
     target: entry?.target || req.body?.target || '',
     status: status === 'executed' ? 'success' : 'failed',
@@ -633,43 +645,44 @@ router.post('/commands/:cmdId/ack', validateAgentApiKey, (req, res) => {
     error: status === 'executed' ? null : text,
     dry_run: !!result.metadata?.dry_run,
     metadata: { ...(result.metadata || {}), cmd_id: cmdId, via: 'rest' },
-  }, source);
+  }, source, req.organizationId);
   pushAction(actionRecord);
-  emit('agent:action', actionRecord);
+  emit('agent:action', actionRecord, req.organizationId);
 
   logger.info(`Command ack (REST) ${cmdId} -> ${status}${error ? ` (${error})` : ''}`);
   res.json({ ok: true, cmd_id: cmdId, status, action: actionRecord });
 });
 
 // GET /api/agent/commands/history – what was dispatched and what happened
-router.get('/commands/history', protect, (req, res) => {
+router.get('/commands/history', ...tenantUser, (req, res) => {
   const endpoint = String(req.query.endpoint_id || '').trim();
   const list = endpoint
-    ? store.commandHistory.filter((c) => c.endpoint_id === endpoint)
-    : store.commandHistory;
+    ? store.commandHistory.filter((c) => c.endpoint_id === endpoint && belongsToTenant(c, req.organizationId, req.organization?.isLegacy))
+    : store.commandHistory.filter((c) => belongsToTenant(c, req.organizationId, req.organization?.isLegacy));
   res.json({ ok: true, count: list.length, commands: list.slice(0, 100) });
 });
 
 // GET /api/agent/agents-online – every agent you can send an action to:
 //   * socket agents (the Windows agent) straight from the command channel,
-//   * REST-polling agents (the Linux Sentinel) from the endpoint store, as long
-//     as they checked in recently. Without them a Linux server could never be
-//     chosen in Agent Console, even though the command queue can reach it.
-router.get('/agents-online', protect, (req, res) => {
+//   * REST-polling company agents (Windows and Linux) from the tenant-scoped
+//     endpoint store, as long as they checked in recently.
+router.get('/agents-online', ...tenantUser, (req, res) => {
   try {
-    const channel = req.app.get('agentChannel');
+    // Socket agents are visible only to the internal legacy workspace until
+    // their connection credential carries a company tenant.
+    const channel = req.organization?.isLegacy ? req.app.get('agentChannel') : null;
     const socketAgents = channel ? channel.listAgents() : [];
     const seen = new Set(socketAgents.map((a) => a.endpointId || a.endpoint_id));
 
     const restAgents = Object.values(store.endpoints || {})
-      .filter((ep) => ep && ep.source && isActive(ep.lastSeen) && !seen.has(ep.source))
+      .filter((ep) => ep && belongsToTenant(ep, req.organizationId, req.organization?.isLegacy) && ep.source && isActive(ep.lastSeen) && !seen.has(ep.source))
       .map((ep) => ({
         endpointId: ep.source,
         hostname: ep.hostname || ep.source,
         lastSeen: ep.lastSeen,
-        platform: ep.platform || 'linux',       // only REST agents today are Linux
+        platform: ep.platform || 'linux',
         channel: 'rest',
-        importance: store.importance[ep.source] || null,
+        importance: store.importance[endpointKey(ep.source, req.organizationId)] || null,
       }));
 
     const agents = [...socketAgents, ...restAgents];
@@ -685,106 +698,108 @@ router.get('/agents-online', protect, (req, res) => {
 // ============================================================
 
 router.post('/finding', validateAgentOrJWT, (req, res) => {
-  const finding = { ...req.body, source: getSource(req) };
-  updateEndpointHeartbeat(finding.source);
+  const finding = { ...req.body, source: getSource(req), ...(req.organizationId ? { organization: req.organizationId } : {}) };
+  updateEndpointHeartbeat(finding.source, undefined, req.organizationId);
   push(store.findings, finding);
-  emit('agent:finding', finding);
-  if (finding.id) ingestAlert(fromFinding(finding));
+  emit('agent:finding', finding, req.organizationId);
+  if (finding.id) ingestAlert(fromFinding(finding), true, req.organizationId);
   res.json({ ok: true });
 });
 
 router.post('/correlated', validateAgentOrJWT, (req, res) => {
-  const incident = { ...req.body, source: req.body?.source || getSource(req) };
+  const incident = { ...req.body, source: req.body?.source || getSource(req), ...(req.organizationId ? { organization: req.organizationId } : {}) };
   // the same incident is re-sent when it grows: keep one row, newest first
-  const idx = store.correlated.findIndex((c) => c.alert_id && c.alert_id === incident.alert_id);
+  const idx = store.correlated.findIndex((c) => c.alert_id && c.alert_id === incident.alert_id
+    && String(c.organization || '') === String(incident.organization || ''));
   if (idx !== -1) store.correlated.splice(idx, 1);
   push(store.correlated, incident);
-  emit('agent:correlated', incident);
-  if (incident.alert_id) ingestAlert(fromCorrelated(incident));
+  emit('agent:correlated', incident, req.organizationId);
+  if (incident.alert_id) ingestAlert(fromCorrelated(incident), true, req.organizationId);
   if (['critical', 'high'].includes(req.body.severity))
-    emit('alert:critical', { ...req.body, message: req.body.description });
+    emit('alert:critical', { ...req.body, message: req.body.description }, req.organizationId);
   res.json({ ok: true });
 });
 
-router.post('/gate-decision', validateAgentOrJWT, (req, res) => {
-  const decision = { ...req.body, source: getSource(req) };
+router.post('/gate-decision', validateAgentOrJWT, async (req, res) => {
+  const decision = { ...req.body, source: getSource(req), ...(req.organizationId ? { organization: req.organizationId } : {}) };
   const decidedPlatform = req.body?.platform || req.body?.metadata?.platform
-    || store.endpoints[decision.source]?.platform || '';
+    || store.endpoints[endpointKey(decision.source, req.organizationId)]?.platform || '';
   decision.platform = decidedPlatform;
-  updateEndpointHeartbeat(decision.source, decidedPlatform);
+  updateEndpointHeartbeat(decision.source, decidedPlatform, req.organizationId);
   const imp = decision.metadata?.trigate?.impact?.importance;
-  if (IMPORTANCE_LEVELS.has(String(imp || ''))) store.importance[decision.source] = String(imp);
+  if (IMPORTANCE_LEVELS.has(String(imp || ''))) store.importance[endpointKey(decision.source, req.organizationId)] = String(imp);
   push(store.gateDecisions, decision);
-  emit('agent:gate', decision);
-  if (decision.event_id) ingestAlert(fromGateDecision(decision)); // HOLD/BLOCK only
-  // PseudoLock: response rules first (first matching rule wins); when no rule
-  // takes over, BLOCK actions the agent did NOT run itself wait for approval.
-  const status = { ...(store.agentStatus[decision.source] || {}), importance: store.importance[decision.source] };
-  onTriGateDecision(decision, status).catch((err) =>
-    logger.error(`Response rules / approvals for TriGate decision failed: ${err.message}`));
+  emit('agent:gate', decision, req.organizationId);
+  if (decision.event_id) ingestAlert(fromGateDecision(decision), true, req.organizationId); // HOLD/BLOCK only
+  const status = { ...(store.agentStatus[endpointKey(decision.source, req.organizationId)] || {}), importance: store.importance[endpointKey(decision.source, req.organizationId)] };
+
+  // The old shared key is unbound and must never drive workspace automation.
+  // Legacy organization callers retain their existing null-organization store.
+  if (req.organization?.isLegacy) {
+    withResponseOrganization(null, () => onTriGateDecision(decision, status), req.organizationId)
+      .catch((err) => logger.error(`Legacy response rules / approvals failed: ${err.message}`));
+  } else if (req.agent?.organizationId && req.agent.endpointId === decision.source) {
+    // Tenant agents may create approvals only when their current subscription
+    // enables response actions. Playbook-backed rules need both entitlements;
+    // otherwise process the ordinary TriGate approval recommendations only.
+    try {
+      const features = await getAgentPlanFeatures(req.organizationId);
+      if (features.responseActions === true) {
+        const runTenantResponse = () => features.playbooks === true
+          ? onTriGateDecision(decision, status)
+          : approvalsFromDecision(decision, status);
+        withResponseOrganization(req.organizationId, runTenantResponse)
+          .catch((err) => logger.error(`Tenant response rules / approvals failed: ${err.message}`));
+      }
+    } catch (err) {
+      // Monitoring and alert ingestion still succeed if billing data is
+      // temporarily unavailable; no automated response runs without a fresh check.
+      logger.warn(`Tenant response automation skipped: ${err.message}`);
+    }
+  }
   res.json({ ok: true });
 });
 
 // ---- Playbooks that talk to outside systems ----
-// Freeze Badge: AiBoO cannot reach a door / badge controller itself. If the
-// company's access-control system (or an automation tool such as n8n / Zapier /
-// Power Automate in front of it) gives a webhook URL, put it in backend/.env:
-//   BADGE_WEBHOOK_URL=https://...      BADGE_WEBHOOK_TOKEN=optional-secret
-// and this playbook POSTs {action:'freeze_badge', badge_id, user, reason, ...}.
-router.get('/playbooks/status', protect, (req, res) => {
-  res.json({ badge: { configured: badgeConfigured() } });
+// Freeze Badge still supports one legacy process-wide webhook. Company
+// workspaces report it as unconfigured and cannot invoke it until a separate
+// tenant-scoped integration and secret-management flow is implemented.
+router.get('/playbooks/status', ...tenantUser, (req, res) => {
+  // The env-backed hook is shared legacy configuration, not a company integration.
+  res.json({ badge: { configured: Boolean(req.organization?.isLegacy && badgeConfigured()) } });
 });
 
-router.post('/playbooks/freeze-badge', protect, authorize('admin', 'analyst'), async (req, res) => {
-  const badgeId = String(req.body?.badge_id || '').trim().slice(0, 120);
-  const reason = String(req.body?.reason || '').trim().slice(0, 300);
-  const by = req.user?.email || req.user?.name || 'analyst';
-  const out = await freezeBadge({ badgeId, reason, by });
-  if (out.httpStatus === 400 || out.notConfigured) return res.status(out.httpStatus).json({ ok: false, error: out.error });
-  pushAction({
-    id: `badge_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-    action: 'freeze_badge', action_label: 'Badge Frozen', target: badgeId, source: 'badge-system',
-    agent: 'Playbook', reason: reason || 'Freeze Badge playbook', timestamp: out.requestedAt,
-    status: out.ok ? 'success' : 'failed', error: out.ok ? '' : out.error,
-  });
-  emit('agent:action', store.actions[0]);
-  if (out.ok) {
-    logger.info(`Freeze badge ${badgeId} by ${by}: HTTP ${out.remoteStatus}`);
-    return res.json({ ok: true, message: out.message, detail: out.detail });
-  }
-  logger.warn(`Freeze badge ${badgeId} failed: ${out.error}`);
-  return res.status(502).json({ ok: false, error: out.error, ...(out.detail !== undefined ? { detail: out.detail } : {}) });
-});
+router.post('/playbooks/freeze-badge', ...tenantUser, authorize('admin', 'analyst'), tenantUnavailable);
 
 // POST /api/agent/compliance - agent sends its ISO 27001 / NIST CSF check
 router.post('/compliance', validateAgentOrJWT, async (req, res) => {
   const source = getSource(req);
-  updateEndpointHeartbeat(source);
+  updateEndpointHeartbeat(source, undefined, req.organizationId);
   const body = req.body || {};
   if (!Array.isArray(body.checks)) return res.status(400).json({ ok: false, error: 'checks[] is required' });
   const report = { ...body, endpoint: source, received_at: new Date().toISOString() };
-  store.compliance[source] = report;
-  await saveCompliance(source, body);
-  emit('agent:compliance', { endpoint: source, score: body.score, counts: body.counts, checked_at: body.checked_at });
+  store.compliance[endpointKey(source, req.organizationId)] = { ...report, ...(req.organizationId ? { organization: req.organizationId } : {}) };
+  await saveCompliance(source, body, req.organizationId);
+  emit('agent:compliance', { endpoint: source, score: body.score, counts: body.counts, checked_at: body.checked_at }, req.organizationId);
   res.json({ ok: true });
 });
 
 // POST /api/agent/agent-status - agent reports which engines are running
 router.post('/agent-status', validateAgentOrJWT, (req, res) => {
   const source = getSource(req);
-  updateEndpointHeartbeat(source);
-  store.agentStatus[source] = { ...(req.body || {}), endpoint: source, received_at: new Date().toISOString() };
-  emit('agent:status', store.agentStatus[source]);
+  updateEndpointHeartbeat(source, undefined, req.organizationId);
+  store.agentStatus[endpointKey(source, req.organizationId)] = { ...(req.body || {}), endpoint: source, received_at: new Date().toISOString(), ...(req.organizationId ? { organization: req.organizationId } : {}) };
+  emit('agent:status', store.agentStatus[endpointKey(source, req.organizationId)], req.organizationId);
   res.json({ ok: true });
 });
 
-router.get('/agent-status', protect, (req, res) => res.json(Object.values(store.agentStatus)));
+router.get('/agent-status', ...tenantUser, (req, res) => res.json(Object.values(store.agentStatus).filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy))));
 
-router.get('/compliance', protect, async (req, res) => {
+router.get('/compliance', ...tenantUser, async (req, res) => {
   // memory copy has the full detail for live agents; DB keeps history
-  let rows = Object.values(store.compliance);
+  let rows = Object.values(store.compliance).filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy));
   if (!rows.length) {
-    try { rows = await latestCompliance(); } catch { rows = []; }
+    try { rows = await latestCompliance(req.organizationId); } catch { rows = []; }
   }
   res.json(rows);
 });
@@ -792,39 +807,10 @@ router.get('/compliance', protect, async (req, res) => {
 // POST /api/agent/gate-decisions/:eventId/feedback  { feedback: false_alarm|confirmed }
 // TriGate learning: the agent stores the feedback on disk; future events of
 // the same kind for the same user score lower (false alarm) / higher (confirmed).
-router.post('/gate-decisions/:eventId/feedback', protect, authorize('admin', 'analyst'), (req, res) => {
-  const feedback = String(req.body?.feedback || '').toLowerCase().trim();
-  if (!['false_alarm', 'confirmed'].includes(feedback)) {
-    return res.status(400).json({ ok: false, error: "feedback must be 'false_alarm' or 'confirmed'" });
-  }
-  const decision = store.gateDecisions.find((d) => d.event_id === req.params.eventId);
-  if (!decision) return res.status(404).json({ ok: false, error: 'Decision not found' });
-  const endpointId = decision.source;
-  if (!endpointId || endpointId === 'unknown') {
-    return res.status(400).json({ ok: false, error: 'This decision has no endpoint (old agent version)' });
-  }
-  const channel = req.app.get('agentChannel');
-  if (!channel) return res.status(503).json({ ok: false, error: 'Agent channel not initialized' });
-  const tri = decision.metadata?.trigate || {};
-  const result = channel.dispatch(endpointId, 'trigate_feedback', decision.event_id, {
-    feedback,
-    event_id: decision.event_id,
-    pattern: tri.pattern || tri.context?.pattern || null,
-    entity: tri.entity ?? tri.context?.entity ?? null,
-  });
-  if (!result.ok) return res.status(404).json(result);
-  decision.feedback = {
-    kind: feedback,
-    cmd_id: result.cmd_id,
-    by: req.user?.email || req.user?.name || 'analyst',
-    at: new Date().toISOString(),
-  };
-  logger.info(`TriGate feedback ${feedback} for ${decision.event_id} on ${endpointId} (${result.cmd_id})`);
-  emit('agent:gate-feedback', { event_id: decision.event_id, feedback: decision.feedback });
-  res.status(202).json({ ok: true, ...result, feedback: decision.feedback });
-});
+router.post('/gate-decisions/:eventId/feedback', ...tenantUser, authorize('admin', 'analyst'), tenantUnavailable);
 
 router.post('/pseudo-lock', validateAgentOrJWT, (req, res) => {
+  if (req.organizationId) return tenantUnavailable(req, res);
   store.pseudoLocks[req.body.lock_id] = req.body;
   emit('agent:pseudo-lock', req.body);
   res.json({ ok: true });
@@ -832,6 +818,7 @@ router.post('/pseudo-lock', validateAgentOrJWT, (req, res) => {
 
 // Agent reports that a decoy port was really closed
 router.post('/pseudo-lock-restore', validateAgentOrJWT, (req, res) => {
+  if (req.organizationId) return tenantUnavailable(req, res);
   const { lock_id, restored_at, message, hits } = req.body || {};
   const lock = store.pseudoLocks[lock_id];
   if (lock) {
@@ -850,11 +837,12 @@ router.post('/pseudo-lock-restore', validateAgentOrJWT, (req, res) => {
 });
 
 // ---- Internal GET endpoints ----
-router.get('/correlated', protect, (req, res) => res.json(store.correlated.slice(0, 20)));
-router.get('/gate-decisions', protect, (req, res) => {
+router.get('/correlated', ...tenantUser, (req, res) => res.json(store.correlated.filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy)).slice(0, 20)));
+router.get('/gate-decisions', ...tenantUser, (req, res) => {
   const channel = req.app.get('agentChannel');
   const { source } = req.query;
-  const list = (source ? store.gateDecisions.filter((d) => d.source === source) : store.gateDecisions)
+  const scopedDecisions = store.gateDecisions.filter((d) => belongsToTenant(d, req.organizationId, req.organization?.isLegacy));
+  const list = (source ? scopedDecisions.filter((d) => d.source === source) : scopedDecisions)
     .slice(0, 50)
     .map((d) => {
       if (!d.feedback?.cmd_id || !channel?.getCommand) return d;
@@ -863,67 +851,35 @@ router.get('/gate-decisions', protect, (req, res) => {
     });
   res.json(list);
 });
-router.get('/pseudo-locks', protect, (req, res) => res.json(Object.values(store.pseudoLocks)));
-router.get('/response-log', protect, (req, res) => res.json(store.responseLog.slice(0, 50)));
+router.get('/pseudo-locks', ...tenantUser, (req, res) => res.json(Object.values(store.pseudoLocks).filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy))));
+router.get('/response-log', ...tenantUser, (req, res) => res.json(store.responseLog.filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy)).slice(0, 50)));
 
-router.get('/stats', protect, (req, res) => {
+router.get('/stats', ...tenantUser, (req, res) => {
   const sc = {}; const tc = {};
-  store.findings.forEach(f => {
+  const findings = store.findings.filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy));
+  const incidents = store.correlated.filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy));
+  const locks = Object.values(store.pseudoLocks).filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy));
+  const actions = store.actions.filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy));
+  const endpoints = Object.values(store.endpoints).filter((row) => belongsToTenant(row, req.organizationId, req.organization?.isLegacy));
+  findings.forEach(f => {
     sc[f.severity] = (sc[f.severity] || 0) + 1;
     tc[f.threat_type] = (tc[f.threat_type] || 0) + 1;
   });
   res.json({
-    total_findings: store.findings.length,
-    correlated_alerts: store.correlated.length,
-    active_locks: Object.values(store.pseudoLocks).filter(l => l.active).length,
-    total_actions: store.actions.length,
+    total_findings: findings.length,
+    correlated_alerts: incidents.length,
+    active_locks: locks.filter(l => l.active).length,
+    total_actions: actions.length,
     by_severity: sc,
     by_type: tc,
-    endpoints: Object.keys(store.endpoints).length,
+    endpoints: endpoints.length,
   });
 });
 
 // ---- Restore lock: ask the agent that owns the decoy to close it ----
 // The agent closes the real listening port and then reports back via
 // POST /pseudo-lock-restore, which flips the lock to "restored".
-router.post('/pseudo-locks/:lockId/restore', protect, authorize('admin', 'analyst'), (req, res) => {
-  const { lockId } = req.params;
-  const lock = store.pseudoLocks[lockId];
-  if (!lock) {
-    return res.status(404).json({ ok: false, error: `Lock '${lockId}' not found` });
-  }
-  if (!lock.active) {
-    return res.json({ ok: true, already_restored: true });
-  }
-
-  const channel = req.app.get('agentChannel');
-  const endpoint = lock.source;
-  if (channel && endpoint && channel.isOnline(endpoint)) {
-    const result = channel.dispatch(endpoint, 'restore_pseudo_lock', lockId, {});
-    if (!result.ok) return res.status(404).json(result);
-    lock.restoring = true;
-    emit('agent:pseudo-lock', lock);
-    logger.info(`Restore of ${lockId} dispatched to ${endpoint} (${result.cmd_id})`);
-    return res.status(202).json({ ok: true, dispatched: true, cmd_id: result.cmd_id, endpoint });
-  }
-
-  // The agent that opened the decoy is not connected. If its process has
-  // stopped, the decoy port closed with it; if it is only disconnected,
-  // the port stays open until it reconnects or restarts. Say so honestly.
-  lock.active = false;
-  lock.restoring = false;
-  lock.restored_at = new Date().toISOString();
-  lock.restore_message = (!endpoint || lock.demo)
-    ? 'Demo/sample lock with no real agent behind it - cleared on the dashboard.'
-    : `Agent '${endpoint}' is not connected - cleared on the dashboard only. ` +
-      'Decoy ports close automatically when the agent stops.';
-  emit('agent:pseudo-lock-restore', {
-    lock_id: lockId,
-    restored_at: lock.restored_at,
-    message: lock.restore_message,
-  });
-  return res.json({ ok: true, dispatched: false, note: lock.restore_message });
-});
+router.post('/pseudo-locks/:lockId/restore', ...tenantUser, authorize('admin', 'analyst'), tenantUnavailable);
 
 // ---- Send Event tab: inject a test event on a connected agent ----
 const TEST_EVENT_TYPES = new Set([
@@ -932,49 +888,21 @@ const TEST_EVENT_TYPES = new Set([
 ]);
 const TEST_SEVERITIES = new Set(['low', 'medium', 'high', 'critical']);
 
-router.post('/test-event', protect, authorize('admin', 'analyst'), (req, res) => {
-  const { endpoint_id, event } = req.body || {};
-  if (!endpoint_id) {
-    return res.status(400).json({ ok: false, error: 'endpoint_id is required' });
-  }
-  const ev = event && typeof event === 'object' ? event : {};
-  const eventType = String(ev.event_type || '').toLowerCase();
-  const severity = String(ev.severity || '').toLowerCase();
-  if (!TEST_EVENT_TYPES.has(eventType)) {
-    return res.status(400).json({ ok: false, error: `Unknown event type '${ev.event_type}'` });
-  }
-  if (!TEST_SEVERITIES.has(severity)) {
-    return res.status(400).json({ ok: false, error: `Unknown severity '${ev.severity}'` });
-  }
-  const channel = req.app.get('agentChannel');
-  if (!channel) {
-    return res.status(503).json({ ok: false, error: 'Agent channel not initialized' });
-  }
-  const spec = {
-    source: String(ev.source || 'dashboard-test').slice(0, 64),
-    event_type: eventType,
-    severity,
-    message: String(ev.message || '').slice(0, 500),
-    payload: ev.payload && typeof ev.payload === 'object' ? ev.payload : {},
-  };
-  const result = channel.dispatch(String(endpoint_id), 'inject_test_event', '', { event: spec });
-  if (!result.ok) return res.status(404).json(result);
-  logger.info(`Test event (${eventType}/${severity}) sent to ${endpoint_id} (${result.cmd_id})`);
-  res.status(202).json(result);
-});
+router.post('/test-event', ...tenantUser, authorize('admin', 'analyst'), tenantUnavailable);
 
 // ---- Dashboard playbook: Open War Room ----
 // Alerts every logged-in dashboard at once (real-time broadcast).
-router.post('/war-room', protect, authorize('admin', 'analyst'), (req, res) => {
+router.post('/war-room', ...tenantUser, authorize('admin', 'analyst'), (req, res) => {
   const entry = {
     id: `war_${Date.now()}`,
     type: 'war_room',
+    organization: req.organizationId,
     opened_by: req.user?.name || req.user?.email || String(req.user?.id || 'unknown'),
     note: String(req.body?.note || '').slice(0, 300),
     timestamp: new Date().toISOString(),
   };
   push(store.responseLog, entry);
-  emit('war-room:opened', entry);
+  emit('war-room:opened', entry, req.organizationId);
   logger.warn(`War room opened by ${entry.opened_by}${entry.note ? `: ${entry.note}` : ''}`);
   res.status(201).json({ ok: true, ...entry });
 });

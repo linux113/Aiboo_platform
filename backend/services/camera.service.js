@@ -2,77 +2,98 @@ import Camera from '../models/Camera.js';
 import Detection from '../models/Detection.js';
 import { getIO } from '../config/socket.js';
 
-const emit = (event, data) => { try { getIO().emit(event, data); } catch {} };
+const tenantFilter = (filter = {}, organizationId) => organizationId
+  ? { ...filter, organization: organizationId }
+  : filter;
+const emit = (event, data, organizationId) => {
+  if (!organizationId) return;
+  try { getIO().to(`org:${organizationId}`).emit(event, data); } catch {}
+};
 
 export const listCameras = async (filter = {}, options = {}) => {
   const page = options.page || 1;
   const limit = options.limit || 20;
   const skip = (page - 1) * limit;
+  const query = tenantFilter(filter, options.organizationId);
   const [data, total] = await Promise.all([
-    Camera.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit),
-    Camera.countDocuments(filter),
+    Camera.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    Camera.countDocuments(query),
   ]);
   return { data, total, page, limit, totalPages: Math.ceil(total / limit) };
 };
 
-export const getCameraById = async (id) => {
-  const cam = await Camera.findById(id);
+export const getCameraById = async (id, organizationId) => {
+  const cam = await Camera.findOne({ _id: id, ...(organizationId ? { organization: organizationId } : {}) });
   if (!cam) throw { statusCode: 404, message: 'Camera not found' };
   return cam;
 };
 
-export const addCamera = async (data, userId) => {
-  const cam = await Camera.create({ ...data, addedBy: userId });
-  emit('camera:added', cam);
+export const addCamera = async (data, userId, organizationId) => {
+  const cam = await Camera.create({ ...data, addedBy: userId, ...(organizationId ? { organization: organizationId } : {}) });
+  emit('camera:added', cam, organizationId);
   return cam;
 };
 
-export const updateCamera = async (id, data) => {
-  const cam = await Camera.findByIdAndUpdate(id, data, { new: true });
+export const updateCamera = async (id, data, organizationId) => {
+  const cam = await Camera.findOneAndUpdate(
+    { _id: id, ...(organizationId ? { organization: organizationId } : {}) },
+    { ...data, ...(organizationId ? { organization: organizationId } : {}) },
+    { new: true },
+  );
   if (!cam) throw { statusCode: 404, message: 'Camera not found' };
-  emit('camera:updated', cam);
+  emit('camera:updated', cam, organizationId);
   return cam;
 };
 
-export const deleteCamera = async (id) => {
-  const cam = await Camera.findByIdAndDelete(id);
+export const deleteCamera = async (id, organizationId) => {
+  const cam = await Camera.findOneAndDelete({ _id: id, ...(organizationId ? { organization: organizationId } : {}) });
   if (!cam) throw { statusCode: 404, message: 'Camera not found' };
-  emit('camera:deleted', { id });
+  emit('camera:deleted', { id }, organizationId);
   return { success: true };
 };
 
-export const listDetections = async (filter = {}, limit = 100) =>
-  Detection.find(filter).sort({ timestamp: -1 }).limit(limit);
+export const listDetections = async (filter = {}, limit = 100, organizationId) =>
+  Detection.find(tenantFilter(filter, organizationId)).sort({ timestamp: -1 }).limit(limit);
 
-export const createDetection = async (data) => {
-  const detection = await Detection.create(data);
-  emit('detection:new', detection);
+export const createDetection = async (data, organizationId) => {
+  if (organizationId && data.cameraId) {
+    const camera = await Camera.findOne({ _id: data.cameraId, organization: organizationId }).select('_id');
+    if (!camera) throw { statusCode: 404, message: 'Camera not found in this company workspace' };
+  }
+  const detection = await Detection.create({ ...data, ...(organizationId ? { organization: organizationId } : {}) });
+  emit('detection:new', detection, organizationId);
   if (['weapon_gun', 'weapon_knife', 'face_watchlist'].includes(data.type)) {
     emit('alert:critical', {
       type: data.type, cameraId: data.cameraId,
       cameraName: data.cameraName, location: data.location,
       confidence: data.confidence, timestamp: detection.timestamp,
       message: buildAlertMessage(data),
-    });
+    }, organizationId);
   }
   return detection;
 };
 
-export const acknowledgeDetection = async (id) => {
-  const det = await Detection.findByIdAndUpdate(id, { acknowledged: true }, { new: true });
+export const acknowledgeDetection = async (id, organizationId) => {
+  const det = await Detection.findOneAndUpdate(
+    { _id: id, ...(organizationId ? { organization: organizationId } : {}) },
+    { acknowledged: true }, { new: true },
+  );
   if (!det) throw { statusCode: 404, message: 'Detection not found' };
   return det;
 };
 
-export const escalateDetection = async (id) => {
-  const det = await Detection.findByIdAndUpdate(id, { escalated: true, severity: 'critical' }, { new: true });
+export const escalateDetection = async (id, organizationId) => {
+  const det = await Detection.findOneAndUpdate(
+    { _id: id, ...(organizationId ? { organization: organizationId } : {}) },
+    { escalated: true, severity: 'critical' }, { new: true },
+  );
   if (!det) throw { statusCode: 404, message: 'Detection not found' };
-  emit('alert:escalated', det);
+  emit('alert:escalated', det, organizationId);
   return det;
 };
 
-export const runDetection = async (cameraId) => {
-  const cam = await getCameraById(cameraId);
+export const runDetection = async (cameraId, organizationId) => {
+  const cam = await getCameraById(cameraId, organizationId);
   if (!cam?.enabled) return null;
   const types = ['person', 'vehicle', 'behavior_anomaly', 'crowd', 'bag'];
   const critTypes = ['weapon_gun', 'weapon_knife', 'face_watchlist', 'face_unknown'];
@@ -85,7 +106,7 @@ export const runDetection = async (cameraId) => {
     cameraId: cam._id, cameraName: cam.name, location: cam.location,
     type, severity, confidence: Math.floor(70 + Math.random() * 30),
     label: buildLabel(type), metadata: { zone: cam.zone },
-  });
+  }, organizationId);
 };
 
 function buildLabel(type) {

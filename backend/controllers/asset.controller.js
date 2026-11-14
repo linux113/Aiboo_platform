@@ -4,7 +4,7 @@ export const getAssets = async (req, res, next) => {
   try {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
-    const assets = await listAssets({}, { page, limit });
+    const assets = await listAssets({}, { page, limit, organizationId: req.organizationId });
     res.json(assets);
   } catch (err) { next(err); }
 };
@@ -13,7 +13,7 @@ export const postAsset = async (req, res, next) => {
   try {
     const { name } = req.body;
     if (!name) return res.status(400).json({ message: 'Asset name is required' });
-    const asset = await createAsset(req.body);
+    const asset = await createAsset(req.body, req.organizationId);
     res.status(201).json(asset);
   } catch (err) { next(err); }
 };
@@ -21,7 +21,7 @@ export const postAsset = async (req, res, next) => {
 export const runAssetScan = async (req, res, next) => {
   try {
     if (!req.params.assetId) return res.status(400).json({ message: 'Asset ID is required' });
-    const vuln = await runScan(req.params.assetId);
+    const vuln = await runScan(req.params.assetId, req.organizationId);
     res.status(201).json(vuln);
   } catch (err) { next(err); }
 };
@@ -30,7 +30,7 @@ export const getVulnerabilities = async (req, res, next) => {
   try {
     const page = Math.max(parseInt(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(parseInt(req.query.limit) || 20, 1), 100);
-    const vulns = await listVulnerabilities({}, { page, limit });
+    const vulns = await listVulnerabilities({}, { page, limit, organizationId: req.organizationId });
     res.json(vulns);
   } catch (err) { next(err); }
 };

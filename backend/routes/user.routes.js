@@ -2,6 +2,7 @@
 // must never be able to create an account or hand themselves a new role.
 import express from 'express';
 import { protect, authorize } from '../middleware/auth.js';
+import { requireOrganization } from '../middleware/tenant.js';
 import {
   listUsers, register, updateUser, disableUser, ROLES,
 } from '../services/auth.service.js';
@@ -13,12 +14,12 @@ const fail = (res, err) => {
   res.status(code).json({ message: err.message || 'User request failed' });
 };
 
-router.use(protect, authorize('admin'));
+router.use(protect, requireOrganization, authorize('admin'));
 
 // GET /api/users - who can log in, and with which role
 router.get('/', async (req, res) => {
   try {
-    res.json({ users: await listUsers(), roles: ROLES });
+    res.json({ users: await listUsers(req.organizationId), roles: ROLES });
   } catch (err) { fail(res, err); }
 });
 

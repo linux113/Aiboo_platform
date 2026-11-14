@@ -8,6 +8,8 @@ import os
 import socket
 import configparser
 import sys
+import urllib.request
+import urllib.error
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Optional
@@ -128,6 +130,12 @@ class DashboardBridge:
         ).rstrip("/")
         self._api_key = api_key or _get_config_value('AIBOO', 'api_key', 'dev-key-change-in-production')
         self._endpoint_id = endpoint_id or _get_config_value('AIBOO', 'endpoint_name', socket.gethostname())
+        self._tenant_credential = str(self._api_key or '').startswith('aiboo1_')
+        self._license_active = not self._tenant_credential
+        self._license_expires_at = None
+        self._license_features = {}
+        self._response_actions_enabled = not self._tenant_credential
+        self.license_status_callback = None
 
         # Set log level from config
         log_level = _get_config_value('AIBOO', 'log_level', 'INFO')
@@ -196,8 +204,55 @@ class DashboardBridge:
 
         log.info("DashboardBridge stopped")
 
+    def _license_deadline_reached(self) -> bool:
+        if not self._license_expires_at:
+            return False
+        try:
+            expiry = datetime.fromisoformat(str(self._license_expires_at).replace('Z', '+00:00'))
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            return datetime.now(timezone.utc) >= expiry
+        except (TypeError, ValueError):
+            return False
+
+    def _check_tenant_license(self) -> tuple[bool, str | None, dict]:
+        payload = json.dumps({
+            "source": self._endpoint_id,
+            "endpoint": self._endpoint_id,
+            "platform": "windows",
+            "os": "windows",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._backend_url}/api/agent/license-heartbeat",
+            data=payload,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": self._api_key,
+                "X-Endpoint-ID": self._endpoint_id,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                data = json.loads(response.read().decode("utf-8", "replace") or "{}")
+            return data.get("active") is True, data.get("expiresAt"), data.get("features") if isinstance(data.get("features"), dict) else {}
+        except Exception as exc:
+            log.warning("Tenant license heartbeat failed; company telemetry and agent actions are paused: %s", exc)
+            return False, None, {}
+
     async def _send_heartbeat(self) -> None:
-        """Send a single heartbeat to the backend (for immediate registration)."""
+        """Send a heartbeat; tenant credentials also refresh their license state."""
+        if self._tenant_credential:
+            self._license_active, self._license_expires_at, self._license_features = await asyncio.to_thread(self._check_tenant_license)
+            self._response_actions_enabled = bool(self._license_active and self._license_features.get("responseActions") is True)
+            if self.license_status_callback:
+                try: self.license_status_callback(self._license_active, self._license_features)
+                except Exception as exc: log.warning("License-status callback failed: %s", exc)
+            if self._license_active:
+                log.info("Company license active through %s", self._license_expires_at or "the current paid period")
+            else:
+                log.warning("Company license is inactive or could not be verified; telemetry and response actions are paused")
+            return
         payload = {
             "source": self._endpoint_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -211,15 +266,44 @@ class DashboardBridge:
         log.debug("Heartbeat queued for %s", self._endpoint_id)
 
     async def _heartbeat_loop(self) -> None:
-        """Send a heartbeat to the backend every 60 seconds."""
+        """Refresh tenant licensing and keep the endpoint heartbeat current."""
         while self._running:
             try:
-                await asyncio.sleep(60)
+                delay = 60.0
+                if self._tenant_credential:
+                    delay = 15.0
+                    if self._license_active and self._license_expires_at:
+                        try:
+                            expiry = datetime.fromisoformat(str(self._license_expires_at).replace('Z', '+00:00'))
+                            if expiry.tzinfo is None:
+                                expiry = expiry.replace(tzinfo=timezone.utc)
+                            delay = max(0.5, min(delay, (expiry - datetime.now(timezone.utc)).total_seconds()))
+                        except (TypeError, ValueError):
+                            pass
+                await asyncio.sleep(delay)
                 if not self._running:
                     break
+                if self._tenant_credential and self._license_active and self._license_deadline_reached():
+                    self._license_active = False
+                    if self.license_status_callback:
+                        self.license_status_callback(False, self._license_features)
                 await self._send_heartbeat()
             except Exception as e:
                 log.warning("Heartbeat error: %s", e)
+                if self._tenant_credential:
+                    self._license_active = False
+                    if self.license_status_callback:
+                        self.license_status_callback(False, self._license_features)
+
+    async def send(self, endpoint: str, payload: dict) -> None:
+        """Queue any JSON report (agent-status, compliance, ...) for
+        POST /api/agent/<endpoint>."""
+        if getattr(self, "_tenant_credential", False) and not getattr(self, "_license_active", True):
+            return
+        payload = dict(payload or {})
+        payload["source"] = self._endpoint_id
+        payload.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        await self._queue.add_to_endpoint(endpoint, json.loads(json.dumps(payload, default=str)))
 
     async def send(self, endpoint: str, payload: dict) -> None:
         """Queue any JSON report (agent-status, compliance, ...) for
@@ -233,6 +317,8 @@ class DashboardBridge:
 
     async def _on_finding(self, event: AgentFinding) -> None:
         """Queue a finding (only high/critical)."""
+        if getattr(self, "_tenant_credential", False) and not getattr(self, "_license_active", True):
+            return
         if event.severity.value not in ("high", "critical"):
             return
 
@@ -280,6 +366,8 @@ class DashboardBridge:
             await self._queue.add_to_endpoint("pseudo-lock-restore", payload)
 
     async def _on_correlated(self, event: CorrelatedAlert) -> None:
+        if getattr(self, "_tenant_credential", False) and not getattr(self, "_license_active", True):
+            return
         payload = _serialize(event)
         payload["alert_id"] = str(payload.get("alert_id", ""))
         payload["timestamp"] = _as_iso(event.timestamp)
@@ -322,13 +410,12 @@ class DashboardBridge:
     # ------------------------------------------------------------------
 
     async def _on_action(self, event: ActionRecord) -> None:
-        """
-        Queue a response action for the backend.
-
-        Every action is forwarded regardless of status (pending / success /
-        failed / active) so the "Isolation & Termination" tab can show
-        in-flight and failed operations too — not just successes.
-        """
+        """Queue a response action for the backend, unless company license is inactive."""
+        if getattr(self, "_tenant_credential", False) and (
+            not getattr(self, "_license_active", True)
+            or not getattr(self, "_response_actions_enabled", True)
+        ):
+            return
         try:
             payload = _serialize(event)
 

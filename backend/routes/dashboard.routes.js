@@ -1,10 +1,11 @@
 import express from 'express';
 import { getKPIsCtrl } from '../controllers/dashboard.controller.js';
 import { protect } from '../middleware/auth.js';
+import { requireOrganization } from '../middleware/tenant.js';
 
 const router = express.Router();
 
-router.get('/kpis', protect, getKPIsCtrl);
+router.get('/kpis', protect, requireOrganization, getKPIsCtrl);
 
 // GET /api/dashboard/services - is the optional camera (CV) service up?
 // Checked from the backend so it works no matter which computer the

@@ -15,7 +15,7 @@ import net from 'node:net';
 import logger from '../utils/logger.js';
 import { alertsSince } from './alertStore.js';
 import {
-  store, emit, whoIs, getPlaybook, startRun, createPlaybookStartApproval, approvalsFromDecision,
+  store, emit, whoIs, getPlaybook, startRun, createPlaybookStartApproval, approvalsFromDecision, getResponseAlertOrganizationId, isLegacyResponseScope,
   approvalExpiryMinutes, checkTarget, ACTIONS,
 } from './pseudolock.service.js';
 
@@ -393,7 +393,7 @@ export async function onTriGateDecision(decision, agentStatus) {
 export async function previewRule(body, days = 30) {
   const { rule } = await validateRule({ name: 'preview', mode: 'notify', ...body });
   const d = intIn(days, 1, 365, 30);
-  const alerts = (await alertsSince(new Date(Date.now() - d * 86400e3))).filter((a) => a.kind === 'trigate');
+  const alerts = (await alertsSince(new Date(Date.now() - d * 86400e3), getResponseAlertOrganizationId(), isLegacyResponseScope())).filter((a) => a.kind === 'trigate');
   const hits = [];
   let unknownImportance = 0;
   const notReasons = {};

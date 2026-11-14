@@ -25,28 +25,32 @@ class MemoryRepo {
     this.alerts = new Map();
     this.compliance = [];
   }
-  async get(alertId) {
-    const a = this.alerts.get(alertId);
+  key(alertId, organizationId) { return `${organizationId || 'legacy'}:${alertId}`; }
+  async get(alertId, organizationId) {
+    const a = this.alerts.get(this.key(alertId, organizationId));
     return a ? clone(a) : null;
   }
   async insert(doc) {
     if (this.alerts.size >= MAX_MEMORY) {
       const oldest = [...this.alerts.values()].sort((a, b) => new Date(a.lastSeen) - new Date(b.lastSeen))[0];
-      if (oldest) this.alerts.delete(oldest.alertId);
+      if (oldest) this.alerts.delete(this.key(oldest.alertId, oldest.organization));
     }
     const now = new Date().toISOString();
     const full = { _id: doc.alertId, createdAt: now, updatedAt: now, ...clone(doc) };
-    this.alerts.set(doc.alertId, full);
+    this.alerts.set(this.key(doc.alertId, doc.organization), full);
     return clone(full);
   }
   async save(doc) {
     const full = { ...clone(doc), updatedAt: new Date().toISOString() };
-    this.alerts.set(doc.alertId, full);
+    this.alerts.set(this.key(doc.alertId, doc.organization), full);
     return clone(full);
   }
-  async since(date) {
+  async since(date, organizationId, includeUnbound = false) {
     const t = date ? new Date(date).getTime() : 0;
-    return [...this.alerts.values()].filter((a) => new Date(a.lastSeen).getTime() >= t).map(clone);
+    return [...this.alerts.values()]
+      .filter((a) => (includeUnbound && !organizationId ? !a.organization : (!organizationId || String(a.organization || '') === String(organizationId) || (includeUnbound && !a.organization)))
+        && new Date(a.lastSeen).getTime() >= t)
+      .map(clone);
   }
   async addCompliance(doc) {
     const full = { _id: `c${Date.now()}${Math.random().toString(36).slice(2, 6)}`, createdAt: new Date().toISOString(), ...clone(doc) };
@@ -54,15 +58,15 @@ class MemoryRepo {
     if (this.compliance.length > 2000) this.compliance.pop();
     return full;
   }
-  async complianceSince(date) {
+  async complianceSince(date, organizationId) {
     const t = date ? new Date(date).getTime() : 0;
-    return this.compliance.filter((c) => new Date(c.checkedAt).getTime() >= t).map(clone);
+    return this.compliance.filter((c) => (!organizationId || String(c.organization || '') === String(organizationId)) && new Date(c.checkedAt).getTime() >= t).map(clone);
   }
 }
 
 class MongoRepo {
-  async get(alertId) {
-    return Alert.findOne({ alertId }).lean();
+  async get(alertId, organizationId) {
+    return Alert.findOne({ alertId, ...(organizationId ? { organization: organizationId } : { organization: null }) }).lean();
   }
   async insert(doc) {
     const created = await Alert.create(doc);
@@ -70,17 +74,26 @@ class MongoRepo {
   }
   async save(doc) {
     const { _id, createdAt, updatedAt, __v, ...rest } = doc;
-    return Alert.findOneAndUpdate({ alertId: doc.alertId }, { $set: rest }, { new: true }).lean();
+    return Alert.findOneAndUpdate(
+      { alertId: doc.alertId, ...(doc.organization ? { organization: doc.organization } : { organization: null }) },
+      { $set: rest }, { new: true },
+    ).lean();
   }
-  async since(date) {
-    const q = date ? { lastSeen: { $gte: new Date(date) } } : {};
+  async since(date, organizationId, includeUnbound = false) {
+    const q = {
+      ...(date ? { lastSeen: { $gte: new Date(date) } } : {}),
+      ...(organizationId ? (includeUnbound ? { $or: [{ organization: organizationId }, { organization: null }] } : { organization: organizationId }) : { organization: null }),
+    };
     return Alert.find(q).sort({ lastSeen: -1 }).limit(20000).lean();
   }
   async addCompliance(doc) {
     return (await ComplianceReport.create(doc)).toObject();
   }
-  async complianceSince(date) {
-    const q = date ? { checkedAt: { $gte: new Date(date) } } : {};
+  async complianceSince(date, organizationId) {
+    const q = {
+      ...(date ? { checkedAt: { $gte: new Date(date) } } : {}),
+      ...(organizationId ? { organization: organizationId } : { organization: null }),
+    };
     return ComplianceReport.find(q).sort({ checkedAt: -1 }).limit(5000).lean();
   }
 }
@@ -107,9 +120,9 @@ let emitter = () => {};
 export const setAlertEmitter = (fn) => {
   emitter = typeof fn === 'function' ? fn : () => {};
 };
-const emit = (ev, data) => {
+const emit = (ev, data, organizationId = null) => {
   try {
-    emitter(ev, data);
+    emitter(ev, data, organizationId);
   } catch (err) {
     logger.error(`alert emit failed: ${err.message}`);
   }
@@ -222,15 +235,16 @@ export const fromCorrelated = (c) => {
 };
 
 // --------------------------------------------------------------- upsert
-export const ingest = async (mapped, retry = true) => {
+export const ingest = async (mapped, retry = true, organizationId = null) => {
   if (!mapped) return null;
   try {
     const r = repo();
     const now = new Date().toISOString();
-    const existing = await r.get(mapped.alertId);
+    const existing = await r.get(mapped.alertId, organizationId);
     if (!existing) {
       const doc = await r.insert({
         ...mapped,
+        ...(organizationId ? { organization: organizationId } : {}),
         status: 'open',
         assignee: '',
         closeReason: '',
@@ -239,7 +253,7 @@ export const ingest = async (mapped, retry = true) => {
         occurrences: 1,
         lastSeen: now,
       });
-      emit('alert:new', doc);
+      emit('alert:new', doc, organizationId);
       return doc;
     }
     // same alert sent again (incident grew / retry): refresh details
@@ -260,11 +274,11 @@ export const ingest = async (mapped, retry = true) => {
         { by: 'agent', action: 'reopened', from: 'closed', to: 'open', text: 'Incident grew after it was closed', at: now }];
     }
     const doc = await r.save(updated);
-    emit('alert:updated', doc);
+    emit('alert:updated', doc, organizationId);
     return doc;
   } catch (err) {
     // same alert inserted twice at the same moment (MongoDB unique id): update instead
-    if (retry && err?.code === 11000) return ingest(mapped, false);
+    if (retry && err?.code === 11000) return ingest(mapped, false, organizationId);
     logger.error(`alert ingest failed (${mapped.alertId}): ${err.message}`);
     return null;
   }
@@ -273,13 +287,13 @@ export const ingest = async (mapped, retry = true) => {
 // --------------------------------------------------------------- actions
 const actor = (user) => clip(user?.name || user?.email || 'analyst', 120);
 
-export const changeStatus = async (alertId, status, user, { note = '', reason = '' } = {}) => {
+export const changeStatus = async (alertId, status, user, { note = '', reason = '' } = {}, organizationId = null) => {
   if (!STATUSES.includes(status)) throw Object.assign(new Error(`status must be one of ${STATUSES.join(', ')}`), { statusCode: 400 });
   if (status === 'closed' && reason && !CLOSE_REASONS.includes(reason)) {
     throw Object.assign(new Error(`reason must be one of ${CLOSE_REASONS.join(', ')}`), { statusCode: 400 });
   }
   const r = repo();
-  const a = await r.get(alertId);
+  const a = await r.get(alertId, organizationId);
   if (!a) throw Object.assign(new Error('Alert not found'), { statusCode: 404 });
   const now = new Date().toISOString();
   const by = actor(user);
@@ -306,13 +320,13 @@ export const changeStatus = async (alertId, status, user, { note = '', reason = 
   a.history = [...(a.history || []), { by, action, from, to: status, text: clip(note || reason, 300), at: now }];
   if (note) a.notes = [...(a.notes || []), { by, text: clip(note, 2000), at: now }];
   const doc = await r.save(a);
-  emit('alert:updated', doc);
+  emit('alert:updated', doc, organizationId);
   return doc;
 };
 
-export const assign = async (alertId, assignee, user) => {
+export const assign = async (alertId, assignee, user, organizationId = null) => {
   const r = repo();
-  const a = await r.get(alertId);
+  const a = await r.get(alertId, organizationId);
   if (!a) throw Object.assign(new Error('Alert not found'), { statusCode: 404 });
   const by = actor(user);
   const to = clip(assignee, 120).trim();
@@ -320,32 +334,32 @@ export const assign = async (alertId, assignee, user) => {
   a.history = [...(a.history || []), { by, action: 'assigned', from: a.assignee || '', to, at: now }];
   a.assignee = to;
   const doc = await r.save(a);
-  emit('alert:updated', doc);
+  emit('alert:updated', doc, organizationId);
   return doc;
 };
 
-export const addNote = async (alertId, text, user) => {
+export const addNote = async (alertId, text, user, organizationId = null) => {
   const t = clip(text, 2000).trim();
   if (!t) throw Object.assign(new Error('Note text is required'), { statusCode: 400 });
   const r = repo();
-  const a = await r.get(alertId);
+  const a = await r.get(alertId, organizationId);
   if (!a) throw Object.assign(new Error('Alert not found'), { statusCode: 404 });
   const by = actor(user);
   const now = new Date().toISOString();
   a.notes = [...(a.notes || []), { by, text: t, at: now }];
   a.history = [...(a.history || []), { by, action: 'note', text: clip(t, 300), at: now }];
   const doc = await r.save(a);
-  emit('alert:updated', doc);
+  emit('alert:updated', doc, organizationId);
   return doc;
 };
 
-export const getAlert = async (alertId) => repo().get(alertId);
+export const getAlert = async (alertId, organizationId = null) => repo().get(alertId, organizationId);
 
 // ---------------------------------------------------------------- query
-export const listAlerts = async (q = {}) => {
+export const listAlerts = async (q = {}, organizationId = null) => {
   const days = Math.min(365, Math.max(1, Number(q.days) || 30));
   const since = new Date(Date.now() - days * 86400000);
-  let rows = await repo().since(since);
+  let rows = await repo().since(since, organizationId);
   const pick = (v) => String(v || '').split(',').map((x) => x.trim().toLowerCase()).filter(Boolean);
   const st = pick(q.status);
   const sv = pick(q.severity);
@@ -386,12 +400,13 @@ export const listAlerts = async (q = {}) => {
   };
 };
 
-export const alertsSince = async (date) => repo().since(date);
+export const alertsSince = async (date, organizationId = null, includeUnbound = false) => repo().since(date, organizationId, includeUnbound);
 
 // ----------------------------------------------------------- compliance
-export const saveCompliance = async (endpoint, body) => {
+export const saveCompliance = async (endpoint, body, organizationId = null) => {
   const doc = {
     endpoint: clip(endpoint, 120),
+    ...(organizationId ? { organization: organizationId } : {}),
     checkedAt: body.checked_at || new Date().toISOString(),
     score: body.score ?? null,
     counts: body.counts || {},
@@ -407,10 +422,10 @@ export const saveCompliance = async (endpoint, body) => {
   }
 };
 
-export const complianceSince = async (date) => repo().complianceSince(date);
+export const complianceSince = async (date, organizationId = null) => repo().complianceSince(date, organizationId);
 
-export const latestCompliance = async () => {
-  const rows = await repo().complianceSince(new Date(Date.now() - 90 * 86400000));
+export const latestCompliance = async (organizationId = null) => {
+  const rows = await repo().complianceSince(new Date(Date.now() - 90 * 86400000), organizationId);
   const latest = {};
   rows.forEach((r) => {
     const cur = latest[r.endpoint];

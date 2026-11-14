@@ -5,12 +5,13 @@
 //        type = risk | compliance | executive
 import express from 'express';
 import { protect } from '../middleware/auth.js';
+import { requireOrganization } from '../middleware/tenant.js';
 import { buildAnalytics } from '../services/reportData.js';
 import { REPORT_TYPES, toCsv, toPdf } from '../services/reportRender.js';
 import logger from '../utils/logger.js';
 
 const router = express.Router();
-router.use(protect);
+router.use(protect, requireOrganization);
 
 router.get('/', (req, res) => {
   res.json(Object.entries(REPORT_TYPES).map(([id, title]) => ({ id, title, formats: ['pdf', 'csv', 'json'] })));
@@ -26,7 +27,7 @@ router.get('/:type', async (req, res) => {
     return res.status(400).json({ ok: false, error: 'format must be pdf, csv or json' });
   }
   try {
-    const data = await buildAnalytics({ days: req.query.days, tz: req.query.tz });
+    const data = await buildAnalytics({ days: req.query.days, tz: req.query.tz, organizationId: req.organizationId });
     const stamp = new Date().toISOString().slice(0, 10);
     const name = `aiboo-${type}-report-${stamp}`;
     logger.info(`Report ${type}.${format} (${data.days} days) for ${req.user?.email || 'user'}`);

@@ -171,6 +171,8 @@ class Orchestrator:
             remote_url=self.config.get('remote_url'),
             api_key=self.config.get('api_key')
         )
+        if self.dashboard_bridge._tenant_credential:
+            self.queue_manager.set_send_enabled(False)
 
         # ---- Remote command channel (dashboard -> this PC) ----
         self.command_channel = None

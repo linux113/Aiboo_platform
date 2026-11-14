@@ -1,6 +1,6 @@
 // backend/routes/pseudolock.routes.js
 // PseudoLock: pending approvals, multi-step playbooks and playbook runs.
-// Everyone logged in may look; only admin / analyst may approve, run or edit.
+// Entitled workspace members may view; only admin / analyst may approve, run or edit.
 //
 //   GET    /api/pseudolock/catalog                 actions, variables, settings (for the editor)
 //   GET    /api/pseudolock/approvals?status=pending|all|done,...
@@ -27,11 +27,12 @@
 import express from 'express';
 import { getIO } from '../config/socket.js';
 import { protect, authorize } from '../middleware/auth.js';
+import { requireOrganization, requirePlanFeature } from '../middleware/tenant.js';
 import logger from '../utils/logger.js';
 import {
   catalog, listApprovals, pendingCount, createApproval, decideApproval, getApproval,
   listPlaybooks, getPlaybook, savePlaybook, deletePlaybook, startRun, listRuns, getRun, cancelRun,
-  setPseudoLockEmitter, whoIs,
+  setPseudoLockEmitter, whoIs, withResponseOrganization,
 } from '../services/pseudolock.service.js';
 import {
   rulesCatalog, listRules, getRule, saveRule, setRuleEnabled, deleteRule, reorderRules, previewRule, ruleActivity,
@@ -39,9 +40,21 @@ import {
 
 const router = express.Router();
 const editors = authorize('admin', 'analyst');
+router.use(protect, requireOrganization, (req, res, next) => {
+  // Legacy workspace records remain unbound; company data uses its organization id.
+  const organizationId = req.organization?.isLegacy ? null : req.organizationId;
+  return withResponseOrganization(organizationId, next, req.organizationId);
+});
+router.use(requirePlanFeature('responseActions'));
+router.use('/playbooks', requirePlanFeature('playbooks'));
+router.use('/rules', requirePlanFeature('playbooks'));
+router.use('/runs', requirePlanFeature('playbooks'));
 
 setPseudoLockEmitter((ev, data) => {
-  try { getIO().emit(ev, data); } catch { /* socket not started (tests) */ }
+  // Do not broadcast PseudoLock data without an organization binding.
+  try {
+    if (data?.organization) getIO().to(`org:${data.organization}`).emit(ev, data);
+  } catch { /* socket not started (tests) */ }
 });
 
 const handle = (fn) => async (req, res) => {
@@ -52,6 +65,18 @@ const handle = (fn) => async (req, res) => {
     if (status >= 500) logger.error(`PseudoLock ${req.method} ${req.originalUrl}: ${err.stack || err.message}`);
     res.status(status).json({ ok: false, error: status >= 500 ? 'Server error - see backend log' : err.message, ...(err.errors ? { errors: err.errors } : {}) });
   }
+};
+
+// An approval can resume a playbook as well as execute a single response action.
+// Keep action approvals available on responseActions-only plans, but gate both
+// playbook-start and playbook-step approvals on the playbooks entitlement.
+const requirePlaybookApprovalEntitlement = async (req, res, next) => {
+  if (req.organization?.isLegacy) return next();
+  try {
+    const approval = await getApproval(req.params.id);
+    if (!approval || !['playbook_start', 'playbook_step'].includes(approval.kind)) return next();
+    return requirePlanFeature('playbooks')(req, res, next);
+  } catch (err) { return next(err); }
 };
 
 router.get('/catalog', protect, handle(async (req, res) => res.json({ ...catalog(), rules: rulesCatalog() })));
@@ -78,7 +103,7 @@ router.post('/approvals', protect, editors, handle(async (req, res) => {
   } catch (err) { err.status = err.status || 400; throw err; }
   res.status(r.created ? 201 : 200).json(r.approval);
 }));
-router.post('/approvals/:id/approve', protect, editors, handle(async (req, res) => {
+router.post('/approvals/:id/approve', protect, editors, requirePlaybookApprovalEntitlement, handle(async (req, res) => {
   res.json(await decideApproval(req.params.id, 'approve', req.user, req.body?.note));
 }));
 router.post('/approvals/:id/reject', protect, editors, handle(async (req, res) => {

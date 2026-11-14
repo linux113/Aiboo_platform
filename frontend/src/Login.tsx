@@ -1,15 +1,26 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import api, { API } from "./utils/api";
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+type SignupPlan = { code: string; name: string; monthlyAmountPaise: number | null; yearlyAmountPaise: number | null };
+type SignupCheckout = { keyId: string; orderId: string; amount: number; currency: string; plan: string; billingCycle: "monthly" | "yearly" };
+
 export default function Login({
   onLogin,
+  onSignupComplete,
 }: {
   onLogin: (token: string) => void;
+  onSignupComplete: (token: string, checkout: SignupCheckout, mustChangePassword: boolean) => void;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [mode, setMode] = useState<"login" | "signup">("login");
+  const [companyName, setCompanyName] = useState("");
+  const [contactName, setContactName] = useState("");
+  const [billingCycle, setBillingCycle] = useState<"monthly" | "yearly">("monthly");
+  const [planCode, setPlanCode] = useState("basic");
+  const [plans, setPlans] = useState<SignupPlan[]>([]);
   const [showPw, setShowPw] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -17,6 +28,14 @@ export default function Login({
   const cooldownRef = useRef(false);
 
   const validateEmail = useCallback((e: string) => EMAIL_REGEX.test(e), []);
+
+  useEffect(() => {
+    api.get("/billing/plans").then((res) => {
+      const available = (res.data?.plans || []) as SignupPlan[];
+      setPlans(available);
+      if (available.length && !available.some((p) => p.code === planCode)) setPlanCode(available[0].code);
+    }).catch(() => {});
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -27,8 +46,18 @@ export default function Login({
 
     if (!password) return setError("Password is required.");
 
+    if (mode === "signup" && (!companyName.trim() || !contactName.trim())) return setError("Company and contact name are required.");
+
     setLoading(true);
     try {
+      if (mode === "signup") {
+        const res = await api.post("/billing/signup", { companyName, name: contactName, email, password, planCode, billingCycle });
+        const { token, checkout } = res.data || {};
+        if (!token || !checkout?.orderId) return setError("Signup was created, but checkout details were not returned. Sign in and open Billing to continue.");
+        localStorage.setItem("aiboo_must_change_pw", res.data?.mustChangePassword ? "1" : "0");
+        onSignupComplete(token, checkout, Boolean(res.data?.mustChangePassword));
+        return;
+      }
       const res = await api.post("/auth/login", { email, password });
       const { token } = res.data;
       if (!token) return setError("No token received.");
@@ -605,6 +634,16 @@ export default function Login({
             )}
 
             <form onSubmit={handleSubmit} className="space-y-3.5">
+              {mode === "signup" && <>
+                <div>
+                  <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400">Company name</label>
+                  <input value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Your company" required disabled={loading} className="w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none disabled:opacity-50" />
+                </div>
+                <div>
+                  <label className="mb-1.5 block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400">Your name</label>
+                  <input value={contactName} onChange={(e) => setContactName(e.target.value)} placeholder="Workspace administrator" required disabled={loading} className="w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-3.5 py-2.5 text-sm text-slate-100 placeholder:text-slate-600 focus:border-cyan-500/50 focus:outline-none disabled:opacity-50" />
+                </div>
+              </>}
               <div>
                 <label className="block text-[10px] font-semibold uppercase tracking-[0.18em] text-slate-400 mb-1.5">
                   Email Address
@@ -660,9 +699,22 @@ export default function Login({
                 </div>
               </div>
 
+              {mode === "signup" && <div className="grid grid-cols-2 gap-2">
+                <label className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Plan
+                  <select value={planCode} onChange={(e) => setPlanCode(e.target.value)} disabled={loading || plans.length === 0} className="mt-1.5 w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-2.5 py-2.5 text-xs text-slate-100">
+                    {plans.map((plan) => <option key={plan.code} value={plan.code}>{plan.name}{(billingCycle === "monthly" ? plan.monthlyAmountPaise : plan.yearlyAmountPaise) == null ? " · contact sales" : ""}</option>)}
+                  </select>
+                </label>
+                <label className="block text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400">Billing
+                  <select value={billingCycle} onChange={(e) => setBillingCycle(e.target.value as "monthly" | "yearly")} disabled={loading} className="mt-1.5 w-full rounded-lg border border-slate-700/60 bg-slate-900/70 px-2.5 py-2.5 text-xs text-slate-100">
+                    <option value="monthly">Monthly</option><option value="yearly">Yearly</option>
+                  </select>
+                </label>
+              </div>}
+
               <button
                 type="submit"
-                disabled={loading || cooldownRef.current}
+                disabled={loading || cooldownRef.current || (mode === "signup" && (!plans.some((p) => p.code === planCode) || (billingCycle === "monthly" ? plans.find((p) => p.code === planCode)?.monthlyAmountPaise : plans.find((p) => p.code === planCode)?.yearlyAmountPaise) == null))}
                 className="w-full rounded-xl bg-gradient-to-r from-cyan-500 to-emerald-500 py-2.5 text-sm font-bold text-slate-950 shadow-lg hover:from-cyan-400 hover:to-emerald-400 disabled:opacity-60 transition mt-1"
               >
                 {loading ? (
@@ -686,18 +738,21 @@ export default function Login({
                         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                       />
                     </svg>
-                    Authenticating…
+                    {mode === "signup" ? "Preparing secure payment…" : "Authenticating…"}
                   </span>
                 ) : (
-                  "Authenticate & Enter"
+                  mode === "signup" ? "Create workspace & continue to payment" : "Authenticate & Enter"
                 )}
               </button>
             </form>
 
             <p className="mt-4 text-center text-[11px] text-slate-500">
-              No account? An admin can add you in{" "}
-              <b className="text-slate-400">Settings -&gt; Users</b>.
+              {mode === "signup" ? "Already have a workspace?" : "Need a company workspace?"}{" "}
+              <button type="button" onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); }} className="font-semibold text-cyan-300 hover:text-cyan-200">
+                {mode === "signup" ? "Sign in" : "Create company account"}
+              </button>
             </p>
+            {mode === "signup" && <p className="mt-2 text-center text-[10px] leading-4 text-slate-600">No email verification at this stage. Workspace access starts only after payment confirmation.</p>}
           </div>
 
           <div className="mt-4 flex justify-center gap-3 text-[10px] text-slate-700">

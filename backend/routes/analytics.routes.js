@@ -4,14 +4,15 @@
 //   GET /trends?days=30&tz=...              daily alert counts per severity + compliance score per day
 import express from 'express';
 import { protect } from '../middleware/auth.js';
+import { requireOrganization } from '../middleware/tenant.js';
 import { buildAnalytics } from '../services/reportData.js';
 
 const router = express.Router();
-router.use(protect);
+router.use(protect, requireOrganization);
 
 router.get('/overview', async (req, res) => {
   try {
-    const { alerts, ...data } = await buildAnalytics({ days: req.query.days, tz: req.query.tz });
+    const { alerts, ...data } = await buildAnalytics({ days: req.query.days, tz: req.query.tz, organizationId: req.organizationId });
     res.json(data);
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -20,7 +21,7 @@ router.get('/overview', async (req, res) => {
 
 router.get('/trends', async (req, res) => {
   try {
-    const a = await buildAnalytics({ days: req.query.days, tz: req.query.tz });
+    const a = await buildAnalytics({ days: req.query.days, tz: req.query.tz, organizationId: req.organizationId });
     res.json({ days: a.days, tz: a.tz, alerts: a.trend, compliance: a.compliance.trend });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });

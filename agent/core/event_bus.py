@@ -23,6 +23,7 @@ Handler = Callable[[Any], Coroutine[Any, Any, None]]
  
 class EventBus:
     def __init__(self) -> None:
+        self.suspended = False
         self._subscribers: dict[type, list[Handler]] = defaultdict(list)
         # Deduplication cache for ThreatEvents
         self._recent_event_fingerprints = deque(maxlen=1000)
@@ -65,6 +66,8 @@ class EventBus:
         log.debug("Subscribed %s to %s", handler.__qualname__, event_type.__name__)
  
     async def publish(self, event: Any) -> None:
+        if self.suspended:
+            return
         event_type = type(event)
         # Deduplicate ThreatEvents
         if event_type.__name__ == 'ThreatEvent' and self._is_duplicate(event):

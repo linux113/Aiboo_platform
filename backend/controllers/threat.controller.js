@@ -9,7 +9,7 @@ export const getThreats = async (req, res, next) => {
     for (const key of allowedFilters) {
       if (req.query[key]) filter[key] = req.query[key];
     }
-    const result = await listThreats(filter, { page, limit });
+    const result = await listThreats(filter, { page, limit, organizationId: req.organizationId });
     res.json(result);
   } catch (err) { next(err); }
 };
@@ -20,7 +20,7 @@ export const postThreat = async (req, res, next) => {
     if (!severity || !title || !source) {
       return res.status(400).json({ message: 'severity, title, and source are required' });
     }
-    const threat = await createThreat(req.body);
+    const threat = await createThreat(req.body, req.organizationId);
     res.status(201).json(threat);
   } catch (err) { next(err); }
 };
@@ -28,7 +28,7 @@ export const postThreat = async (req, res, next) => {
 export const patchThreat = async (req, res, next) => {
   try {
     if (!req.params.id) return res.status(400).json({ message: 'Threat ID is required' });
-    const threat = await updateThreat(req.params.id, req.body);
+    const threat = await updateThreat(req.params.id, req.body, req.organizationId);
     res.json(threat);
   } catch (err) { next(err); }
 };
@@ -36,7 +36,7 @@ export const patchThreat = async (req, res, next) => {
 export const getThreat = async (req, res, next) => {
   try {
     if (!req.params.id) return res.status(400).json({ message: 'Threat ID is required' });
-    const threat = await getThreatById(req.params.id);
+    const threat = await getThreatById(req.params.id, req.organizationId);
     res.json(threat);
   } catch (err) { next(err); }
 };

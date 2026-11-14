@@ -12,7 +12,10 @@
     "clear-alerts": "node clear-alerts.js",
     "test": "node --test tests/*.test.js",
     "add-user": "node create-user.js",
-    "users": "node create-user.js --list"
+    "users": "node create-user.js --list",
+    "plans:seed": "node seed-plans.js",
+    "bootstrap:super-admin": "node bootstrap-super-admin.js",
+    "tenant:migrate-legacy": "node migrate-legacy-tenant.js"
   },
   "dependencies": {
     "axios": "^1.7.0",

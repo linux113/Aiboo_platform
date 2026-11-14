@@ -11,6 +11,7 @@
 // Everyone logged in can read; only admin / analyst can change alerts.
 import express from 'express';
 import { protect, authorize } from '../middleware/auth.js';
+import { requireOrganization } from '../middleware/tenant.js';
 import {
   listAlerts, getAlert, changeStatus, assign, addNote, storageKind, CLOSE_REASONS,
 } from '../services/alertStore.js';
@@ -26,10 +27,10 @@ const wrap = (fn) => async (req, res) => {
   }
 };
 
-router.use(protect);
+router.use(protect, requireOrganization);
 
 router.get('/', wrap(async (req, res) => {
-  res.json(await listAlerts(req.query));
+  res.json(await listAlerts(req.query, req.organizationId));
 }));
 
 router.get('/meta', (req, res) => {
@@ -44,9 +45,9 @@ router.post('/bulk', canEdit, wrap(async (req, res) => {
   for (const id of ids.map(String)) {
     try {
       let doc;
-      if (action === 'acknowledge') doc = await changeStatus(id, 'acknowledged', req.user, { note });
-      else if (action === 'close') doc = await changeStatus(id, 'closed', req.user, { note, reason });
-      else if (action === 'assign') doc = await assign(id, assignee ?? '', req.user);
+      if (action === 'acknowledge') doc = await changeStatus(id, 'acknowledged', req.user, { note }, req.organizationId);
+      else if (action === 'close') doc = await changeStatus(id, 'closed', req.user, { note, reason }, req.organizationId);
+      else if (action === 'assign') doc = await assign(id, assignee ?? '', req.user, req.organizationId);
       else return res.status(400).json({ ok: false, error: 'action must be acknowledge, close or assign' });
       results.push({ id, ok: true, status: doc.status });
     } catch (err) {
@@ -57,31 +58,31 @@ router.post('/bulk', canEdit, wrap(async (req, res) => {
 }));
 
 router.get('/:id', wrap(async (req, res) => {
-  const a = await getAlert(req.params.id);
+  const a = await getAlert(req.params.id, req.organizationId);
   if (!a) return res.status(404).json({ ok: false, error: 'Alert not found' });
   res.json(a);
 }));
 
 router.post('/:id/acknowledge', canEdit, wrap(async (req, res) => {
-  res.json(await changeStatus(req.params.id, 'acknowledged', req.user, { note: req.body?.note }));
+  res.json(await changeStatus(req.params.id, 'acknowledged', req.user, { note: req.body?.note }, req.organizationId));
 }));
 
 router.post('/:id/assign', canEdit, wrap(async (req, res) => {
   if (typeof req.body?.assignee !== 'string') return res.status(400).json({ ok: false, error: 'assignee (text) is required' });
-  res.json(await assign(req.params.id, req.body.assignee, req.user));
+  res.json(await assign(req.params.id, req.body.assignee, req.user, req.organizationId));
 }));
 
 router.post('/:id/close', canEdit, wrap(async (req, res) => {
   const reason = String(req.body?.reason || 'resolved');
-  res.json(await changeStatus(req.params.id, 'closed', req.user, { note: req.body?.note, reason }));
+  res.json(await changeStatus(req.params.id, 'closed', req.user, { note: req.body?.note, reason }, req.organizationId));
 }));
 
 router.post('/:id/reopen', canEdit, wrap(async (req, res) => {
-  res.json(await changeStatus(req.params.id, 'open', req.user, { note: req.body?.note }));
+  res.json(await changeStatus(req.params.id, 'open', req.user, { note: req.body?.note }, req.organizationId));
 }));
 
 router.post('/:id/notes', canEdit, wrap(async (req, res) => {
-  res.json(await addNote(req.params.id, req.body?.text, req.user));
+  res.json(await addNote(req.params.id, req.body?.text, req.user, req.organizationId));
 }));
 
 export default router;

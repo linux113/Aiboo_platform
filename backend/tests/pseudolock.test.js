@@ -3,6 +3,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 
@@ -12,10 +13,41 @@ process.env.AGENT_API_KEY = 'test-agent-key';
 process.env.APPROVAL_EXPIRY_MINUTES = '30';
 process.env.PLAYBOOK_ACTION_TIMEOUT_SECONDS = '5';
 
+const mongoose = (await import('mongoose')).default;
+const User = (await import('../models/User.js')).default;
+const Organization = (await import('../models/Organization.js')).default;
+const Subscription = (await import('../models/Subscription.js')).default;
+const Plan = (await import('../models/Plan.js')).default;
+const AgentCredential = (await import('../models/AgentCredential.js')).default;
+const LEGACY_ORG = '650000000000000000000004';
+const COMPANY_A = '650000000000000000000014';
+const COMPANY_B = '650000000000000000000015';
+const TENANT_AGENT_SECRET = 'T'.repeat(43);
+const TENANT_AGENT_TOKEN = `aiboo1_keyid123.${TENANT_AGENT_SECRET}`;
 const { default: agentRoutes } = await import('../routes/agent.routes.js');
 const { default: plRoutes } = await import('../routes/pseudolock.routes.js');
 const { useMemoryStore } = await import('../services/alertStore.js');
 const svc = await import('../services/pseudolock.service.js');
+const responseRules = await import('../services/responseRules.service.js');
+Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurable: true, writable: true });
+const queryDoc = (value) => { const q = { select() { return q; }, then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); } }; return q; };
+User.findById = (id) => queryDoc({
+  _id: id, name: String(id), email: `${id}@test`, role: ['admin', 'analyst', 'viewer'].includes(String(id)) ? String(id) : String(id).includes('analyst') ? 'analyst' : 'admin', active: true,
+  organization: String(id).startsWith('tenant-a') ? COMPANY_A : String(id).startsWith('tenant-b') ? COMPANY_B : LEGACY_ORG,
+});
+Organization.findById = (id) => queryDoc(String(id) === LEGACY_ORG
+  ? { _id: LEGACY_ORG, name: 'Internal Legacy Workspace', slug: 'legacy', status: 'legacy', isLegacy: true }
+  : [COMPANY_A, COMPANY_B].includes(String(id))
+    ? { _id: id, name: 'Company', slug: String(id), status: 'active', isLegacy: false, subscriptionExpiresAt: new Date(Date.now() + 86400000) }
+    : null);
+Subscription.findOne = () => queryDoc({ plan: 'test-plan' });
+let companyFeatures = { responseActions: true, playbooks: true };
+Plan.findById = () => queryDoc({ enabled: true, features: companyFeatures });
+AgentCredential.findOne = () => queryDoc({
+  _id: '650000000000000000000016', keyId: 'keyid123', secretHash: crypto.createHash('sha256').update(TENANT_AGENT_SECRET).digest('hex'),
+  organization: COMPANY_A, endpointId: 'tenant-a-pc', platform: 'windows', status: 'active',
+});
+
 
 // ---- fake agent channel: PC "gorilla" is online and answers every command
 const sent = [];
@@ -47,10 +79,16 @@ let server;
 let base;
 const events = [];
 const token = (role, email = `${role}@test`) => jwt.sign({ id: role, role, email, name: role }, 'test-secret');
-const AUTH = { admin: token('admin'), analyst: token('analyst'), viewer: token('viewer'), analyst2: token('analyst', 'second@test') };
-const call = async (method, path, { body, role = 'admin', agent } = {}) => {
+const AUTH = {
+  admin: token('admin'), analyst: token('analyst'), viewer: token('viewer'), analyst2: token('analyst', 'second@test'),
+  tenantA: jwt.sign({ id: 'tenant-a-admin', role: 'admin', email: 'admin@tenant-a.test' }, 'test-secret'),
+  tenantB: jwt.sign({ id: 'tenant-b-admin', role: 'admin', email: 'admin@tenant-b.test' }, 'test-secret'),
+};
+const call = async (method, path, { body, role = 'admin', agent, tenantAgent, authToken } = {}) => {
   const headers = { 'Content-Type': 'application/json' };
-  if (agent) { headers['x-api-key'] = 'test-agent-key'; headers['x-endpoint-id'] = 'gorilla'; } else headers.Authorization = `Bearer ${AUTH[role]}`;
+  if (tenantAgent) { headers['x-api-key'] = TENANT_AGENT_TOKEN; headers['x-endpoint-id'] = 'tenant-a-pc'; }
+  else if (agent) { headers['x-api-key'] = 'test-agent-key'; headers['x-endpoint-id'] = 'gorilla'; }
+  else headers.Authorization = `Bearer ${authToken || AUTH[role]}`;
   const res = await fetch(base + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
   const text = await res.text();
   let data; try { data = JSON.parse(text); } catch { data = text; }
@@ -87,12 +125,184 @@ before(async () => {
 after(async () => { svc.stopPseudoLock(); await new Promise((r) => server.close(r)); });
 
 const settle = (ms = 80) => new Promise((r) => setTimeout(r, ms));
+const processGate = async (decision) => {
+  await responseRules.onTriGateDecision(decision, {});
+  await settle();
+};
+
+test('company approvals, playbooks and runs are tenant-isolated and actions use the tenant queue', async () => {
+  svc.useMemoryResponseStore();
+  sent.length = 0;
+  const approval = await call('POST', '/api/pseudolock/approvals', {
+    authToken: AUTH.tenantA,
+    body: { action: 'block_access', target: '203.0.113.21', endpoint: 'tenant-a-pc', reason: 'test' },
+  });
+  assert.equal(approval.status, 201);
+  assert.equal(approval.data.organization, COMPANY_A);
+  assert.ok(events.some((event) => event.ev === 'approval:new' && event.data.organization === COMPANY_A));
+  assert.equal((await call('GET', '/api/pseudolock/approvals', { authToken: AUTH.tenantB })).data.length, 0);
+  assert.equal((await call('GET', '/api/pseudolock/approvals', { authToken: AUTH.tenantA })).data.length, 1);
+  assert.equal((await call('GET', '/api/pseudolock/approvals', { role: 'admin' })).data.length, 0);
+  assert.equal((await call('POST', `/api/pseudolock/approvals/${approval.data.id}/approve`, {
+    authToken: AUTH.tenantB, body: {},
+  })).status, 404, 'another tenant cannot approve the record');
+  const decision = await call('POST', `/api/pseudolock/approvals/${approval.data.id}/approve`, {
+    authToken: AUTH.tenantA, body: {},
+  });
+  assert.equal(decision.status, 200);
+  assert.equal(decision.data.status, 'running');
+  const { getCommandState, finishCommand } = await import('../services/commandQueue.service.js');
+  const approvalCommand = getCommandState().commandQueue.find((item) => item.organization === COMPANY_A && item.endpoint_id === 'tenant-a-pc' && item.status === 'queued');
+  assert.ok(approvalCommand, 'approved action uses the organization-bound queue');
+  assert.equal(sent.length, 0, 'approved tenant action never uses the legacy socket channel');
+  finishCommand(approvalCommand.cmd_id, 'executed', null, { message: 'test ack' }, COMPANY_A, 'tenant-a-pc');
+  await svc.waitForApprovalExecution(approval.data.id);
+  assert.equal((await call('GET', `/api/pseudolock/approvals/${approval.data.id}`, { authToken: AUTH.tenantA })).data.status, 'done');
+  assert.equal((await call('GET', `/api/pseudolock/approvals/${approval.data.id}`, { authToken: AUTH.tenantB })).status, 404);
+
+  const created = await call('POST', '/api/pseudolock/playbooks', {
+    authToken: AUTH.tenantA,
+    body: { name: 'Tenant action', steps: [{ type: 'action', action: 'block_access', target: '{ip}' }] },
+  });
+  assert.equal(created.status, 201);
+  assert.equal(created.data.organization, COMPANY_A);
+  assert.equal((await call('GET', `/api/pseudolock/playbooks/${created.data.id}`, { authToken: AUTH.tenantB })).status, 404);
+
+  const rule = await call('POST', '/api/pseudolock/rules', {
+    authToken: AUTH.tenantA,
+    body: { name: 'Tenant notification', mode: 'notify', conditions: { verdicts: ['block'] } },
+  });
+  assert.equal(rule.status, 201);
+  assert.equal(rule.data.organization, COMPANY_A);
+  assert.ok(events.some((event) => event.ev === 'rule:updated' && event.data.organization === COMPANY_A));
+  assert.equal((await call('GET', '/api/pseudolock/rules', { authToken: AUTH.tenantB })).data.length, 0);
+  assert.equal((await call('GET', '/api/pseudolock/rules', { authToken: AUTH.tenantA })).data.length, 1);
+
+  const run = await call('POST', `/api/pseudolock/playbooks/${created.data.id}/run`, {
+    authToken: AUTH.tenantA,
+    body: { endpoint: 'tenant-a-pc', vars: { ip: '203.0.113.22' } },
+  });
+  assert.equal(run.status, 202);
+  await settle(40);
+  const queued = getCommandState().commandQueue.find((item) => item.organization === COMPANY_A && item.endpoint_id === 'tenant-a-pc' && item.status === 'queued');
+  assert.ok(queued, 'tenant action was put into its organization-bound REST queue');
+  assert.equal(sent.length, 0, 'tenant action never uses the shared socket channel');
+  assert.equal(finishCommand(queued.cmd_id, 'executed', null, { message: 'test ack' }, COMPANY_A, 'tenant-a-pc')?.status, 'executed');
+  await svc.waitForRun(run.data.id);
+  assert.ok(events.some((event) => event.ev === 'run:updated' && event.data.organization === COMPANY_A));
+  assert.equal((await call('GET', `/api/pseudolock/runs/${run.data.id}`, { authToken: AUTH.tenantB })).status, 404);
+});
+
+test('company response endpoints enforce response-action and playbook entitlements', async () => {
+  companyFeatures = { responseActions: false, playbooks: false };
+  assert.equal((await call('GET', '/api/pseudolock/approvals', { authToken: AUTH.tenantA })).status, 403);
+  companyFeatures = { responseActions: true, playbooks: false };
+  assert.equal((await call('GET', '/api/pseudolock/approvals', { authToken: AUTH.tenantA })).status, 200);
+  assert.equal((await call('GET', '/api/pseudolock/playbooks', { authToken: AUTH.tenantA })).status, 403);
+  assert.equal((await call('GET', '/api/pseudolock/runs', { authToken: AUTH.tenantA })).status, 403);
+  const playbookApproval = await svc.withResponseOrganization(COMPANY_A, () => svc.__saveApprovalForTests({
+    id: 'tenant_playbook_approval', status: 'pending', kind: 'playbook_start', playbookId: 'builtin_safe_test',
+    endpoint: '', vars: {}, expiresAt: new Date(Date.now() + 60000).toISOString(), history: [],
+  }));
+  assert.equal((await call('POST', `/api/pseudolock/approvals/${playbookApproval.id}/approve`, {
+    authToken: AUTH.tenantA, body: {},
+  })).status, 403);
+
+  // A global legacy badge webhook must neither be advertised to nor invoked by a company workspace.
+  const previousBadgeWebhook = process.env.BADGE_WEBHOOK_URL;
+  process.env.BADGE_WEBHOOK_URL = 'http://127.0.0.1:1/legacy-badge-hook';
+  try {
+    const badgeStatus = await call('GET', '/api/agent/playbooks/status', { authToken: AUTH.tenantA });
+    assert.equal(badgeStatus.data.badge.configured, false);
+    const badgeAction = await svc.withResponseOrganization(COMPANY_A, () => svc.executeAction({
+      action: 'freeze_badge', target: 'EMP-1042', by: 'tenant admin',
+    }));
+    assert.equal(badgeAction.ok, false);
+    assert.match(badgeAction.error, /not configured for this company workspace/i);
+  } finally {
+    if (previousBadgeWebhook === undefined) delete process.env.BADGE_WEBHOOK_URL;
+    else process.env.BADGE_WEBHOOK_URL = previousBadgeWebhook;
+  }
+  companyFeatures = { responseActions: true, playbooks: true };
+});
+
+test('tenant agent decisions trigger only entitled, organization-scoped response automation', async () => {
+  svc.useMemoryResponseStore();
+  events.length = 0;
+  sent.length = 0;
+  companyFeatures = { responseActions: true, playbooks: true };
+  const playbook = await call('POST', '/api/pseudolock/playbooks', {
+    authToken: AUTH.tenantA,
+    body: { name: 'Automated tenant response', steps: [{ type: 'action', action: 'block_access', target: '{ip}' }] },
+  });
+  assert.equal(playbook.status, 201);
+  const rule = await call('POST', '/api/pseudolock/rules', {
+    authToken: AUTH.tenantA,
+    body: { name: 'Auto malware response', mode: 'auto', playbookId: playbook.data.id,
+      conditions: { patterns: ['malware'], verdicts: ['block'], minRisk: 0 } },
+  });
+  assert.equal(rule.status, 201);
+
+  const malwareDecision = (eventId, ip) => {
+    const decision = gate(eventId, { auto: false, ip });
+    decision.source = 'tenant-a-pc';
+    decision.metadata.trigate.pattern = 'malware';
+    decision.metadata.trigate.context.pattern = 'malware';
+    return decision;
+  };
+
+  // responseActions without playbooks may create ordinary action approvals,
+  // but must not execute a stored playbook rule.
+  companyFeatures = { responseActions: true, playbooks: false };
+  let response = await call('POST', '/api/agent/gate-decision', {
+    tenantAgent: true, body: malwareDecision('tenant-no-playbooks', '203.0.113.31'),
+  });
+  assert.equal(response.status, 200);
+  await settle(120);
+  let approvals = (await call('GET', '/api/pseudolock/approvals', { authToken: AUTH.tenantA })).data;
+  assert.ok(approvals.some((approval) => approval.alertId === 'tg_tenant-no-playbooks' && approval.origin === 'trigate'));
+  assert.equal((await import('../services/commandQueue.service.js')).getCommandState().commandQueue.some((item) => item.endpoint_id === 'tenant-a-pc' && item.status === 'queued'), false);
+
+  // With both current entitlements, the matching rule starts the playbook and
+  // dispatches only to the REST queue bound to this organization and endpoint.
+  companyFeatures = { responseActions: true, playbooks: true };
+  response = await call('POST', '/api/agent/gate-decision', {
+    tenantAgent: true, body: malwareDecision('tenant-automated', '203.0.113.32'),
+  });
+  assert.equal(response.status, 200);
+  await settle(120);
+  const { getCommandState, finishCommand } = await import('../services/commandQueue.service.js');
+  const queued = getCommandState().commandQueue.find((item) => item.endpoint_id === 'tenant-a-pc' && item.organization === COMPANY_A && item.status === 'queued');
+  assert.ok(queued, 'rule action was queued for the tenant endpoint');
+  assert.equal(sent.length, 0, 'tenant response did not use the shared socket channel');
+  const runs = (await call('GET', '/api/pseudolock/runs', { authToken: AUTH.tenantA })).data;
+  const run = runs.find((candidate) => candidate.ruleId === rule.data.id);
+  assert.ok(run);
+  finishCommand(queued.cmd_id, 'executed', null, { message: 'test ack' }, COMPANY_A, 'tenant-a-pc');
+  await svc.waitForRun(run.id);
+  assert.ok(events.some((event) => event.ev === 'run:updated' && event.data.organization === COMPANY_A));
+  assert.equal((await call('GET', '/api/pseudolock/runs', { authToken: AUTH.tenantB })).data.length, 0);
+  const tenantActivity = (await call('GET', `/api/pseudolock/rules/activity?ruleId=${rule.data.id}`, { authToken: AUTH.tenantA })).data;
+  const otherActivity = (await call('GET', `/api/pseudolock/rules/activity?ruleId=${rule.data.id}`, { authToken: AUTH.tenantB })).data;
+  assert.ok(tenantActivity.length > 0);
+  assert.ok(tenantActivity.every((item) => item.organization === COMPANY_A));
+  assert.equal(otherActivity.length, 0);
+
+  // Without responseActions, even default recommendation approvals are skipped.
+  companyFeatures = { responseActions: false, playbooks: true };
+  response = await call('POST', '/api/agent/gate-decision', {
+    tenantAgent: true, body: gate('tenant-no-responses', { auto: false, ip: '203.0.113.33', pattern: 'brute_force' }),
+  });
+  assert.equal(response.status, 200);
+  await settle(80);
+  companyFeatures = { responseActions: true, playbooks: true };
+  approvals = (await call('GET', '/api/pseudolock/approvals', { authToken: AUTH.tenantA })).data;
+  assert.equal(approvals.some((approval) => approval.alertId === 'tg_tenant-no-responses'), false);
+});
 
 test('TriGate BLOCK with auto_response OFF creates pending approvals (no duplicates)', async () => {
-  let r = await call('POST', '/api/agent/gate-decision', { agent: true, body: gate('ev1', { auto: false }) });
-  assert.equal(r.status, 200);
-  await settle();
-  r = await call('GET', '/api/pseudolock/approvals?status=pending');
+  await processGate(gate('ev1', { auto: false }));
+  let r = await call('GET', '/api/pseudolock/approvals?status=pending');
   assert.equal(r.data.length, 2, 'block IP + restrict account (isolate without IP and notify are skipped)');
   const block = r.data.find((a) => a.action === 'block_access');
   assert.equal(block.target, '45.95.147.3');
@@ -103,21 +313,25 @@ test('TriGate BLOCK with auto_response OFF creates pending approvals (no duplica
   assert.equal(r.data.find((a) => a.action === 'restrict_identity').params.minutes, 30);
 
   // same attack again -> counted, not duplicated
-  await call('POST', '/api/agent/gate-decision', { agent: true, body: gate('ev2', { auto: false }) });
-  await settle();
+  await processGate(gate('ev2', { auto: false }));
   r = await call('GET', '/api/pseudolock/approvals?status=pending');
   assert.equal(r.data.length, 2);
   assert.equal(r.data.find((a) => a.action === 'block_access').occurrences, 2);
+  assert.equal((await call('GET', '/api/pseudolock/approvals/count')).data.pending, 2);
+
+  // The shared legacy API key is not organization-bound. Its gate events must
+  // not invoke the global response-rules / approval engine.
+  await call('POST', '/api/agent/gate-decision', { agent: true, body: gate('unbound', { auto: false }) });
+  await settle();
   assert.equal((await call('GET', '/api/pseudolock/approvals/count')).data.pending, 2);
   assert.ok(events.some((e) => e.ev === 'approval:new'));
 });
 
 test('no approval when the agent already acted (auto_response ON), for HOLD, or for old replayed decisions', async () => {
   const before = (await call('GET', '/api/pseudolock/approvals?status=pending')).data.length;
-  await call('POST', '/api/agent/gate-decision', { agent: true, body: gate('ev3', { auto: true, ip: '45.95.147.4' }) });
-  await call('POST', '/api/agent/gate-decision', { agent: true, body: gate('ev4', { verdict: 'HOLD', ip: '45.95.147.5' }) });
-  await call('POST', '/api/agent/gate-decision', { agent: true, body: gate('ev5', { ip: '45.95.147.6', ts: new Date(Date.now() - 2 * 3600e3).toISOString() }) });
-  await settle();
+  await processGate(gate('ev3', { auto: true, ip: '45.95.147.4' }));
+  await processGate(gate('ev4', { verdict: 'HOLD', ip: '45.95.147.5' }));
+  await processGate(gate('ev5', { ip: '45.95.147.6', ts: new Date(Date.now() - 2 * 3600e3).toISOString() }));
   assert.equal((await call('GET', '/api/pseudolock/approvals?status=pending')).data.length, before);
 });
 

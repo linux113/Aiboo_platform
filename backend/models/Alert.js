@@ -23,7 +23,8 @@ const historySchema = new mongoose.Schema(
 
 const alertSchema = new mongoose.Schema(
   {
-    alertId: { type: String, required: true, unique: true, index: true },
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
+    alertId: { type: String, required: true },
     kind: { type: String, enum: ['trigate', 'finding', 'incident'], required: true, index: true },
     source: { type: String, default: 'unknown', index: true }, // endpoint
     title: { type: String, default: '' },
@@ -59,6 +60,7 @@ const alertSchema = new mongoose.Schema(
   { timestamps: true, minimize: false }
 );
 
+alertSchema.index({ organization: 1, alertId: 1 }, { unique: true, name: 'organization_1_alertId_1' });
 alertSchema.index({ status: 1, severity: 1, lastSeen: -1 });
 
 export default mongoose.models.Alert || mongoose.model('Alert', alertSchema);

@@ -6,6 +6,7 @@ import mongoose from 'mongoose';
 
 const complianceSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     endpoint: { type: String, required: true, index: true },
     checkedAt: { type: Date, default: Date.now, index: true },
     score: { type: Number, default: null },

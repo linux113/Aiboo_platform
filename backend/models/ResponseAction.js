@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const responseActionSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     type: { type: String, enum: ['isolate', 'block', 'lock', 'escalate', 'auto'], required: true },
     target: { type: String, required: true },
     triggeredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },

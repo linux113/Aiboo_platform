@@ -180,6 +180,11 @@ class OfflineQueueManager:
         self._retry_thread.start()
         log.info("Offline retry worker started (target URL: %s)", remote_url)
 
+    def set_send_enabled(self, enabled: bool):
+        """Pause/resume network delivery without deleting queued reports."""
+        self.send_enabled = bool(enabled)
+        self._wake.set()
+
     def stop_retry(self):
         """Stop the retry worker gracefully."""
         self._running = False
@@ -202,7 +207,7 @@ class OfflineQueueManager:
                 if pending:
                     log.info("Retry worker: %d pending alert(s) to send", len(pending))
                     for alert_id, payload_str in pending:
-                        if not self._running:
+                        if not self._running or not self.send_enabled:
                             break
                         try:
                             wrapped = json.loads(payload_str)

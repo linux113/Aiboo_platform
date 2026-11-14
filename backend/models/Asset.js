@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const assetSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     name: { type: String, required: true },
     ip: { type: String },
     zone: { type: String },

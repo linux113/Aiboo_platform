@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const cameraSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     name: { type: String, required: true },
     streamUrl: { type: String, required: true }, // RTSP / IP / HTTP
     location: { type: String, default: '' },

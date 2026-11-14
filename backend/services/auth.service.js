@@ -1,4 +1,7 @@
 import User from '../models/User.js';
+import Organization from '../models/Organization.js';
+import Subscription from '../models/Subscription.js';
+import Plan from '../models/Plan.js';
 import jwt from 'jsonwebtoken';
 import { forgetUser } from '../middleware/auth.js';
 import { isDefaultPassword, validateNewPassword } from '../utils/passwords.js';
@@ -7,7 +10,7 @@ export const ROLES = ['admin', 'analyst', 'viewer'];
 
 const signToken = (user) =>
   jwt.sign(
-    { id: user._id, role: user.role, email: user.email, name: user.name },
+    { id: user._id, role: user.role, email: user.email, name: user.name, organization: user.organization ? String(user.organization) : null },
     process.env.JWT_SECRET,
     { expiresIn: '7d' }
   );
@@ -17,6 +20,7 @@ const publicUser = (user) => ({
   name: user.name,
   email: user.email,
   role: user.role,
+  organization: user.organization ? String(user.organization) : null,
   active: user.active !== false,
   lastLogin: user.lastLogin || null,
   createdAt: user.createdAt || null,
@@ -30,6 +34,29 @@ const checkRole = (role) => {
 };
 
 const cleanEmail = (email) => String(email || '').trim().toLowerCase();
+
+const ensureUserSeatAvailable = async (organizationId, excludeUserId = null) => {
+  if (!organizationId) return;
+  const organization = await Organization.findById(organizationId).select('isLegacy');
+  if (!organization) throw { statusCode: 403, message: 'Company workspace not found' };
+  if (organization.isLegacy) return;
+  const now = new Date();
+  const subscription = await Subscription.findOne({
+    organization: organizationId,
+    status: 'active',
+    currentPeriodStart: { $lte: now },
+    currentPeriodEnd: { $gt: now },
+  }).sort({ currentPeriodEnd: -1 });
+  if (!subscription) throw { statusCode: 402, message: 'An active subscription is required to add users' };
+  const plan = await Plan.findById(subscription.plan).select('limits enabled');
+  if (!plan || plan.enabled === false) throw { statusCode: 402, message: 'The company subscription plan is unavailable' };
+  if (plan.limits?.users == null) return;
+  const limit = Number(plan.limits.users);
+  if (!Number.isFinite(limit)) return;
+  const query = { organization: organizationId, active: { $ne: false }, ...(excludeUserId ? { _id: { $ne: excludeUserId } } : {}) };
+  const seats = await User.countDocuments(query);
+  if (seats >= limit) throw { statusCode: 409, message: `User limit reached for this subscription plan (${limit} seats)` };
+};
 
 // A user is created by an admin (dashboard -> Settings -> Users, or
 // `npm run add-user`). There is no public self-registration: before, anyone who
@@ -47,7 +74,11 @@ export const register = async ({ name, email, password, role }, actor = null) =>
   }
   const existing = await User.findOne({ email: mail });
   if (existing) throw { statusCode: 400, message: 'That email already has an account' };
-  const user = await User.create({ name: String(name).trim(), email: mail, password, role: wanted });
+  if (actor?.organization) await ensureUserSeatAvailable(actor.organization);
+  const user = await User.create({
+    name: String(name).trim(), email: mail, password, role: wanted,
+    organization: actor?.organization || null,
+  });
   const token = signToken(user);
   return { token, user: publicUser(user) };
 };
@@ -92,6 +123,7 @@ export const getMe = async (userId) => {
   if (!user) throw { statusCode: 404, message: 'User not found' };
   return {
     id: user._id, name: user.name, email: user.email, role: user.role,
+    organization: user.organization ? String(user.organization) : null,
     active: user.active !== false, lastLogin: user.lastLogin || null,
   };
 };
@@ -99,25 +131,31 @@ export const getMe = async (userId) => {
 // ---------------------------------------------------------------- user admin
 // Everything below is admin-only (enforced again by the route).
 
-export const listUsers = async () => {
-  const users = await User.find().select('-password').sort({ createdAt: 1 });
+export const listUsers = async (organizationId = null) => {
+  const filter = organizationId ? { organization: organizationId } : {};
+  const users = await User.find(filter).select('-password').sort({ createdAt: 1 });
   return users.map(publicUser);
 };
 
-const activeAdmins = async (excludeId = null) => {
-  const admins = await User.find({ role: 'admin' });
+const activeAdmins = async (excludeId = null, organizationId = null) => {
+  const filter = { role: 'admin' };
+  if (organizationId) filter.organization = organizationId;
+  const admins = await User.find(filter);
   return admins.filter((u) => u.active !== false && String(u._id) !== String(excludeId || ''));
 };
 
 export const updateUser = async (id, patch = {}, actor = null) => {
-  const user = await User.findById(id);
+  const filter = { _id: id };
+  if (actor?.organization) filter.organization = actor.organization;
+  const user = await User.findOne(filter);
   if (!user) throw { statusCode: 404, message: 'User not found' };
   const self = actor && String(actor.id || '') === String(user._id);
+  const organizationId = actor?.organization || null;
 
   if (patch.role !== undefined) {
     const wanted = checkRole(patch.role);
     if (self) throw { statusCode: 400, message: 'You cannot change your own role' };
-    if (user.role === 'admin' && wanted !== 'admin' && (await activeAdmins(user._id)).length === 0) {
+    if (user.role === 'admin' && wanted !== 'admin' && (await activeAdmins(user._id, organizationId)).length === 0) {
       throw { statusCode: 400, message: 'This is the last admin - make someone else an admin first' };
     }
     user.role = wanted;
@@ -126,7 +164,8 @@ export const updateUser = async (id, patch = {}, actor = null) => {
   if (patch.active !== undefined) {
     const on = Boolean(patch.active);
     if (self && !on) throw { statusCode: 400, message: 'You cannot disable your own account' };
-    if (!on && user.role === 'admin' && (await activeAdmins(user._id)).length === 0) {
+    if (on && user.active === false) await ensureUserSeatAvailable(organizationId, user._id);
+    if (!on && user.role === 'admin' && (await activeAdmins(user._id, organizationId)).length === 0) {
       throw { statusCode: 400, message: 'This is the last admin - create another admin first' };
     }
     user.active = on;

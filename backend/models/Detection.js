@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const detectionSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     cameraId: { type: mongoose.Schema.Types.Mixed, required: true }, // ObjectId for DB cameras, string for CV-only (webcam)
     cameraName: { type: String },
     location: { type: String },

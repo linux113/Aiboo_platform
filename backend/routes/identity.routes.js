@@ -5,11 +5,13 @@ import {
   patchIdentity,
 } from '../controllers/identity.controller.js';
 import { protect, authorize } from '../middleware/auth.js';
+import { requireOrganization } from '../middleware/tenant.js';
 
 const router = express.Router();
+router.use(protect, requireOrganization);
 
-router.get('/', protect, getIdentities);
-router.get('/:id', protect, getIdentityById);
-router.patch('/:id', protect, authorize('admin', 'analyst'), patchIdentity);
+router.get('/', getIdentities);
+router.get('/:id', getIdentityById);
+router.patch('/:id', authorize('admin', 'analyst'), patchIdentity);
 
 export default router;

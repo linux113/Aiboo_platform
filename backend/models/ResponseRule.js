@@ -6,6 +6,7 @@ import mongoose from 'mongoose';
 
 const schema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     id: { type: String, required: true, unique: true },
     status: { type: String, index: true },
   },

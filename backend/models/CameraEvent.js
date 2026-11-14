@@ -6,6 +6,7 @@ import mongoose from 'mongoose';
 
 const cameraEventSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     cameraId: { type: String, required: true },
     location: { type: String },
     eventType: { type: String, enum: ['person', 'breach', 'motion'], required: true },

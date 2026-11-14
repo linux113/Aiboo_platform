@@ -31,6 +31,9 @@ import analyticsRoutes from './routes/analytics.routes.js';
 import reportRoutes from './routes/report.routes.js';
 import pseudolockRoutes from './routes/pseudolock.routes.js';
 import userRoutes from './routes/user.routes.js';
+import billingRoutes from './routes/billing.routes.js';
+import platformRoutes from './routes/platform.routes.js';
+import agentCredentialRoutes from './routes/agentCredential.routes.js';
 import { initPseudoLock } from './services/pseudolock.service.js';
 
 // ❌ Outbound WebSocket import removed – agents push via HTTP.
@@ -52,9 +55,12 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'"],
+      scriptSrc: ["'self'", 'https://checkout.razorpay.com'],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      imgSrc: ["'self'", 'data:', 'blob:'],
+      imgSrc: ["'self'", 'data:', 'blob:', 'https://*.razorpay.com'],
+      connectSrc: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
+      frameSrc: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com', 'https://*.razorpay.com'],
+      formAction: ["'self'", 'https://api.razorpay.com', 'https://checkout.razorpay.com'],
     },
   },
 }));
@@ -67,7 +73,12 @@ app.use(cors({
   credentials: true,
 }));
 app.use(hpp());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({
+  limit: '5mb',
+  verify: (req, _res, buffer) => {
+    if (req.originalUrl.startsWith('/api/billing/webhooks/razorpay')) req.rawBody = Buffer.from(buffer);
+  },
+}));
 
 app.use((req, res, next) => {
   logger.info(`${req.method} ${req.originalUrl}`);
@@ -93,7 +104,10 @@ app.use('/api/reports', apiLimiter, reportRoutes);       // Risk / compliance / 
 app.use('/api/pseudolock', apiLimiter, pseudolockRoutes); // Approvals, multi-step playbooks, runs
 
 // ✅ Agent routes now use agentLimiter (more permissive)
-app.use('/api/users', authLimiter, userRoutes);          // Admin only: who can log in
+app.use('/api/users', authLimiter, userRoutes);          // Company-scoped admin: who can log in
+app.use('/api/billing', apiLimiter, billingRoutes);      // Workspace subscriptions and Razorpay payment
+app.use('/api/platform', apiLimiter, platformRoutes);    // Super Admin-only platform controls
+app.use('/api/agent-credentials', apiLimiter, agentCredentialRoutes); // Admin-only one-time endpoint keys
 app.use('/api/agent', agentLimiter, agentRoutes);
 
 // ---- 404 & error handling ----
@@ -112,8 +126,11 @@ socketHandler(io);
 const agentChannel = registerAgentChannel(io);
 app.set('agentChannel', agentChannel);
 logger.info('Agent command channel registered on /agent-channel namespace');
-// PseudoLock approvals + playbooks send actions through the same channel
-initPseudoLock({ agentChannel, emitter: (ev, data) => io.emit(ev, data) });
+// PseudoLock keeps legacy socket dispatch separate from tenant-bound REST dispatch.
+initPseudoLock({ agentChannel, emitter: (ev, data) => {
+  // Only emit records that carry an organization binding, to that workspace's room.
+  if (data?.organization) io.to(`org:${data.organization}`).emit(ev, data);
+} });
 
 // ❌ Outbound WebSocket connection to agent is completely removed.
 // Remote agents push findings via HTTP POST to /api/agent/findings.

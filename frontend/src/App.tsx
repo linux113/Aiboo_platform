@@ -16,6 +16,8 @@ import EndpointsList from "./components/EndpointsList";
 const ExecutiveModule = lazy(() => import("./components/ExecutiveModule"));
 import AlertsModule from "./components/AlertsModule";
 import ReportsModule from "./components/ReportsModule";
+import BillingModule from "./components/BillingModule";
+import PlatformAdmin from "./components/PlatformAdmin";
 import ResponseModule from "./components/ResponseModule";
 import type { Camera, Detection, Threat, AgentFinding, CorrelatedAlert, GateDecision, PseudoLock, Notification, NavId, SearchResult, ActionRecord } from "./types";
 
@@ -103,7 +105,9 @@ export default function App() {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [userName, setUserName] = useState("Akshay Upadhyay");
   const [userEmail, setUserEmail] = useState("admin@example.com");
-  const [userRole, setUserRole] = useState("Admin");
+  const [userRole, setUserRole] = useState(() => parseToken(getToken())?.role || "admin");
+  const [billingOpen, setBillingOpen] = useState(false);
+  const [billingSummary, setBillingSummary] = useState<any>(null);
   const [mustChangePw, setMustChangePw] = useState(() => localStorage.getItem("aiboo_must_change_pw") === "1");
   const socketRef = useRef<Socket | null>(null);
   const [connected, setConnected] = useState(false);
@@ -279,6 +283,11 @@ export default function App() {
       );
     }
   }, []);
+
+  useEffect(() => {
+    if (!token) { setBillingSummary(null); return; }
+    api.get("/billing").then((res) => setBillingSummary(res.data)).catch(() => setBillingSummary(null));
+  }, [token, billingOpen]);
 
   // ---- Main effect: socket + initial fetch ----
   useEffect(() => {
@@ -560,6 +569,7 @@ export default function App() {
     if (t && t !== "undefined") {
       storeToken(t);
       setTokenState(t);
+      setUserRole(parseToken(t)?.role || "admin");
       setMustChangePw(localStorage.getItem("aiboo_must_change_pw") === "1");
     }
   };
@@ -572,7 +582,12 @@ export default function App() {
     setTokenState(null);
   };
 
-  if (!token) return <Login onLogin={handleLogin} />;
+  if (!token) return <Login onLogin={handleLogin} onSignupComplete={(t, _checkout, mustChange) => {
+    if (mustChange) localStorage.setItem("aiboo_must_change_pw", "1");
+    handleLogin(t);
+    setBillingOpen(true);
+  }} />;
+  if (String(userRole).toLowerCase() === "super_admin") return <PlatformAdmin name={userName} onLogout={handleLogout} />;
 
   return (
     <div className="flex min-h-screen flex-col bg-[#020617] text-slate-50">
@@ -583,6 +598,7 @@ export default function App() {
         onReadNotif={(id) => setNotifications(p => p.map(n => n.id === id ? { ...n, read: true } : n))}
         onClearNotifs={() => setNotifications([])}
         onLogout={handleLogout}
+        onOpenBilling={() => setBillingOpen(true)}
         userName={userName}
         searchState={searchState}
         onSearchNav={(nav) => setActive(nav)}
@@ -592,6 +608,12 @@ export default function App() {
       <main className="relative flex-1 overflow-hidden bg-gradient-to-br from-[#020617] via-slate-950 to-slate-950/90" style={{ height: "calc(100vh - 56px)" }}>
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top,_rgba(34,211,238,0.08),transparent_60%),radial-gradient(circle_at_bottom,_rgba(15,118,110,0.15),transparent_60%)] opacity-80" />
         <div className="relative z-10 flex h-full flex-col">
+          {active === "dashboard" && billingSummary?.access && billingSummary?.subscription?.daysRemaining >= 0 && billingSummary.subscription.daysRemaining <= 7 && (
+            <div className="mx-5 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-xs text-amber-100 flex-shrink-0">
+              <span>Subscription expires in <b>{billingSummary.subscription.daysRemaining} day{billingSummary.subscription.daysRemaining === 1 ? "" : "s"}</b> ({new Date(billingSummary.subscription.currentPeriodEnd).toLocaleDateString()}). Renew to keep monitoring active.</span>
+              <button onClick={() => setBillingOpen(true)} className="rounded-lg border border-amber-300/40 bg-amber-400/10 px-3 py-1 font-semibold hover:bg-amber-400/20">Open Billing</button>
+            </div>
+          )}
           {mustChangePw && (
             <div className="mx-5 mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-2 text-xs text-red-200 flex-shrink-0">
               <span>⚠️ You are logged in with a <b>default password</b>. Anyone who knows it can log in. Please change it now.</span>
@@ -662,6 +684,7 @@ export default function App() {
                   <EndpointsList
                     onSelectEndpoint={setSelectedEndpoint}
                     selectedEndpoint={selectedEndpoint}
+                    isAdmin={String(userRole).toLowerCase() === "admin"}
                   />
                 )}
                 {active === "settings" && (
@@ -685,6 +708,7 @@ export default function App() {
       <nav className="md:hidden fixed inset-x-0 bottom-0 z-30 flex h-12 items-center justify-around border-t border-slate-800/80 bg-black/90 backdrop-blur">
         {NAV.map(n => <button key={n.id} onClick={() => setActive(n.id)} className={cn("flex flex-1 flex-col items-center gap-0.5 py-2 text-[9px]", active === n.id ? "text-cyan-300" : "text-slate-500")}><span>{n.icon}</span>{n.label.split(" ")[0]}</button>)}
       </nav>
+      {billingOpen && <BillingModule onClose={() => setBillingOpen(false)} isAdmin={String(userRole).toLowerCase() === "admin"} onUpdated={setBillingSummary} />}
     </div>
   );
 }

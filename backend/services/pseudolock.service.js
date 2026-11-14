@@ -13,10 +13,12 @@
 //      Built-in templates are read-only (copy them to change them).
 //   3. RUNS       - one execution of a playbook, with a status per step.
 //
-// Actions are sent to the agent over the command channel (sockets/agentChannel.js)
-// and we wait for the agent's "executed" / "failed" answer.
+// Legacy actions use the shared Socket.IO channel; company actions use the
+// organization- and endpoint-bound REST command queue. Both wait for an agent's
+// "executed" / "failed" answer.
 // Storage: MongoDB when connected, otherwise memory (same as alertStore.js).
 import net from 'node:net';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import mongoose from 'mongoose';
 import ApprovalModel from '../models/Approval.js';
 import PlaybookModel from '../models/Playbook.js';
@@ -71,7 +73,7 @@ export const ACTIONS = {
   step_up_auth: { label: 'Lock the screen (sign in again)', target: 'user', help: 'Locks the Windows screen; the user must type the password again.' },
   terminate_process: { label: 'Stop a program', target: 'process', help: 'Kills the process (by PID or name).' },
   pseudo_lock: { label: 'Open decoy port (Lock Perimeter)', target: 'label', help: 'Opens a honeypot port on the PC and logs who connects.' },
-  freeze_badge: { label: 'Freeze door badge', target: 'badge', agent: false, help: 'Asks the badge system to block this badge (needs BADGE_WEBHOOK_URL).' },
+  freeze_badge: { label: 'Freeze door badge', target: 'badge', agent: false, help: 'Legacy-workspace webhook only; company workspace integrations are not configured.' },
 };
 // TriGate BLOCK recommendations that become approval requests (same set the
 // agent would run itself with auto_response = true, minus "notify").
@@ -149,22 +151,60 @@ export const catalog = () => ({
   maxSteps: MAX_STEPS,
 });
 
+// Request/automation context scopes every storage operation and emitted event.
+const responseContext = new AsyncLocalStorage();
+const currentScope = () => responseContext.getStore() || null;
+export const getResponseOrganizationId = () => currentScope()?.organizationId || null;
+export const getResponseAlertOrganizationId = () => currentScope()?.alertOrganizationId || null;
+export const isLegacyResponseScope = () => Boolean(currentScope()?.scoped && !currentScope()?.organizationId);
+export const withResponseOrganization = (organizationId, callback, alertOrganizationId = organizationId) => responseContext.run({
+  scoped: true,
+  organizationId: organizationId ? String(organizationId) : null,
+  alertOrganizationId: alertOrganizationId ? String(alertOrganizationId) : null,
+}, callback);
+
+const organizationKey = (organization) => String(organization || '');
+const rowKey = (id, organization) => `${organizationKey(organization)}:${id}`;
+const scopedOrganization = () => {
+  const scope = currentScope();
+  return scope?.scoped ? scope.organizationId : undefined;
+};
+const belongsToScope = (row) => {
+  const organization = scopedOrganization();
+  return organization === undefined || organizationKey(row.organization) === organizationKey(organization);
+};
+
 // ------------------------------------------------------------------ storage
 class MemoryCol {
   constructor(max) { this.max = max; this.rows = new Map(); }
-  async get(id) { const r = this.rows.get(id); return r ? clone(r) : null; }
+  async get(id) {
+    const organization = scopedOrganization();
+    const row = organization === undefined
+      ? [...this.rows.values()].find((r) => r.id === id)
+      : this.rows.get(rowKey(id, organization));
+    return row ? clone(row) : null;
+  }
   async save(doc) {
-    const prev = this.rows.get(doc.id);
-    const full = { ...clone(doc), createdAt: prev?.createdAt || doc.createdAt || nowIso(), updatedAt: nowIso() };
-    this.rows.delete(doc.id);
-    this.rows.set(doc.id, full);
+    const scope = currentScope();
+    const organization = scope?.scoped ? scope.organizationId : (doc.organization || null);
+    const key = rowKey(doc.id, organization);
+    const prev = this.rows.get(key);
+    const full = { ...clone(doc), organization, createdAt: prev?.createdAt || doc.createdAt || nowIso(), updatedAt: nowIso() };
+    this.rows.delete(key);
+    this.rows.set(key, full);
     while (this.rows.size > this.max) this.rows.delete(this.rows.keys().next().value);
     return clone(full);
   }
-  async remove(id) { return this.rows.delete(id); }
+  async remove(id) {
+    const organization = scopedOrganization();
+    if (organization !== undefined) return this.rows.delete(rowKey(id, organization));
+    let removed = false;
+    for (const [key, row] of this.rows) if (row.id === id) { this.rows.delete(key); removed = true; }
+    return removed;
+  }
   async list({ status, limit = 200 } = {}) {
     const st = status ? new Set([].concat(status)) : null;
-    return [...this.rows.values()].filter((r) => !st || st.has(r.status))
+    return [...this.rows.values()].filter((r) => belongsToScope(r) && (!st || st.has(r.status)))
       .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, limit).map(clone);
   }
   async count({ status } = {}) { return (await this.list({ status, limit: Infinity })).length; }
@@ -178,18 +218,24 @@ class MongoCol {
     return { ...rest, createdAt: d.createdAt ? new Date(d.createdAt).toISOString() : undefined,
       updatedAt: d.updatedAt ? new Date(d.updatedAt).toISOString() : undefined };
   }
-  async get(id) { return MongoCol.strip(await this.Model.findOne({ id }).lean()); }
+  scopeQuery() {
+    const organization = scopedOrganization();
+    return organization === undefined ? {} : { organization: organization || null };
+  }
+  async get(id) { return MongoCol.strip(await this.Model.findOne({ id, ...this.scopeQuery() }).lean()); }
   async save(doc) {
+    const scope = currentScope();
     const { _id, __v, createdAt, updatedAt, ...set } = clone(doc);
-    const r = await this.Model.findOneAndUpdate({ id: doc.id }, { $set: set }, { upsert: true, new: true, lean: true });
+    if (scope?.scoped) set.organization = scope.organizationId;
+    const r = await this.Model.findOneAndUpdate({ id: doc.id, ...this.scopeQuery() }, { $set: set }, { upsert: true, new: true, lean: true });
     return MongoCol.strip(r);
   }
-  async remove(id) { return (await this.Model.deleteOne({ id })).deletedCount > 0; }
+  async remove(id) { return (await this.Model.deleteOne({ id, ...this.scopeQuery() })).deletedCount > 0; }
   async list({ status, limit = 200 } = {}) {
-    const q = status ? { status: { $in: [].concat(status) } } : {};
+    const q = { ...this.scopeQuery(), ...(status ? { status: { $in: [].concat(status) } } : {}) };
     return (await this.Model.find(q).sort({ createdAt: -1 }).limit(limit).lean()).map(MongoCol.strip);
   }
-  async count({ status } = {}) { return this.Model.countDocuments(status ? { status: { $in: [].concat(status) } } : {}); }
+  async count({ status } = {}) { return this.Model.countDocuments({ ...this.scopeQuery(), ...(status ? { status: { $in: [].concat(status) } } : {}) }); }
 }
 
 const memory = {
@@ -215,7 +261,15 @@ let sweeper = null;
 const ackWaiters = new Map(); // cmd_id -> resolve(ack)
 
 export function setPseudoLockEmitter(fn) { emitFn = typeof fn === 'function' ? fn : () => {}; }
-export const emit = (ev, data) => { try { emitFn(ev, data); } catch (err) { logger.error(`PseudoLock emit ${ev}: ${err.message}`); } };
+export const emit = (ev, data) => {
+  try {
+    const scope = currentScope();
+    const payload = scope?.scoped && scope.organizationId
+      ? { ...data, organization: scope.organizationId }
+      : data;
+    emitFn(ev, payload);
+  } catch (err) { logger.error(`PseudoLock emit ${ev}: ${err.message}`); }
+};
 
 /** Called once from server.js (and by tests with a fake channel). */
 export function initPseudoLock({ agentChannel, emitter, sweepSeconds = 15 } = {}) {
@@ -250,17 +304,25 @@ export async function executeAction({ endpoint, action, target, params = {}, by 
   const def = ACTIONS[action];
   if (!def) return { ok: false, status: 'failed', error: `Unknown action ${action}` };
   if (def.agent === false) {
+    // BADGE_WEBHOOK_URL is a single legacy integration, not tenant-scoped.
+    // Never let a company playbook send badge data through that shared hook.
+    if (currentScope()?.scoped && currentScope()?.organizationId) {
+      return { ok: false, status: 'failed', error: 'Badge actions are not configured for this company workspace' };
+    }
     const out = await freezeBadge({ badgeId: target, reason, by });
     return { ok: out.ok, status: out.ok ? 'executed' : 'failed', error: out.ok ? null : out.error, result: { message: out.message || out.error } };
   }
   if (!endpoint) return { ok: false, status: 'failed', error: 'No PC (endpoint) chosen for this action' };
-  // Windows agents live on the socket channel; Linux agents poll the REST queue.
-  const sent = channel ? channel.dispatch(String(endpoint), action, String(target ?? ''), params) : { ok: false };
+  // Legacy endpoints use the shared Windows socket channel. Company endpoints
+  // must use the tenant-bound REST queue for both Windows and Linux agents.
+  const organizationId = getResponseOrganizationId();
+  const tenantScoped = Boolean(currentScope()?.scoped && organizationId);
+  const sent = !tenantScoped && channel ? channel.dispatch(String(endpoint), action, String(target ?? ''), params) : { ok: false };
   if (!sent?.ok) {
     // Windows agents answer on the socket. A Linux agent has no socket.io - it
     // polls /api/agent/commands/pending, so queue the command for it instead.
     const queued = queueCommand(String(endpoint), action, String(target ?? ''), params,
-                                { requested_by: by, reason: reason ? String(reason).slice(0, 200) : '' });
+                                { ...(tenantScoped ? { organization: organizationId } : {}), requested_by: by, reason: reason ? String(reason).slice(0, 200) : '' });
     if (!queued.ok) {
       return { ok: false, status: 'failed',
                error: `PC '${endpoint}' is not connected - start the agent on that PC and try again` };
@@ -731,7 +793,7 @@ export async function startRun(playbookId, { endpoint = '', vars = {}, alertId =
   if (pb.enabled === false) throw httpError(400, 'This playbook is switched off - edit it and tick "Enabled"');
   const pc = clip(endpoint, 120).trim();
   if (pb.needsPc && !pc) throw httpError(400, 'Choose the PC (endpoint) to run this playbook on');
-  if (pb.needsPc && channel && !channel.isOnline?.(pc)) throw httpError(409, `PC '${pc}' is not connected - start the agent on that PC first`);
+  if (pb.needsPc && !getResponseOrganizationId() && channel && !channel.isOnline?.(pc)) throw httpError(409, `PC '${pc}' is not connected - start the agent on that PC first`);
   const v = {};
   for (const k of Object.keys(VARIABLES)) if (vars?.[k] != null && String(vars[k]).trim()) v[k] = clip(vars[k], 200).trim();
   v.pc = pc || v.pc || '';

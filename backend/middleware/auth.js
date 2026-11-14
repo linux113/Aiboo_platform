@@ -33,8 +33,14 @@ const freshUser = async (id) => {
   const key = String(id);
   const hit = userCache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit;
-  const u = await User.findById(id).select('role active');
-  const fresh = { role: u?.role || null, active: u ? u.active !== false : false, at: Date.now() };
+  const u = await User.findById(id).select('role active organization');
+  const fresh = {
+    role: u?.role || null,
+    active: u ? u.active !== false : false,
+    organization: u?.organization ? String(u.organization) : null,
+    tenantVerified: !!u,
+    at: Date.now(),
+  };
   userCache.set(key, fresh);
   return fresh;
 };
@@ -62,7 +68,14 @@ export const protect = async (req, res, next) => {
         if (fresh.active === false) {
           return res.status(403).json({ message: 'This account has been disabled by an admin' });
         }
-        if (fresh.role) req.user = { ...decoded, role: fresh.role };
+        if (fresh.role) {
+          req.user = {
+            ...decoded,
+            role: fresh.role,
+            organization: fresh.organization,
+            tenantVerified: fresh.tenantVerified,
+          };
+        }
       }
     } catch {
       /* keep the token claims */

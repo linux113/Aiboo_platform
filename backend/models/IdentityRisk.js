@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 
 const identityRiskSchema = new mongoose.Schema(
   {
+    organization: { type: mongoose.Schema.Types.ObjectId, ref: 'Organization', default: null, index: true },
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     riskScore: { type: Number, min: 0, max: 100 },
     anomalyScore: { type: Number, min: 0, max: 100 },

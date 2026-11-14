@@ -20,6 +20,7 @@ because the backend protects "/" with dashboard JWT auth.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
 from typing import Awaitable, Callable, Dict, Optional, TYPE_CHECKING

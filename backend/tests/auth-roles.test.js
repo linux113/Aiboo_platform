@@ -12,6 +12,9 @@ process.env.AGENT_API_KEY = 'test-agent-key';
 const bcrypt = (await import('bcryptjs')).default;
 const mongoose = (await import('mongoose')).default;
 const User = (await import('../models/User.js')).default;
+const Organization = (await import('../models/Organization.js')).default;
+const Subscription = (await import('../models/Subscription.js')).default;
+const Plan = (await import('../models/Plan.js')).default;
 const { default: authRoutes } = await import('../routes/auth.routes.js');
 const { default: userRoutes } = await import('../routes/user.routes.js');
 const { default: agentRoutes } = await import('../routes/agent.routes.js');
@@ -25,6 +28,15 @@ Object.defineProperty(mongoose.connection, 'readyState', { value: 1, configurabl
 // ---------------------------------------------------------------- fake store
 // The real queries the services use: find/findOne/findById/create/save.
 const users = [];
+const ORG_A = '650000000000000000000001';
+const ORG_B = '650000000000000000000002';
+Organization.findById = (id) => asDoc(String(id) === ORG_A
+  ? { _id: ORG_A, name: 'Tenant A', slug: 'tenant-a', status: 'active', subscriptionExpiresAt: new Date(Date.now() + 365 * 86400000) }
+  : String(id) === ORG_B
+    ? { _id: ORG_B, name: 'Tenant B', slug: 'tenant-b', status: 'active', subscriptionExpiresAt: new Date(Date.now() + 365 * 86400000) }
+    : null);
+Subscription.findOne = () => asDoc({ plan: 'plan-basic' });
+Plan.findById = () => asDoc({ enabled: true, limits: { users: 10 }, features: { responseActions: true } });
 let seq = 0;
 const hashed = (pw) => String(pw || '').startsWith('$2') ? pw : bcrypt.hashSync(pw, 4);
 
@@ -53,6 +65,7 @@ const makeUser = (doc) => {
     email: doc.email,
     password: hashed(doc.password),
     role: doc.role || 'viewer',
+    organization: doc.organization || ORG_A,
     active: doc.active !== false,
     lastLogin: doc.lastLogin || null,
     createdAt: new Date(),
@@ -66,6 +79,9 @@ const makeUser = (doc) => {
 User.find = (q) => asQuery(users.filter((u) => matches(u, q)));
 User.findOne = async (q) => users.find((u) => matches(u, q)) || null;
 User.findById = (id) => asDoc(users.find((u) => String(u._id) === String(id)) || null);
+User.countDocuments = async ({ organization, _id } = {}) => users.filter((u) =>
+  String(u.organization) === String(organization) && u.active !== false && String(u._id) !== String(_id?.$ne || ''),
+).length;
 User.findByIdAndUpdate = async (id, patch) => { const u = await User.findById(id); if (u) Object.assign(u, patch); return u; };
 
 User.create = async (doc) => makeUser(doc);
@@ -176,13 +192,25 @@ test('only an admin can see or manage users', async () => {
   assert.equal(admin.status, 200);
   assert.ok(Array.isArray(admin.data.users));
   assert.ok(admin.data.users.every((u) => u.password === undefined));
+  assert.ok(admin.data.users.every((u) => String(u.organization) === ORG_A));
+
+  // A valid account from another company is invisible and cannot be edited by this admin.
+  const outsider = makeUser({ name: 'Tenant B Admin', email: 'tenant-b-admin@test', password: 'TenantB12345', role: 'admin', organization: ORG_B });
+  const tenantBToken = token('admin', outsider.email, outsider._id);
+  const tenantBList = await call('GET', '/api/users', { tok: tenantBToken });
+  assert.equal(tenantBList.status, 200);
+  assert.ok(tenantBList.data.users.every((u) => String(u.organization) === ORG_B));
+  const crossTenantEdit = await call('PATCH', `/api/users/${outsider._id}`, { tok: ADMIN, body: { name: 'Compromised' } });
+  assert.equal(crossTenantEdit.status, 404);
+  assert.equal(outsider.name, 'Tenant B Admin');
 });
 
 test('a viewer cannot dispatch a response command, an analyst can', async () => {
   const asViewer = await call('POST', '/api/agent/commands', { tok: VIEWER, body: { endpoint_id: 'linux-01', action: 'block_access', target: '45.95.147.3' } });
   assert.equal(asViewer.status, 403);
   const asAnalyst = await call('POST', '/api/agent/commands', { tok: ANALYST, body: { endpoint_id: 'linux-01', action: 'block_access', target: '45.95.147.3' } });
-  assert.equal(asAnalyst.status, 202);
+  assert.equal(asAnalyst.status, 202, 'analysts may dispatch commands into their tenant-scoped REST queue');
+  assert.equal(asAnalyst.data.queued, true);
 });
 
 // --------------------------------------------------------- lock-out guards
@@ -215,16 +243,16 @@ test('one admin can demote another, but the last admin is protected', async () =
 
   // the guard itself (belt and braces, also used by the add-user script)
   await assert.rejects(
-    () => svc.updateUser(third._id, { role: 'analyst' }, { id: second._id, role: 'admin' }),
+    () => svc.updateUser(third._id, { role: 'analyst' }, { id: second._id, role: 'admin', organization: ORG_A }),
     (err) => /last admin/i.test(String(err?.message)),
   );
   await assert.rejects(
-    () => svc.disableUser(third._id, { id: second._id, role: 'admin' }),
+    () => svc.disableUser(third._id, { id: second._id, role: 'admin', organization: ORG_A }),
     (err) => /last admin/i.test(String(err?.message)),
   );
 
   // put admin1 back so the tests below keep their admin
-  await svc.updateUser(first._id, { role: 'admin' }, { id: third._id, role: 'admin' });
+  await svc.updateUser(first._id, { role: 'admin' }, { id: third._id, role: 'admin', organization: ORG_A });
   assert.equal((await User.findById(first._id)).role, 'admin');
 });
 
